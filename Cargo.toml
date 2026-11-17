@@ -1,0 +1,78 @@
+[workspace]
+members = [
+    "crates/testrix-core",
+    "crates/testrix-storage",
+    "crates/testrix-http",
+    "crates/testrix-app",
+]
+default-members = ["crates/testrix-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Testrix Contributors"]
+publish = false
+
+[workspace.dependencies]
+# Internal workspace crates (strictly acyclic downward dependencies)
+testrix-core = { path = "crates/testrix-core" }
+testrix-storage = { path = "crates/testrix-storage" }
+testrix-http = { path = "crates/testrix-http" }
+
+# UI framework
+gpui-kit = { version = "0.10.0", features = ["tree-sitter-yaml", "tree-sitter-html"] }
+
+# Serialization & data formats
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+yaml_serde = "0.10.7"
+
+# Errors & observability
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime & HTTP client
+tokio = { version = "1.53", features = ["rt-multi-thread", "fs", "macros", "sync", "time"] }
+tokio-util = { version = "0.7" }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+    "form",
+    "multipart",
+    "gzip",
+    "brotli",
+    "deflate",
+] }
+
+# Utilities
+base64 = "0.22"
+bytes = "1.12"
+url = "2.5"
+uuid = { version = "1.26", features = ["v4"] }
+
+# Testing
+tempfile = "3.20"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+redundant_clone = "deny"
+almost_complete_range = "allow"
+module_inception = "allow"
+type_complexity = "allow"
+
+[profile.dev]
+debug = "limited"
+split-debuginfo = "unpacked"
+
+[profile.dev.package]
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }

@@ -1,0 +1,20 @@
+[package]
+name = "testrix-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+testrix-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+yaml_serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

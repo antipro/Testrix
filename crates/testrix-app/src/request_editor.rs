@@ -1,0 +1,1828 @@
+use std::path::PathBuf;
+
+use gpui_kit::{
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
+    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window,
+    assets::IconName as LucideIcon,
+    component::{
+        ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, WindowExt as _,
+        alert::Alert,
+        button::{Button, ButtonVariants as _},
+        form::{Field, Form},
+        h_flex,
+        input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
+        resizable::{resizable_panel, v_resizable},
+        scroll::ScrollableElement as _,
+        select::{Select, SelectEvent, SelectItem, SelectState},
+        spinner::Spinner,
+        switch::Switch,
+        tab::{Tab, TabBar},
+        tag::{Tag, TagVariant},
+        v_flex,
+    },
+    div,
+    prelude::FluentBuilder as _,
+    px,
+};
+use testrix_core::{
+    AuthNodeRef, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc, HttpResponseSnapshot,
+    ProjectNode, RawBodyFormat, RequestBody, RequestExecutionState, RequestNode, RequestSettings,
+    materialize_request_doc, resolve_request_doc_auth,
+};
+use testrix_http::{CancellationToken, HttpError, HttpRunner};
+use testrix_storage::to_yaml_pretty;
+
+use crate::{
+    auth_section::{AuthEditor, AuthEditorEvent},
+    editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent},
+    kv_editor::{KeyValueTable, MultipartTable, TableChangeEvent, common_http_header_options},
+    theme_helpers::{format_bytes, method_color, status_badge},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MethodOption(HttpMethod);
+
+impl SelectItem for MethodOption {
+    type Value = HttpMethod;
+
+    fn title(&self) -> SharedString {
+        self.0.as_str().into()
+    }
+
+    fn display_title(&self) -> Option<gpui_kit::AnyElement> {
+        let method = self.0;
+        Some(
+            div()
+                .font_semibold()
+                .text_xs()
+                .child(method.as_str())
+                .into_any_element(),
+        )
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestSection {
+    Params,
+    Headers,
+    Body,
+    Auth,
+    YamlSpec,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseSection {
+    Body,
+    Headers,
+    SentRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyMode {
+    None,
+    Json,
+    Raw,
+    FormUrlEncoded,
+    Multipart,
+    Binary,
+}
+
+impl BodyMode {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::Json,
+        Self::Raw,
+        Self::FormUrlEncoded,
+        Self::Multipart,
+        Self::Binary,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Json => "JSON",
+            Self::Raw => "Raw",
+            Self::FormUrlEncoded => "x-www-form-urlencoded",
+            Self::Multipart => "Multipart",
+            Self::Binary => "Binary",
+        }
+    }
+
+    fn from_body(body: &RequestBody) -> Self {
+        match body {
+            RequestBody::None => Self::None,
+            RequestBody::Json { .. } => Self::Json,
+            RequestBody::Raw { .. } => Self::Raw,
+            RequestBody::FormUrlEncoded { .. } => Self::FormUrlEncoded,
+            RequestBody::Multipart { .. } => Self::Multipart,
+            RequestBody::Binary { .. } => Self::Binary,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RequestTabEvent {
+    SaveRequest {
+        project_id: String,
+        request_id: String,
+        doc: Box<HttpRequestDoc>,
+    },
+    OpenAuthSource {
+        project_id: String,
+        node: AuthNodeRef,
+    },
+    DirtyChanged,
+}
+
+/// Center workbench view for inspecting, editing, and executing a single HTTP request YAML document.
+pub(crate) struct RequestTabView {
+    project_id: String,
+    request_id: String,
+    parent_folder_ids: Vec<String>,
+    file_path: PathBuf,
+    saved_doc: HttpRequestDoc,
+    project_snapshot: ProjectNode,
+    active_env: Option<EnvironmentDoc>,
+    runner: HttpRunner,
+
+    // Request controls
+    method: HttpMethod,
+    method_select: Entity<SelectState<Vec<MethodOption>>>,
+    url_prefix_combo: Entity<EditableCombobox>,
+    url_input: Entity<InputState>,
+    name_input: Entity<InputState>,
+    description_input: Entity<TextareaState>,
+    params_table: Entity<KeyValueTable>,
+    headers_table: Entity<KeyValueTable>,
+
+    // Body controls
+    body_mode: BodyMode,
+    raw_format: RawBodyFormat,
+    json_editor: Entity<EditorState>,
+    raw_editor: Entity<EditorState>,
+    form_table: Entity<KeyValueTable>,
+    multipart_table: Entity<MultipartTable>,
+    binary_path_input: Entity<InputState>,
+    binary_ct_input: Entity<InputState>,
+
+    // Auth + YAML + Settings controls
+    auth_editor: Entity<AuthEditor>,
+    yaml_editor: Entity<EditorState>,
+    timeout_input: Entity<InputState>,
+    follow_redirects: bool,
+    verify_tls: bool,
+
+    // Response state
+    active_request_section: RequestSection,
+    active_response_section: ResponseSection,
+    execution: RequestExecutionState,
+    response_body_editor: Entity<EditorState>,
+    show_secret_headers: bool,
+    active_cancel: Option<CancellationToken>,
+    request_revision: u64,
+
+    breadcrumb: SharedString,
+    dirty: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<RequestTabEvent> for RequestTabView {}
+
+impl RequestTabView {
+    pub(crate) fn new(
+        project: &ProjectNode,
+        parent_folders: &[&FolderNode],
+        node: &RequestNode,
+        active_env: Option<EnvironmentDoc>,
+        runner: HttpRunner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let doc = &node.doc;
+        let file_path = node.file_path.clone();
+        let method_options: Vec<MethodOption> =
+            HttpMethod::ALL.into_iter().map(MethodOption).collect();
+        let initial_method_ix = HttpMethod::ALL
+            .iter()
+            .position(|m| *m == doc.request.method)
+            .map(|row| IndexPath::default().row(row));
+        let method_select =
+            cx.new(|cx| SelectState::new(method_options, initial_method_ix, window, cx));
+
+        let (initial_prefix, initial_path) = split_url_prefix(&doc.request.url);
+        let prefix_placeholder = if project.doc.base_url.trim().is_empty() {
+            "{{base_url}}".to_string()
+        } else {
+            project.doc.base_url.clone()
+        };
+        let prefix_options = build_url_prefix_options(project, active_env.as_ref());
+        let url_prefix_combo = cx.new(|cx| {
+            EditableCombobox::new(
+                format!("req-url-prefix-{}", doc.id),
+                prefix_placeholder,
+                initial_prefix,
+                prefix_options,
+                window,
+                cx,
+            )
+            .cleanable(true)
+            .menu_width(px(320.))
+        });
+        let url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/v1/resource or path")
+                .default_value(initial_path)
+        });
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Request name")
+                .default_value(doc.name.clone())
+        });
+        let description_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(3)
+                .placeholder("Describe this endpoint…")
+                .default_value(doc.description.clone())
+        });
+
+        let params_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("req-params-{}", doc.id),
+                "Parameter",
+                "Value",
+                "Add Param",
+                &doc.request.params,
+                window,
+                cx,
+            )
+        });
+        let headers_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("req-headers-{}", doc.id),
+                "Header",
+                "Value",
+                "Add Header",
+                &doc.request.headers,
+                window,
+                cx,
+            )
+            .with_name_suggestions(common_http_header_options(), window, cx)
+        });
+
+        let body_mode = BodyMode::from_body(&doc.request.body);
+        let (json_text, raw_format, raw_text, form_rows, multipart_rows, bin_path, bin_ct) =
+            extract_body_fields(&doc.request.body);
+
+        let json_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("json")
+                .folding(true)
+                .default_value(json_text)
+        });
+        let raw_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(raw_format.editor_language())
+                .folding(true)
+                .default_value(raw_text)
+        });
+        let form_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("req-form-{}", doc.id),
+                "Field",
+                "Value",
+                "Add Form Field",
+                &form_rows,
+                window,
+                cx,
+            )
+        });
+        let multipart_table = cx.new(|cx| {
+            MultipartTable::new(format!("req-mp-{}", doc.id), &multipart_rows, window, cx)
+        });
+        let binary_path_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/path/to/payload.bin")
+                .default_value(bin_path)
+        });
+        let binary_ct_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("application/octet-stream")
+                .default_value(bin_ct)
+        });
+
+        let resolved_auth = resolve_request_doc_auth(project, parent_folders, doc);
+        let auth_editor = cx.new(|cx| {
+            let mut editor = AuthEditor::new(
+                format!("req-auth-{}", doc.id),
+                true,
+                &doc.request.auth,
+                window,
+                cx,
+            );
+            editor.set_context(Some(resolved_auth), active_env.clone(), cx);
+            editor
+        });
+
+        let yaml_text = to_yaml_pretty(doc).unwrap_or_default();
+        let yaml_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("yaml")
+                .folding(true)
+                .default_value(yaml_text)
+        });
+
+        let timeout_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("30000")
+                .default_value(doc.request.settings.timeout_ms.to_string())
+        });
+
+        let response_body_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("json")
+                .folding(true)
+                .default_value("")
+        });
+
+        let breadcrumb = build_breadcrumb(project, parent_folders, &doc.name);
+        let parent_folder_ids = parent_folders.iter().map(|f| f.doc.id.clone()).collect();
+
+        let mut view = Self {
+            project_id: project.doc.id.clone(),
+            request_id: doc.id.clone(),
+            parent_folder_ids,
+            file_path,
+            saved_doc: doc.clone(),
+            project_snapshot: project.clone(),
+            active_env,
+            runner,
+            method: doc.request.method,
+            method_select,
+            url_prefix_combo,
+            url_input,
+            name_input,
+            description_input,
+            params_table,
+            headers_table,
+            body_mode,
+            raw_format,
+            json_editor,
+            raw_editor,
+            form_table,
+            multipart_table,
+            binary_path_input,
+            binary_ct_input,
+            auth_editor,
+            yaml_editor,
+            timeout_input,
+            follow_redirects: doc.request.settings.follow_redirects,
+            verify_tls: doc.request.settings.verify_tls,
+            active_request_section: RequestSection::Params,
+            active_response_section: ResponseSection::Body,
+            execution: RequestExecutionState::Idle,
+            response_body_editor,
+            show_secret_headers: false,
+            active_cancel: None,
+            request_revision: 0,
+            breadcrumb,
+            dirty: false,
+            _subscriptions: Vec::new(),
+        };
+        view.wire_subscriptions(window, cx);
+        view
+    }
+
+    fn wire_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut subs = Vec::new();
+        subs.push(cx.subscribe_in(
+            &self.method_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<MethodOption>>, window, cx| {
+                if let SelectEvent::Confirm(Some(method)) = event {
+                    this.method = *method;
+                    this.on_edited(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.url_prefix_combo,
+            window,
+            |this, _, _: &EditableComboboxEvent, window, cx| {
+                this.on_edited(window, cx);
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.url_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.on_edited(window, cx),
+                InputEvent::PressEnter { .. } => this.send_request(window, cx),
+                _ => {}
+            },
+        ));
+
+        for input in [
+            &self.name_input,
+            &self.binary_path_input,
+            &self.binary_ct_input,
+            &self.timeout_input,
+        ] {
+            subs.push(
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.on_edited(window, cx);
+                    }
+                }),
+            );
+        }
+
+        subs.push(cx.subscribe_in(
+            &self.description_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_edited(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.json_editor,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_edited(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.raw_editor,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_edited(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.params_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
+        ));
+        subs.push(cx.subscribe_in(
+            &self.headers_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
+        ));
+        subs.push(cx.subscribe_in(
+            &self.form_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
+        ));
+        subs.push(cx.subscribe_in(
+            &self.multipart_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
+        ));
+        subs.push(cx.subscribe_in(
+            &self.auth_editor,
+            window,
+            |this, _, event: &AuthEditorEvent, window, cx| match event {
+                AuthEditorEvent::Changed => this.on_edited(window, cx),
+                AuthEditorEvent::OpenSourceNode(node) => {
+                    cx.emit(RequestTabEvent::OpenAuthSource {
+                        project_id: this.project_id.clone(),
+                        node: node.clone(),
+                    });
+                }
+            },
+        ));
+        self._subscriptions = subs;
+    }
+
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(crate) fn method(&self) -> HttpMethod {
+        self.method
+    }
+
+    pub(crate) fn title(&self, cx: &App) -> String {
+        let current = self.name_input.read(cx).value().trim().to_string();
+        if current.is_empty() {
+            self.saved_doc.name.clone()
+        } else {
+            current
+        }
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        matches!(self.execution, RequestExecutionState::Loading { .. })
+    }
+
+    /// Updates project/environment context when parent auth, base URL, or active profile changes.
+    pub(crate) fn sync_context(
+        &mut self,
+        project: &ProjectNode,
+        active_env: Option<EnvironmentDoc>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_snapshot = project.clone();
+        self.active_env = active_env.clone();
+
+        let (ancestors, updated_file_path) = match project.find_request(&self.request_id) {
+            Some((ancestors, req_node)) => {
+                self.parent_folder_ids = ancestors.iter().map(|f| f.doc.id.clone()).collect();
+                (ancestors, Some(req_node.file_path.clone()))
+            }
+            None => (Vec::new(), None),
+        };
+        if let Some(path) = updated_file_path {
+            self.file_path = path;
+        }
+
+        let current_doc = self.build_doc(cx);
+        self.breadcrumb = build_breadcrumb(project, &ancestors, &current_doc.name);
+        let resolved_auth = resolve_request_doc_auth(project, &ancestors, &current_doc);
+        let prefix_options = build_url_prefix_options(project, self.active_env.as_ref());
+        let prefix_placeholder = if project.doc.base_url.trim().is_empty() {
+            "{{base_url}}".to_string()
+        } else {
+            project.doc.base_url.clone()
+        };
+        self.url_prefix_combo.update(cx, |combo, cx| {
+            combo.set_options(prefix_options, cx);
+            combo.set_placeholder(prefix_placeholder, window, cx);
+        });
+        self.auth_editor.update(cx, |editor, cx| {
+            editor.set_context(Some(resolved_auth), active_env, cx);
+        });
+        self.refresh_yaml_preview(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn mark_saved(&mut self, cx: &mut Context<Self>) {
+        self.saved_doc = self.build_doc(cx);
+        self.dirty = false;
+        cx.emit(RequestTabEvent::DirtyChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        let doc = self.build_doc(cx);
+        cx.emit(RequestTabEvent::SaveRequest {
+            project_id: self.project_id.clone(),
+            request_id: self.request_id.clone(),
+            doc: Box::new(doc),
+        });
+    }
+
+    pub(crate) fn cancel_request(&mut self, cx: &mut Context<Self>) {
+        if let Some(token) = self.active_cancel.take() {
+            token.cancel();
+            self.execution = RequestExecutionState::Cancelled;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn send_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = self.active_cancel.take() {
+            prev.cancel();
+        }
+
+        let doc = self.build_doc(cx);
+        let ancestors = self.resolve_ancestors();
+        let prepared = match materialize_request_doc(
+            &self.project_snapshot,
+            &ancestors,
+            &doc,
+            self.active_env.as_ref(),
+        ) {
+            Ok(req) => req,
+            Err(err) => {
+                self.execution = RequestExecutionState::Failed {
+                    message: err.to_string(),
+                };
+                cx.notify();
+                return;
+            }
+        };
+
+        self.request_revision += 1;
+        let revision = self.request_revision;
+        let cancel_token = CancellationToken::new();
+        self.active_cancel = Some(cancel_token.clone());
+        self.execution = RequestExecutionState::Loading {
+            request_revision: revision,
+        };
+        cx.notify();
+
+        let rx = self.runner.dispatch(prepared, cancel_token);
+        cx.spawn_in(window, async move |weak_self, cx| {
+            let outcome = rx.await;
+            _ = weak_self.update_in(cx, |this, window, cx| {
+                // Reject stale responses if user already cancelled or started a newer request.
+                if this.request_revision != revision {
+                    return;
+                }
+                this.active_cancel = None;
+                match outcome {
+                    Ok(Ok(snapshot)) => {
+                        let lang = snapshot.editor_language();
+                        let pretty = snapshot.pretty_body.clone();
+                        this.response_body_editor.update(cx, |editor, cx| {
+                            editor.set_highlighter(lang, cx);
+                            editor.set_value(pretty, window, cx);
+                        });
+                        this.execution = RequestExecutionState::Completed(Box::new(snapshot));
+                    }
+                    Ok(Err(HttpError::Cancelled)) => {
+                        this.execution = RequestExecutionState::Cancelled;
+                    }
+                    Ok(Err(err)) => {
+                        this.execution = RequestExecutionState::Failed {
+                            message: err.to_string(),
+                        };
+                    }
+                    Err(_) => {
+                        this.execution = RequestExecutionState::Failed {
+                            message: "HTTP execution task terminated unexpectedly.".to_string(),
+                        };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn resolve_ancestors(&self) -> Vec<&FolderNode> {
+        self.project_snapshot
+            .find_request(&self.request_id)
+            .map(|(ancestors, _)| ancestors)
+            .unwrap_or_default()
+    }
+
+    fn on_edited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.build_doc(cx);
+        self.dirty = draft != self.saved_doc;
+
+        let (breadcrumb, resolved_auth) = {
+            let ancestors = self.resolve_ancestors();
+            (
+                build_breadcrumb(&self.project_snapshot, &ancestors, &draft.name),
+                resolve_request_doc_auth(&self.project_snapshot, &ancestors, &draft),
+            )
+        };
+        self.breadcrumb = breadcrumb;
+        let active_env = self.active_env.clone();
+        self.auth_editor.update(cx, |editor, cx| {
+            editor.set_context(Some(resolved_auth), active_env, cx);
+        });
+        self.refresh_yaml_preview(window, cx);
+        cx.emit(RequestTabEvent::DirtyChanged);
+        cx.notify();
+    }
+
+    fn refresh_yaml_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let yaml = to_yaml_pretty(&self.build_doc(cx)).unwrap_or_default();
+        self.yaml_editor.update(cx, |editor, cx| {
+            editor.set_value(yaml, window, cx);
+        });
+    }
+
+    pub(crate) fn build_doc(&self, cx: &App) -> HttpRequestDoc {
+        let mut doc = self.saved_doc.clone();
+        let next_name = self.name_input.read(cx).value().trim().to_string();
+        if !next_name.is_empty() {
+            doc.name = next_name;
+        }
+        doc.description = self.description_input.read(cx).value().to_string();
+        doc.request.method = self.method;
+        doc.request.url = combine_url_prefix(
+            &self.url_prefix_combo.read(cx).value(cx),
+            &self.url_input.read(cx).value(),
+        );
+        doc.request.params = self.params_table.read(cx).snapshot(cx);
+        doc.request.headers = self.headers_table.read(cx).snapshot(cx);
+        doc.request.auth = self.auth_editor.read(cx).snapshot(cx);
+        doc.request.body = match self.body_mode {
+            BodyMode::None => RequestBody::None,
+            BodyMode::Json => RequestBody::Json {
+                content: self.json_editor.read(cx).value().to_string(),
+            },
+            BodyMode::Raw => RequestBody::Raw {
+                raw_format: self.raw_format,
+                content: self.raw_editor.read(cx).value().to_string(),
+            },
+            BodyMode::FormUrlEncoded => RequestBody::FormUrlEncoded {
+                fields: self.form_table.read(cx).snapshot(cx),
+            },
+            BodyMode::Multipart => RequestBody::Multipart {
+                fields: self.multipart_table.read(cx).snapshot(cx),
+            },
+            BodyMode::Binary => {
+                let ct = self.binary_ct_input.read(cx).value().trim().to_string();
+                RequestBody::Binary {
+                    file_path: self.binary_path_input.read(cx).value().to_string(),
+                    content_type: if ct.is_empty() { None } else { Some(ct) },
+                }
+            }
+        };
+
+        let timeout_ms = self
+            .timeout_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(self.saved_doc.request.settings.timeout_ms.max(1));
+
+        doc.request.settings =
+            RequestSettings::new(timeout_ms, self.follow_redirects, self.verify_tls);
+        doc
+    }
+
+    fn format_json_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.json_editor.read(cx).value().to_string();
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(parsed) => {
+                if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
+                    self.json_editor.update(cx, |editor, cx| {
+                        editor.replace_all(pretty, window, cx);
+                    });
+                    self.on_edited(window, cx);
+                }
+            }
+            Err(err) => {
+                window.push_notification(format!("Invalid JSON: {err}"), cx);
+            }
+        }
+    }
+
+    fn render_header_and_url_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_doc = self.build_doc(cx);
+        let ancestors = self.resolve_ancestors();
+        let resolved_auth =
+            resolve_request_doc_auth(&self.project_snapshot, &ancestors, &current_doc);
+        let preview = materialize_request_doc(
+            &self.project_snapshot,
+            &ancestors,
+            &current_doc,
+            self.active_env.as_ref(),
+        );
+        let loading = self.is_loading();
+        let id_base = self.request_id.clone();
+
+        v_flex()
+            .w_full()
+            .px_4()
+            .py_2p5()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            // Breadcrumb & Auth summary strip
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .truncate()
+                                    .child(self.breadcrumb.clone()),
+                            )
+                            .child(
+                                Tag::new()
+                                    .with_variant(if resolved_auth.is_inherited() {
+                                        TagVariant::Info
+                                    } else {
+                                        TagVariant::Secondary
+                                    })
+                                    .outline()
+                                    .small()
+                                    .child(format!("Auth: {}", resolved_auth.summary())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(
+                                self.file_path
+                                    .file_name()
+                                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                            ),
+                    ),
+            )
+            // Method + URL + Send + Save row
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div().w(px(116.)).flex_none().child(
+                            Select::new(&self.method_select)
+                                .id(SharedString::from(format!("req-method-{id_base}")))
+                                .text_color(method_color(self.method, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(px(210.))
+                            .flex_none()
+                            .child(self.url_prefix_combo.clone()),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.url_input)
+                                .id(SharedString::from(format!("req-url-{id_base}")))
+                                .w_full()
+                                .cleanable(true),
+                        ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("req-send-{id_base}")))
+                            .when(!loading, |b| {
+                                b.primary()
+                                    .icon(Icon::new(LucideIcon::SendHorizontal))
+                                    .label("Send")
+                            })
+                            .when(loading, |b| b.danger().icon(Spinner::new()).label("Cancel"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.is_loading() {
+                                    this.cancel_request(cx);
+                                } else {
+                                    this.send_request(window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("req-save-{id_base}")))
+                            .outline()
+                            .icon(Icon::new(LucideIcon::Save))
+                            .label(if self.dirty { "Save*" } else { "Save" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save(cx);
+                            })),
+                    ),
+            )
+            // Resolved URL / unresolved variables hint
+            .child(match preview {
+                Ok(prepared) => h_flex()
+                    .w_full()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Resolved:"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(cx.theme().foreground)
+                            .child(prepared.url),
+                    )
+                    .when(!prepared.unresolved_variables.is_empty(), |row| {
+                        row.child(
+                            Tag::new()
+                                .with_variant(TagVariant::Warning)
+                                .outline()
+                                .small()
+                                .child(format!(
+                                    "Unresolved: {}",
+                                    prepared.unresolved_variables.join(", ")
+                                )),
+                        )
+                    })
+                    .into_any_element(),
+                Err(err) => div()
+                    .text_xs()
+                    .text_color(cx.theme().warning)
+                    .child(err.to_string())
+                    .into_any_element(),
+            })
+    }
+
+    fn render_request_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let doc = self.build_doc(cx);
+        let param_count = doc.request.params.iter().filter(|r| r.enabled).count();
+        let header_count = doc.request.headers.iter().filter(|r| r.enabled).count();
+        let id_base = self.request_id.clone();
+
+        let sections = [
+            RequestSection::Params,
+            RequestSection::Headers,
+            RequestSection::Body,
+            RequestSection::Auth,
+            RequestSection::YamlSpec,
+            RequestSection::Settings,
+        ];
+        let selected_ix = sections
+            .iter()
+            .position(|s| *s == self.active_request_section)
+            .unwrap_or(0);
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(
+                TabBar::new(SharedString::from(format!("req-sections-{id_base}")))
+                    .w_full()
+                    .underline()
+                    .small()
+                    .px_4()
+                    .selected_index(selected_ix)
+                    .on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                        if let Some(sec) = sections.get(*ix) {
+                            this.active_request_section = *sec;
+                            cx.notify();
+                        }
+                    }))
+                    .child(Tab::new().label(if param_count > 0 {
+                        format!("Params ({param_count})")
+                    } else {
+                        "Params".to_string()
+                    }))
+                    .child(Tab::new().label(if header_count > 0 {
+                        format!("Headers ({header_count})")
+                    } else {
+                        "Headers".to_string()
+                    }))
+                    .child(Tab::new().label(format!("Body ({})", self.body_mode.label())))
+                    .child(Tab::new().label("Auth"))
+                    .child(Tab::new().label("YAML Spec"))
+                    .child(Tab::new().label("Settings")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .when(self.active_request_section == RequestSection::Params, |this| {
+                        this.child(self.params_table.clone())
+                    })
+                    .when(self.active_request_section == RequestSection::Headers, |this| {
+                        this.child(
+                            v_flex()
+                                .size_full()
+                                .min_h_0()
+                                .gap_2()
+                                .when(!self.project_snapshot.doc.default_headers.is_empty(), |col| {
+                                    let count = self
+                                        .project_snapshot
+                                        .doc
+                                        .default_headers
+                                        .iter()
+                                        .filter(|h| h.enabled)
+                                        .count();
+                                    col.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().muted)
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{count} default header(s) inherited from project \"{}\". Request headers override matching names.",
+                                                self.project_snapshot.doc.name
+                                            )),
+                                    )
+                                })
+                                .child(div().flex_1().min_h_0().child(self.headers_table.clone())),
+                        )
+                    })
+                    .when(self.active_request_section == RequestSection::Body, |this| {
+                        this.child(self.render_body_editor(cx))
+                    })
+                    .when(self.active_request_section == RequestSection::Auth, |this| {
+                        this.child(
+                            div()
+                                .size_full()
+                                .overflow_y_scrollbar()
+                                .child(self.auth_editor.clone()),
+                        )
+                    })
+                    .when(self.active_request_section == RequestSection::YamlSpec, |this| {
+                        this.child(self.render_yaml_spec_pane(cx))
+                    })
+                    .when(self.active_request_section == RequestSection::Settings, |this| {
+                        this.child(self.render_settings_pane(cx))
+                    }),
+            )
+    }
+
+    fn render_body_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        let mode_ix = BodyMode::ALL
+            .iter()
+            .position(|m| *m == self.body_mode)
+            .unwrap_or(0);
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        TabBar::new(SharedString::from(format!("req-body-mode-{id_base}")))
+                            .segmented()
+                            .small()
+                            .selected_index(mode_ix)
+                            .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                                if let Some(mode) = BodyMode::ALL.get(*ix) {
+                                    this.body_mode = *mode;
+                                    this.on_edited(window, cx);
+                                }
+                            }))
+                            .children(BodyMode::ALL.iter().map(|m| Tab::new().label(m.label()))),
+                    )
+                    .when(self.body_mode == BodyMode::Json, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("format-json-{id_base}")))
+                                .outline()
+                                .xsmall()
+                                .icon(Icon::new(LucideIcon::Sparkles))
+                                .label("Format JSON")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.format_json_body(window, cx);
+                                })),
+                        )
+                    })
+                    .when(self.body_mode == BodyMode::Raw, |row| {
+                        row.child(
+                            h_flex().gap_1().children(RawBodyFormat::ALL.iter().map(|fmt| {
+                                let fmt = *fmt;
+                                Button::new(SharedString::from(format!(
+                                    "raw-fmt-{id_base}-{}",
+                                    fmt.label()
+                                )))
+                                .xsmall()
+                                .label(fmt.label())
+                                .when(self.raw_format == fmt, |b| b.primary())
+                                .when(self.raw_format != fmt, |b| b.outline())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.raw_format = fmt;
+                                    this.raw_editor.update(cx, |ed, cx| {
+                                        ed.set_highlighter(fmt.editor_language(), cx);
+                                    });
+                                    this.on_edited(window, cx);
+                                }))
+                            })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .when(self.body_mode == BodyMode::None, |this| {
+                        this.child(
+                            div()
+                                .p_4()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("This request has no body payload."),
+                        )
+                    })
+                    .when(self.body_mode == BodyMode::Json, |this| {
+                        this.child(Editor::new(&self.json_editor).size_full())
+                    })
+                    .when(self.body_mode == BodyMode::Raw, |this| {
+                        this.child(Editor::new(&self.raw_editor).size_full())
+                    })
+                    .when(self.body_mode == BodyMode::FormUrlEncoded, |this| {
+                        this.child(self.form_table.clone())
+                    })
+                    .when(self.body_mode == BodyMode::Multipart, |this| {
+                        this.child(self.multipart_table.clone())
+                    })
+                    .when(self.body_mode == BodyMode::Binary, |this| {
+                        this.child(
+                            Form::new()
+                                .child(
+                                    Field::new().label("Binary File Path").child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Input::new(&self.binary_path_input).small()),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "bin-browse-{id_base}"
+                                                )))
+                                                .outline()
+                                                .small()
+                                                .icon(Icon::new(LucideIcon::FolderOpen))
+                                                .label("Browse…")
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    let prompt = cx.prompt_for_paths(PathPromptOptions {
+                                                        files: true,
+                                                        directories: false,
+                                                        multiple: false,
+                                                        prompt: Some("Select binary payload file".into()),
+                                                    });
+                                                    let entity = cx.entity();
+                                                    cx.spawn_in(window, async move |_, window| {
+                                                        let path = prompt.await.ok()?.ok()??.into_iter().next()?;
+                                                        window
+                                                            .update(|window, cx| {
+                                                                entity.update(cx, |this, cx| {
+                                                                    this.binary_path_input.update(cx, |input, cx| {
+                                                                        input.set_value(path.to_string_lossy().to_string(), window, cx);
+                                                                    });
+                                                                    this.on_edited(window, cx);
+                                                                });
+                                                            })
+                                                            .ok()
+                                                    })
+                                                    .detach();
+                                                })),
+                                            ),
+                                    ),
+                                )
+                                .child(
+                                    Field::new()
+                                        .label("Content-Type")
+                                        .child(Input::new(&self.binary_ct_input).small()),
+                                ),
+                        )
+                    }),
+            )
+    }
+
+    fn render_yaml_spec_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(format!("File: {}", self.file_path.display())),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("copy-yaml-{id_base}")))
+                            .outline()
+                            .xsmall()
+                            .icon(IconName::Copy)
+                            .label("Copy YAML")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let yaml = this.yaml_editor.read(cx).value().to_string();
+                                cx.write_to_clipboard(ClipboardItem::new_string(yaml));
+                                window.push_notification("YAML document copied to clipboard.", cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(Editor::new(&self.yaml_editor).size_full().readonly(true)),
+            )
+    }
+
+    fn render_settings_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        div().size_full().overflow_y_scrollbar().child(
+            Form::new()
+                .child(
+                    Field::new()
+                        .label("Request Name")
+                        .child(Input::new(&self.name_input).small()),
+                )
+                .child(
+                    Field::new()
+                        .label("Timeout (ms)")
+                        .child(Input::new(&self.timeout_input).small().w(px(160.))),
+                )
+                .child(
+                    Field::new().label_indent(false).child(
+                        Switch::new(SharedString::from(format!("follow-redir-{id_base}")))
+                            .label("Follow HTTP redirects")
+                            .checked(self.follow_redirects)
+                            .on_change(cx.listener(|this, next, window, cx| {
+                                this.follow_redirects = *next;
+                                this.on_edited(window, cx);
+                            })),
+                    ),
+                )
+                .child(
+                    Field::new().label_indent(false).child(
+                        Switch::new(SharedString::from(format!("verify-tls-{id_base}")))
+                            .label("Verify TLS certificates")
+                            .checked(self.verify_tls)
+                            .on_change(cx.listener(|this, next, window, cx| {
+                                this.verify_tls = *next;
+                                this.on_edited(window, cx);
+                            })),
+                    ),
+                )
+                .child(
+                    Field::new()
+                        .label("Description")
+                        .child(Textarea::new(&self.description_input)),
+                ),
+        )
+    }
+
+    fn render_response_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(cx.theme().background)
+            .child(match &self.execution {
+                RequestExecutionState::Idle => v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .p_4()
+                    .child(
+                        Icon::new(LucideIcon::SendHorizontal)
+                            .large()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(div().text_sm().font_medium().child("Ready to send"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "Press Send or hit Enter in the URL bar to execute this request.",
+                            ),
+                    )
+                    .into_any_element(),
+                RequestExecutionState::Loading { .. } => v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .p_4()
+                    .child(Spinner::new().large())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Executing HTTP request…"),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("cancel-req-{id_base}")))
+                            .outline()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_request(cx);
+                            })),
+                    )
+                    .into_any_element(),
+                RequestExecutionState::Cancelled => div()
+                    .p_4()
+                    .child(
+                        Alert::warning(
+                            SharedString::from(format!("resp-cancelled-{id_base}")),
+                            "The in-flight request was cancelled.",
+                        )
+                        .title("Request Cancelled"),
+                    )
+                    .into_any_element(),
+                RequestExecutionState::Failed { message } => div()
+                    .p_4()
+                    .child(
+                        Alert::error(
+                            SharedString::from(format!("resp-error-{id_base}")),
+                            message.clone(),
+                        )
+                        .title("Request Failed"),
+                    )
+                    .into_any_element(),
+                RequestExecutionState::Completed(snapshot) => self
+                    .render_completed_response(snapshot, cx)
+                    .into_any_element(),
+            })
+    }
+
+    fn render_completed_response(
+        &self,
+        snapshot: &HttpResponseSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        let sections = [
+            ResponseSection::Body,
+            ResponseSection::Headers,
+            ResponseSection::SentRequest,
+        ];
+        let selected_ix = sections
+            .iter()
+            .position(|s| *s == self.active_response_section)
+            .unwrap_or(0);
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            // Response metadata strip
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_4()
+                    .py_2()
+                    .justify_between()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(status_badge(snapshot.status_code, &snapshot.reason))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{} ms", snapshot.duration_ms)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format_bytes(snapshot.size_bytes)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(snapshot.http_version.clone()),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("copy-resp-{id_base}")))
+                            .outline()
+                            .xsmall()
+                            .icon(IconName::Copy)
+                            .label("Copy Body")
+                            .on_click(cx.listener({
+                                let body = snapshot.pretty_body.clone();
+                                move |_, _, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(body.clone()));
+                                    window.push_notification(
+                                        "Response body copied to clipboard.",
+                                        cx,
+                                    );
+                                }
+                            })),
+                    ),
+            )
+            // Response tabs
+            .child(
+                TabBar::new(SharedString::from(format!("resp-tabs-{id_base}")))
+                    .w_full()
+                    .underline()
+                    .small()
+                    .px_4()
+                    .selected_index(selected_ix)
+                    .on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                        if let Some(sec) = sections.get(*ix) {
+                            this.active_response_section = *sec;
+                            cx.notify();
+                        }
+                    }))
+                    .child(Tab::new().label("Body"))
+                    .child(Tab::new().label(format!("Headers ({})", snapshot.headers.len())))
+                    .child(Tab::new().label("Effective Request")),
+            )
+            // Response content
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .when(
+                        self.active_response_section == ResponseSection::Body,
+                        |this| {
+                            this.child(
+                                Editor::new(&self.response_body_editor)
+                                    .size_full()
+                                    .readonly(true),
+                            )
+                        },
+                    )
+                    .when(
+                        self.active_response_section == ResponseSection::Headers,
+                        |this| {
+                            this.child(
+                                v_flex()
+                                    .size_full()
+                                    .overflow_y_scrollbar()
+                                    .gap_1()
+                                    .children(snapshot.headers.iter().enumerate().map(
+                                        |(ix, hdr)| {
+                                            h_flex()
+                                                .w_full()
+                                                .px_2()
+                                                .py_1p5()
+                                                .gap_3()
+                                                .rounded(cx.theme().radius)
+                                                .when(ix % 2 == 1, |r| r.bg(cx.theme().table_even))
+                                                .text_xs()
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .child(
+                                                    div()
+                                                        .w(px(220.))
+                                                        .font_semibold()
+                                                        .text_color(cx.theme().foreground)
+                                                        .child(hdr.name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(hdr.value.clone()),
+                                                )
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    .when(
+                        self.active_response_section == ResponseSection::SentRequest,
+                        |this| {
+                            let sent = &snapshot.sent_request;
+                            this.child(
+                                v_flex()
+                                    .size_full()
+                                    .overflow_y_scrollbar()
+                                    .gap_3()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .text_xs()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .child(
+                                                Tag::primary().small().child(sent.method.as_str()),
+                                            )
+                                            .child(
+                                                div().flex_1().min_w_0().child(sent.url.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_semibold()
+                                                    .child("Transmitted Headers"),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "toggle-secret-hdr-{id_base}"
+                                                )))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(if self.show_secret_headers {
+                                                    IconName::EyeOff
+                                                } else {
+                                                    IconName::Eye
+                                                })
+                                                .label(if self.show_secret_headers {
+                                                    "Hide Secrets"
+                                                } else {
+                                                    "Reveal Secrets"
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_secret_headers =
+                                                        !this.show_secret_headers;
+                                                    cx.notify();
+                                                })),
+                                            ),
+                                    )
+                                    .child(v_flex().gap_1().children(sent.headers.iter().map(
+                                        |h| {
+                                            let val = if h.secret && !self.show_secret_headers {
+                                                "•••••••• (inherited/secret)".to_string()
+                                            } else {
+                                                h.value.clone()
+                                            };
+                                            h_flex()
+                                                .px_2()
+                                                .py_1()
+                                                .gap_3()
+                                                .text_xs()
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .child(
+                                                    div()
+                                                        .w(px(220.))
+                                                        .font_semibold()
+                                                        .child(h.name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(val),
+                                                )
+                                        },
+                                    )))
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(
+                                                div().text_xs().font_semibold().child("Body Sent"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .p_2()
+                                                    .rounded(cx.theme().radius)
+                                                    .border_1()
+                                                    .border_color(cx.theme().border)
+                                                    .text_xs()
+                                                    .font_family(
+                                                        cx.theme().mono_font_family.clone(),
+                                                    )
+                                                    .child(sent.body_preview.clone()),
+                                            ),
+                                    ),
+                            )
+                        },
+                    ),
+            )
+    }
+}
+
+impl Render for RequestTabView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(cx.theme().background)
+            .child(self.render_header_and_url_bar(cx))
+            .child(
+                div().flex_1().min_h_0().child(
+                    v_resizable(SharedString::from(format!("req-resp-split-{id_base}")))
+                        .child(
+                            resizable_panel()
+                                .size(px(300.))
+                                .size_range(px(180.)..px(700.))
+                                .child(self.render_request_pane(cx)),
+                        )
+                        .child(self.render_response_pane(cx).into_any_element()),
+                ),
+            )
+    }
+}
+
+fn extract_body_fields(
+    body: &RequestBody,
+) -> (
+    String,
+    RawBodyFormat,
+    String,
+    Vec<testrix_core::KeyValueRow>,
+    Vec<testrix_core::MultipartField>,
+    String,
+    String,
+) {
+    match body {
+        RequestBody::None => (
+            "{\n  \n}".to_string(),
+            RawBodyFormat::Text,
+            String::new(),
+            vec![],
+            vec![],
+            String::new(),
+            String::new(),
+        ),
+        RequestBody::Json { content } => (
+            content.clone(),
+            RawBodyFormat::Text,
+            String::new(),
+            vec![],
+            vec![],
+            String::new(),
+            String::new(),
+        ),
+        RequestBody::Raw {
+            raw_format,
+            content,
+        } => (
+            "{\n  \n}".to_string(),
+            *raw_format,
+            content.clone(),
+            vec![],
+            vec![],
+            String::new(),
+            String::new(),
+        ),
+        RequestBody::FormUrlEncoded { fields } => (
+            "{\n  \n}".to_string(),
+            RawBodyFormat::Text,
+            String::new(),
+            fields.clone(),
+            vec![],
+            String::new(),
+            String::new(),
+        ),
+        RequestBody::Multipart { fields } => (
+            "{\n  \n}".to_string(),
+            RawBodyFormat::Text,
+            String::new(),
+            vec![],
+            fields.clone(),
+            String::new(),
+            String::new(),
+        ),
+        RequestBody::Binary {
+            file_path,
+            content_type,
+        } => (
+            "{\n  \n}".to_string(),
+            RawBodyFormat::Text,
+            String::new(),
+            vec![],
+            vec![],
+            file_path.clone(),
+            content_type.clone().unwrap_or_default(),
+        ),
+    }
+}
+
+fn build_breadcrumb(
+    project: &ProjectNode,
+    folders: &[&FolderNode],
+    request_name: &str,
+) -> SharedString {
+    let mut parts = Vec::with_capacity(folders.len() + 2);
+    parts.push(project.doc.name.clone());
+    for f in folders {
+        parts.push(f.doc.name.clone());
+    }
+    parts.push(request_name.to_string());
+    parts.join(" › ").into()
+}
+
+fn split_url_prefix(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("{{")
+        && let Some(end) = trimmed.find("}}")
+    {
+        let prefix = &trimmed[..end + 2];
+        let rest = &trimmed[end + 2..];
+        return (prefix.to_string(), rest.to_string());
+    }
+
+    for scheme in ["https://", "http://"] {
+        if let Some(after_scheme) = trimmed.strip_prefix(scheme) {
+            if let Some(slash_ix) = after_scheme.find('/') {
+                let split_at = scheme.len() + slash_ix;
+                return (
+                    trimmed[..split_at].to_string(),
+                    trimmed[split_at..].to_string(),
+                );
+            }
+            return (trimmed.to_string(), String::new());
+        }
+    }
+
+    (String::new(), trimmed.to_string())
+}
+
+fn combine_url_prefix(prefix: &str, path: &str) -> String {
+    let p = prefix.trim();
+    let rest = path.trim();
+    if p.is_empty() {
+        return rest.to_string();
+    }
+    if rest.is_empty() {
+        return p.to_string();
+    }
+    if p.ends_with('/') && rest.starts_with('/') {
+        return format!("{}{}", p.trim_end_matches('/'), rest);
+    }
+    if !p.ends_with('/')
+        && !rest.starts_with('/')
+        && !rest.starts_with('?')
+        && !rest.starts_with('#')
+    {
+        return format!("{p}/{rest}");
+    }
+    format!("{p}{rest}")
+}
+
+fn build_url_prefix_options(
+    project: &ProjectNode,
+    active_env: Option<&EnvironmentDoc>,
+) -> Vec<ComboboxOption> {
+    let mut options = Vec::new();
+    let base = project.doc.base_url.trim();
+    if !base.is_empty() {
+        options.push(ComboboxOption::new(base).with_detail("Project baseUrl"));
+    }
+
+    if let Some(env) = active_env {
+        for var in &env.variables {
+            if !var.enabled || var.key.trim().is_empty() {
+                continue;
+            }
+            let token = format!("{{{{{}}}}}", var.key.trim());
+            let detail = if var.secret {
+                "••••••".to_string()
+            } else {
+                var.value.clone()
+            };
+            if let Some(existing) = options.iter_mut().find(|opt| opt.value == token) {
+                if !detail.is_empty() {
+                    existing.detail = Some(detail);
+                }
+            } else {
+                options.push(ComboboxOption::new(token).with_detail(detail));
+            }
+        }
+    }
+
+    options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_and_combines_url_prefix_and_path() {
+        assert_eq!(
+            split_url_prefix("{{base_url}}/v1/users"),
+            ("{{base_url}}".to_string(), "/v1/users".to_string())
+        );
+        assert_eq!(
+            split_url_prefix("https://api.example.com/v1/users"),
+            (
+                "https://api.example.com".to_string(),
+                "/v1/users".to_string()
+            )
+        );
+        assert_eq!(
+            split_url_prefix("/delete"),
+            (String::new(), "/delete".to_string())
+        );
+
+        assert_eq!(combine_url_prefix("", "/delete"), "/delete");
+        assert_eq!(
+            combine_url_prefix("{{base_url}}/", "/delete"),
+            "{{base_url}}/delete"
+        );
+        assert_eq!(
+            combine_url_prefix("{{base_url}}", "delete"),
+            "{{base_url}}/delete"
+        );
+    }
+}

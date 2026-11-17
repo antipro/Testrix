@@ -1,0 +1,564 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use serde::{Deserialize, Serialize};
+use testrix_core::{
+    EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod, HttpRequestDoc, ProjectDoc,
+    ProjectNode, RequestNode, WorkspaceTree, generate_id,
+};
+use tracing::{debug, warn};
+
+use crate::{
+    error::StorageError,
+    seed::seed_starter_workspace,
+    slug::{unique_dir_path, unique_file_path},
+};
+
+const PROJECT_MANIFEST_FILE: &str = "testrix.project.yaml";
+const FOLDER_MANIFEST_FILE: &str = "_folder.yaml";
+const ENVIRONMENTS_DIR: &str = "environments";
+const REQUEST_EXTENSION: &str = ".request.yaml";
+const ENV_EXTENSION: &str = ".env.yaml";
+const WORKSPACE_STATE_FILE: &str = ".testrix-state.yaml";
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_environment_id: Option<String>,
+}
+
+/// Serializes any Testrix YAML document to canonical pretty YAML.
+pub fn to_yaml_pretty<T: Serialize>(doc: &T) -> Result<String, StorageError> {
+    Ok(yaml_serde::to_string(doc)?)
+}
+
+/// Atomically writes a YAML-serializable document to `path`.
+pub fn write_yaml_atomic<T: Serialize>(path: &Path, doc: &T) -> Result<(), StorageError> {
+    let yaml = to_yaml_pretty(doc)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| StorageError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    let file_name =
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| StorageError::InvalidPath {
+                path: path.to_path_buf(),
+                reason: "missing filename".to_string(),
+            })?;
+
+    let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp.{}.{nonce}", std::process::id()));
+
+    std::fs::write(&tmp_path, yaml.as_bytes()).map_err(|source| StorageError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+
+    std::fs::rename(&tmp_path, path).map_err(|source| {
+        let _ = std::fs::remove_file(&tmp_path);
+        StorageError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Ensures `workspace_root` exists and contains at least one project (seeding starter data if empty),
+/// then loads the entire workspace tree.
+pub fn ensure_seeded_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageError> {
+    std::fs::create_dir_all(workspace_root).map_err(|source| StorageError::Io {
+        path: workspace_root.to_path_buf(),
+        source,
+    })?;
+
+    let mut tree = load_workspace(workspace_root)?;
+    if tree.projects.is_empty() {
+        debug!(path = %workspace_root.display(), "seeding starter Testrix workspace");
+        seed_starter_workspace(workspace_root)?;
+        tree = load_workspace(workspace_root)?;
+        if let Some(first_project) = tree.projects.first() {
+            tree.active_project_id = Some(first_project.doc.id.clone());
+            tree.active_environment_id = first_project
+                .environments
+                .iter()
+                .find(|env| env.doc.name.eq_ignore_ascii_case("Development"))
+                .or_else(|| first_project.environments.first())
+                .map(|env| env.doc.id.clone());
+            let _ = save_workspace_state(
+                workspace_root,
+                tree.active_project_id.as_deref(),
+                tree.active_environment_id.as_deref(),
+            );
+        }
+    }
+
+    Ok(tree)
+}
+
+/// Loads all projects, folders, HTTP requests, and environments from `workspace_root`.
+pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageError> {
+    if !workspace_root.exists() {
+        return Ok(WorkspaceTree {
+            root_dir: workspace_root.to_path_buf(),
+            projects: Vec::new(),
+            active_project_id: None,
+            active_environment_id: None,
+        });
+    }
+
+    let mut projects = Vec::new();
+    let root_manifest = workspace_root.join(PROJECT_MANIFEST_FILE);
+    if root_manifest.is_file() {
+        projects.push(load_project(workspace_root)?);
+    } else {
+        let entries = std::fs::read_dir(workspace_root).map_err(|source| StorageError::Io {
+            path: workspace_root.to_path_buf(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| StorageError::Io {
+                path: workspace_root.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if !path.is_dir() || is_hidden_name(&path) {
+                continue;
+            }
+            if path.join(PROJECT_MANIFEST_FILE).is_file() {
+                projects.push(load_project(&path)?);
+            }
+        }
+    }
+
+    projects.sort_by_key(|a| a.doc.name.to_lowercase());
+
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    let state = if state_path.is_file() {
+        read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
+    } else {
+        WorkspaceStateFile::default()
+    };
+
+    let active_project_id = state
+        .active_project_id
+        .filter(|id| projects.iter().any(|p| &p.doc.id == id))
+        .or_else(|| projects.first().map(|p| p.doc.id.clone()));
+
+    let active_environment_id = state.active_environment_id.filter(|env_id| {
+        active_project_id
+            .as_deref()
+            .and_then(|proj_id| projects.iter().find(|p| p.doc.id == proj_id))
+            .is_some_and(|proj| proj.environments.iter().any(|e| &e.doc.id == env_id))
+    });
+
+    Ok(WorkspaceTree {
+        root_dir: workspace_root.to_path_buf(),
+        projects,
+        active_project_id,
+        active_environment_id,
+    })
+}
+
+/// Persists active project/environment UI selection in `.testrix-state.yaml`.
+pub fn save_workspace_state(
+    workspace_root: &Path,
+    active_project_id: Option<&str>,
+    active_environment_id: Option<&str>,
+) -> Result<(), StorageError> {
+    let state = WorkspaceStateFile {
+        active_project_id: active_project_id.map(str::to_string),
+        active_environment_id: active_environment_id.map(str::to_string),
+    };
+    write_yaml_atomic(&workspace_root.join(WORKSPACE_STATE_FILE), &state)
+}
+
+/// Loads a single project directory.
+pub fn load_project(project_dir: &Path) -> Result<ProjectNode, StorageError> {
+    let manifest_path = project_dir.join(PROJECT_MANIFEST_FILE);
+    let doc: ProjectDoc = read_yaml_file(&manifest_path)?;
+    doc.validate()?;
+
+    let mut folders = Vec::new();
+    let mut requests = Vec::new();
+    let mut environments = Vec::new();
+
+    let entries = std::fs::read_dir(project_dir).map_err(|source| StorageError::Io {
+        path: project_dir.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: project_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if is_hidden_name(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            if name == ENVIRONMENTS_DIR {
+                environments = load_environments(&path)?;
+            } else {
+                folders.push(load_folder(project_dir, &path)?);
+            }
+        } else if path.is_file() && name.ends_with(REQUEST_EXTENSION) {
+            requests.push(load_request(&path)?);
+        }
+    }
+
+    sort_folders(&mut folders);
+    sort_requests(&mut requests);
+    environments.sort_by_key(|a| a.doc.name.to_lowercase());
+
+    Ok(ProjectNode {
+        doc,
+        root_dir: project_dir.to_path_buf(),
+        manifest_path,
+        folders,
+        requests,
+        environments,
+    })
+}
+
+fn load_environments(env_dir: &Path) -> Result<Vec<EnvironmentNode>, StorageError> {
+    let mut envs = Vec::new();
+    let entries = std::fs::read_dir(env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: env_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if !path.is_file() || is_hidden_name(&path) {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with(ENV_EXTENSION))
+        {
+            let doc: EnvironmentDoc = read_yaml_file(&path)?;
+            doc.validate()?;
+            envs.push(EnvironmentNode {
+                doc,
+                file_path: path,
+            });
+        }
+    }
+    Ok(envs)
+}
+
+fn load_folder(project_root: &Path, dir_path: &Path) -> Result<FolderNode, StorageError> {
+    let manifest_path = dir_path.join(FOLDER_MANIFEST_FILE);
+    let (doc, has_manifest) = if manifest_path.is_file() {
+        let parsed: FolderDoc = read_yaml_file(&manifest_path)?;
+        parsed.validate()?;
+        (parsed, true)
+    } else {
+        let rel = dir_path
+            .strip_prefix(project_root)
+            .unwrap_or(dir_path)
+            .to_string_lossy()
+            .replace(['\\', '/'], "-");
+        let display_name = dir_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Folder");
+        (FolderDoc::new(format!("fld-{rel}"), display_name), false)
+    };
+
+    let mut folders = Vec::new();
+    let mut requests = Vec::new();
+    let entries = std::fs::read_dir(dir_path).map_err(|source| StorageError::Io {
+        path: dir_path.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: dir_path.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if is_hidden_name(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            folders.push(load_folder(project_root, &path)?);
+        } else if path.is_file() && name.ends_with(REQUEST_EXTENSION) {
+            requests.push(load_request(&path)?);
+        }
+    }
+
+    sort_folders(&mut folders);
+    sort_requests(&mut requests);
+
+    Ok(FolderNode {
+        doc,
+        dir_path: dir_path.to_path_buf(),
+        manifest_path,
+        has_manifest,
+        folders,
+        requests,
+    })
+}
+
+fn load_request(path: &Path) -> Result<RequestNode, StorageError> {
+    let doc: HttpRequestDoc = read_yaml_file(path)?;
+    doc.validate()?;
+    Ok(RequestNode {
+        doc,
+        file_path: path.to_path_buf(),
+    })
+}
+
+/// Saves a project manifest (`testrix.project.yaml`).
+pub fn save_project(project: &ProjectNode) -> Result<(), StorageError> {
+    project.doc.validate()?;
+    write_yaml_atomic(&project.manifest_path, &project.doc)
+}
+
+/// Creates a new project directory with `testrix.project.yaml` and a default `Development` environment.
+pub fn create_project(
+    workspace_root: &Path,
+    name: &str,
+    base_url: &str,
+) -> Result<ProjectNode, StorageError> {
+    let trimmed = name.trim();
+    let dir_name = if trimmed.is_empty() {
+        "New Project"
+    } else {
+        trimmed
+    };
+    let root_dir = unique_dir_path(workspace_root, dir_name);
+    let env_dir = root_dir.join(ENVIRONMENTS_DIR);
+    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.clone(),
+        source,
+    })?;
+
+    let mut project = ProjectDoc::new(generate_id("proj"), dir_name);
+    project.base_url = base_url.to_string();
+    let manifest_path = root_dir.join(PROJECT_MANIFEST_FILE);
+    write_yaml_atomic(&manifest_path, &project)?;
+
+    let env = EnvironmentDoc::new(generate_id("env"), "Development");
+    write_yaml_atomic(&env_dir.join("development.env.yaml"), &env)?;
+
+    load_project(&root_dir)
+}
+
+/// Saves a folder manifest (`_folder.yaml`).
+pub fn save_folder(folder: &FolderNode) -> Result<(), StorageError> {
+    folder.doc.validate()?;
+    write_yaml_atomic(&folder.manifest_path, &folder.doc)
+}
+
+/// Creates a new folder directory and `_folder.yaml` under `parent_dir`.
+pub fn create_folder(
+    parent_dir: &Path,
+    name: &str,
+    order: i32,
+) -> Result<FolderNode, StorageError> {
+    let trimmed = name.trim();
+    let folder_name = if trimmed.is_empty() {
+        "New Folder"
+    } else {
+        trimmed
+    };
+    let dir_path = unique_dir_path(parent_dir, folder_name);
+    std::fs::create_dir_all(&dir_path).map_err(|source| StorageError::Io {
+        path: dir_path.clone(),
+        source,
+    })?;
+
+    let mut doc = FolderDoc::new(generate_id("fld"), folder_name);
+    doc.order = order;
+    let manifest_path = dir_path.join(FOLDER_MANIFEST_FILE);
+    write_yaml_atomic(&manifest_path, &doc)?;
+
+    Ok(FolderNode {
+        doc,
+        dir_path,
+        manifest_path,
+        has_manifest: true,
+        folders: Vec::new(),
+        requests: Vec::new(),
+    })
+}
+
+/// Saves an HTTP request YAML document (`*.request.yaml`).
+pub fn save_request(request: &RequestNode) -> Result<(), StorageError> {
+    request.doc.validate()?;
+    write_yaml_atomic(&request.file_path, &request.doc)
+}
+
+/// Creates a new HTTP request YAML document under `parent_dir`.
+pub fn create_request(
+    parent_dir: &Path,
+    name: &str,
+    method: HttpMethod,
+    url: &str,
+) -> Result<RequestNode, StorageError> {
+    let trimmed = name.trim();
+    let req_name = if trimmed.is_empty() {
+        "New Request"
+    } else {
+        trimmed
+    };
+    let file_path = unique_file_path(parent_dir, req_name, REQUEST_EXTENSION);
+    let doc = HttpRequestDoc::new(generate_id("req"), req_name, method, url);
+    write_yaml_atomic(&file_path, &doc)?;
+    Ok(RequestNode { doc, file_path })
+}
+
+/// Duplicates an existing request into a sibling `*.request.yaml` with a new ID and name.
+pub fn duplicate_request(source: &RequestNode) -> Result<RequestNode, StorageError> {
+    let parent_dir = source
+        .file_path
+        .parent()
+        .ok_or_else(|| StorageError::InvalidPath {
+            path: source.file_path.clone(),
+            reason: "request path has no parent directory".to_string(),
+        })?;
+    let copy_name = format!("{} Copy", source.doc.name);
+    let file_path = unique_file_path(parent_dir, &copy_name, REQUEST_EXTENSION);
+    let mut doc = source.doc.clone();
+    doc.id = generate_id("req");
+    doc.name = copy_name;
+    write_yaml_atomic(&file_path, &doc)?;
+    Ok(RequestNode { doc, file_path })
+}
+
+/// Removes an HTTP request YAML file from disk.
+pub fn delete_request(file_path: &Path) -> Result<(), StorageError> {
+    if file_path.exists() {
+        std::fs::remove_file(file_path).map_err(|source| StorageError::Io {
+            path: file_path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Removes a folder directory and all contained YAML files from disk.
+pub fn delete_folder(dir_path: &Path) -> Result<(), StorageError> {
+    if dir_path.exists() {
+        std::fs::remove_dir_all(dir_path).map_err(|source| StorageError::Io {
+            path: dir_path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Saves an environment profile YAML document (`*.env.yaml`).
+pub fn save_environment(env: &EnvironmentNode) -> Result<(), StorageError> {
+    env.doc.validate()?;
+    write_yaml_atomic(&env.file_path, &env.doc)
+}
+
+/// Creates a new environment profile under `<project_root>/environments/`.
+pub fn create_environment(
+    project_root: &Path,
+    name: &str,
+) -> Result<EnvironmentNode, StorageError> {
+    let trimmed = name.trim();
+    let env_name = if trimmed.is_empty() {
+        "New Profile"
+    } else {
+        trimmed
+    };
+    let env_dir = project_root.join(ENVIRONMENTS_DIR);
+    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.clone(),
+        source,
+    })?;
+    let file_path = unique_file_path(&env_dir, env_name, ENV_EXTENSION);
+    let doc = EnvironmentDoc::new(generate_id("env"), env_name);
+    write_yaml_atomic(&file_path, &doc)?;
+    Ok(EnvironmentNode { doc, file_path })
+}
+
+/// Deletes an environment profile YAML file from disk.
+pub fn delete_environment(file_path: &Path) -> Result<(), StorageError> {
+    if file_path.exists() {
+        std::fs::remove_file(file_path).map_err(|source| StorageError::Io {
+            path: file_path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn read_yaml_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, StorageError> {
+    let content = std::fs::read_to_string(path).map_err(|source| StorageError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    yaml_serde::from_str(&content).map_err(|source| {
+        warn!(path = %path.display(), error = %source, "failed parsing YAML document");
+        StorageError::YamlRead {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn is_hidden_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn sort_folders(folders: &mut [FolderNode]) {
+    folders.sort_by(|a, b| {
+        a.doc
+            .order
+            .cmp(&b.doc.order)
+            .then_with(|| a.doc.name.to_lowercase().cmp(&b.doc.name.to_lowercase()))
+    });
+}
+
+fn sort_requests(requests: &mut [RequestNode]) {
+    requests.sort_by(|a, b| {
+        a.doc
+            .order
+            .cmp(&b.doc.order)
+            .then_with(|| a.doc.name.to_lowercase().cmp(&b.doc.name.to_lowercase()))
+    });
+}
+
+/// Returns the default workspace directory (`$HOME/.testrix/workspace` fallback `./.testrix-workspace`).
+pub fn default_workspace_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".testrix").join("workspace")
+    } else {
+        PathBuf::from(".testrix-workspace")
+    }
+}
