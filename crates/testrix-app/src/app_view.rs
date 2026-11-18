@@ -36,7 +36,7 @@ use testrix_core::{
 use testrix_http::HttpRunner;
 use testrix_storage::{
     create_environment, create_folder, create_project, create_request, delete_environment,
-    delete_folder, delete_request, duplicate_request, ensure_seeded_workspace,
+    delete_folder, delete_project, delete_request, duplicate_request, ensure_seeded_workspace,
     import_bundle_into_project, import_project_bundle, load_workspace, save_config_workspace_dir,
     save_environment, save_folder, save_project, save_request, save_workspace_state,
 };
@@ -264,6 +264,9 @@ impl TestrixApp {
                 project_id,
                 folder_id,
             } => self.confirm_delete_folder(project_id, folder_id, window, cx),
+            ExplorerEvent::DeleteProject { project_id } => {
+                self.confirm_delete_project(project_id, window, cx)
+            }
             ExplorerEvent::ImportOpenApi => self.prompt_import_openapi(window, cx),
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
@@ -1460,6 +1463,64 @@ impl TestrixApp {
                                 key != format!("fld:{fid}")
                             }
                         });
+                        this.reload_workspace(window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    fn confirm_delete_project(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.workspace.find_project(&project_id) else {
+            return;
+        };
+        let project_name = project.doc.name.clone();
+        let root_dir = project.root_dir.clone();
+        let app_entity = cx.entity();
+
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app_ok = app_entity.clone();
+            let path = root_dir.clone();
+            let pid = project_id.clone();
+            alert
+                .title(format!("Delete project \"{project_name}\"?"))
+                .description(
+                    "The project directory and all folders, requests, and environments inside it will be deleted from disk.",
+                )
+                .confirm()
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    app_ok.update(cx, |this, cx| {
+                        if let Err(err) = delete_project(&path) {
+                            window.push_notification(format!("Delete failed: {err}"), cx);
+                            return;
+                        }
+                        let removed_project = this.workspace.find_project(&pid).cloned();
+                        this.tabs.retain(|t| {
+                            let key = t.key(cx);
+                            if key == format!("proj:{pid}") {
+                                return false;
+                            }
+                            if let Some(proj) = &removed_project {
+                                if let Some(rid) = key.strip_prefix("req:") {
+                                    return proj.find_request(rid).is_none();
+                                }
+                                if let Some(fid) = key.strip_prefix("fld:") {
+                                    return proj.find_folder(fid).is_none();
+                                }
+                            }
+                            true
+                        });
+                        if this.workspace.active_project_id.as_deref() == Some(&pid) {
+                            this.workspace.active_project_id = None;
+                            this.workspace.active_environment_id = None;
+                        }
                         this.reload_workspace(window, cx);
                     });
                     true

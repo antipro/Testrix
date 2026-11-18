@@ -10,8 +10,8 @@ pub use seed::seed_starter_workspace;
 pub use slug::slugify;
 pub use workspace::{
     TestrixConfig, config_file_path, create_environment, create_folder, create_project,
-    create_request, default_workspace_dir, delete_environment, delete_folder, delete_request,
-    duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
+    create_request, default_workspace_dir, delete_environment, delete_folder, delete_project,
+    delete_request, duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
     init_or_load_config, init_or_load_config_at, load_project, load_workspace,
     save_config_workspace_dir, save_config_workspace_dir_at,
     save_environment, save_folder, save_project, save_request, save_workspace_state,

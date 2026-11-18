@@ -629,6 +629,11 @@ pub fn delete_folder(dir_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Removes a project directory and all its folders, requests, and environments from disk.
+pub fn delete_project(root_dir: &Path) -> Result<(), StorageError> {
+    delete_folder(root_dir)
+}
+
 /// Saves an environment profile YAML document (`*.env.yaml`).
 pub fn save_environment(env: &EnvironmentNode) -> Result<(), StorageError> {
     env.doc.validate()?;

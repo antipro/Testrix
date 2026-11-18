@@ -50,6 +50,9 @@ pub(crate) enum ExplorerEvent {
         project_id: String,
         folder_id: String,
     },
+    DeleteProject {
+        project_id: String,
+    },
     ImportOpenApi,
     ReloadWorkspace,
 }
@@ -678,9 +681,11 @@ fn build_context_menu(
             let v2 = view.clone();
             let v3 = view.clone();
             let v4 = view.clone();
+            let v5 = view.clone();
             let p1 = project_id.clone();
             let p2 = project_id.clone();
-            let p3 = project_id;
+            let p3 = project_id.clone();
+            let p4 = project_id;
             menu.item(
                 PopupMenuItem::new("New HTTP Request")
                     .icon(LucideIcon::FilePlus)
@@ -723,6 +728,18 @@ fn build_context_menu(
                     .on_click(move |_, _, cx| {
                         v4.update(cx, |_, cx| {
                             cx.emit(ExplorerEvent::ReloadWorkspace);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Delete Project…")
+                    .icon(IconName::Delete)
+                    .on_click(move |_, _, cx| {
+                        v5.update(cx, |_, cx| {
+                            cx.emit(ExplorerEvent::DeleteProject {
+                                project_id: p4.clone(),
+                            });
                         });
                     }),
             )
