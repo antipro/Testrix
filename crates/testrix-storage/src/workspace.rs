@@ -6,7 +6,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use testrix_core::{
     EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod, HttpRequestDoc,
-    ImportedProjectBundle, ProjectDoc, ProjectNode, RequestNode, WorkspaceTree, generate_id,
+    HttpResponseSnapshot, ImportedProjectBundle, ProjectDoc, ProjectNode, RequestNode,
+    WorkspaceTree, generate_id,
 };
 use tracing::{debug, warn};
 
@@ -22,6 +23,7 @@ const ENVIRONMENTS_DIR: &str = "environments";
 const REQUEST_EXTENSION: &str = ".request.yaml";
 const ENV_EXTENSION: &str = ".env.yaml";
 const WORKSPACE_STATE_FILE: &str = ".testrix-state.yaml";
+const RESPONSES_CACHE_DIR: &str = ".testrix-responses";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -32,6 +34,17 @@ struct WorkspaceStateFile {
     active_project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_environment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    open_tabs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_tab_key: Option<String>,
+}
+
+/// Persisted open-tab list and active tab key for a workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceTabState {
+    pub open_tabs: Vec<String>,
+    pub active_tab_key: Option<String>,
 }
 
 /// Serializes any Testrix YAML document to canonical pretty YAML.
@@ -172,17 +185,89 @@ pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageErr
     })
 }
 
-/// Persists active project/environment UI selection in `.testrix-state.yaml`.
+/// Persists active project/environment UI selection in `.testrix-state.yaml`,
+/// preserving any previously saved open-tab state.
 pub fn save_workspace_state(
     workspace_root: &Path,
     active_project_id: Option<&str>,
     active_environment_id: Option<&str>,
 ) -> Result<(), StorageError> {
-    let state = WorkspaceStateFile {
-        active_project_id: active_project_id.map(str::to_string),
-        active_environment_id: active_environment_id.map(str::to_string),
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    let mut state = if state_path.is_file() {
+        read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
+    } else {
+        WorkspaceStateFile::default()
     };
-    write_yaml_atomic(&workspace_root.join(WORKSPACE_STATE_FILE), &state)
+    state.active_project_id = active_project_id.map(str::to_string);
+    state.active_environment_id = active_environment_id.map(str::to_string);
+    write_yaml_atomic(&state_path, &state)
+}
+
+/// Loads the persisted open-tab keys and active tab key from `.testrix-state.yaml`.
+pub fn load_workspace_tabs(workspace_root: &Path) -> WorkspaceTabState {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    if !state_path.is_file() {
+        return WorkspaceTabState::default();
+    }
+    let state = read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default();
+    WorkspaceTabState {
+        open_tabs: state.open_tabs,
+        active_tab_key: state.active_tab_key,
+    }
+}
+
+/// Persists the open-tab keys and active tab key into `.testrix-state.yaml`.
+pub fn save_workspace_tabs(
+    workspace_root: &Path,
+    open_tabs: &[String],
+    active_tab_key: Option<&str>,
+) -> Result<(), StorageError> {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    let mut state = if state_path.is_file() {
+        read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
+    } else {
+        WorkspaceStateFile::default()
+    };
+    state.open_tabs = open_tabs.to_vec();
+    state.active_tab_key = active_tab_key.map(str::to_string);
+    write_yaml_atomic(&state_path, &state)
+}
+
+fn response_cache_path(workspace_root: &Path, request_id: &str) -> PathBuf {
+    let safe_id = crate::slug::slugify(request_id);
+    workspace_root
+        .join(RESPONSES_CACHE_DIR)
+        .join(format!("{safe_id}.yaml"))
+}
+
+/// Persists the last HTTP response snapshot for `request_id` under `.testrix-responses/`.
+pub fn save_request_response(
+    workspace_root: &Path,
+    request_id: &str,
+    snapshot: &HttpResponseSnapshot,
+) -> Result<(), StorageError> {
+    write_yaml_atomic(&response_cache_path(workspace_root, request_id), snapshot)
+}
+
+/// Loads the last persisted HTTP response snapshot for `request_id`, if present.
+pub fn load_request_response(
+    workspace_root: &Path,
+    request_id: &str,
+) -> Option<HttpResponseSnapshot> {
+    let path = response_cache_path(workspace_root, request_id);
+    if !path.is_file() {
+        return None;
+    }
+    read_yaml_file::<HttpResponseSnapshot>(&path).ok()
+}
+
+/// Removes all persisted HTTP response snapshots under `.testrix-responses/`.
+pub fn clear_saved_responses(workspace_root: &Path) -> Result<(), StorageError> {
+    let dir = workspace_root.join(RESPONSES_CACHE_DIR);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|source| StorageError::Io { path: dir, source })?;
+    }
+    Ok(())
 }
 
 /// Loads a single project directory.
@@ -742,10 +827,18 @@ pub struct TestrixConfig {
     #[serde(default = "default_config_api_version")]
     pub api_version: String,
     pub workspace_dir: PathBuf,
+    #[serde(default = "default_true")]
+    pub remember_open_tabs: bool,
+    #[serde(default = "default_true")]
+    pub remember_responses: bool,
 }
 
 fn default_config_api_version() -> String {
     testrix_core::API_VERSION.to_string()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for TestrixConfig {
@@ -753,6 +846,8 @@ impl Default for TestrixConfig {
         Self {
             api_version: default_config_api_version(),
             workspace_dir: default_workspace_dir(),
+            remember_open_tabs: true,
+            remember_responses: true,
         }
     }
 }
@@ -793,5 +888,29 @@ pub fn save_config_workspace_dir_at(
         TestrixConfig::default()
     };
     cfg.workspace_dir = workspace_dir.to_path_buf();
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Persists preference toggles into `~/.testrix/config.yaml`.
+pub fn save_config_preferences(
+    remember_open_tabs: bool,
+    remember_responses: bool,
+) -> Result<(), StorageError> {
+    save_config_preferences_at(&config_file_path(), remember_open_tabs, remember_responses)
+}
+
+/// Persists preference toggles into `config_path`.
+pub fn save_config_preferences_at(
+    config_path: &Path,
+    remember_open_tabs: bool,
+    remember_responses: bool,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    cfg.remember_open_tabs = remember_open_tabs;
+    cfg.remember_responses = remember_responses;
     write_yaml_atomic(config_path, &cfg)
 }

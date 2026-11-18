@@ -22,6 +22,7 @@ use gpui_kit::{
         resizable::{h_resizable, resizable_panel},
         select::{Select, SelectEvent, SelectItem, SelectState},
         status_bar::StatusBar,
+        switch::Switch,
         tab::{Tab, TabBar},
         v_flex,
     },
@@ -36,10 +37,12 @@ use testrix_core::{
 };
 use testrix_http::HttpRunner;
 use testrix_storage::{
-    create_environment, create_folder, create_project, create_request, delete_environment,
-    delete_folder, delete_project, delete_request, duplicate_request, ensure_seeded_workspace,
-    import_project_bundle, load_workspace, save_config_workspace_dir, save_environment,
-    save_folder, save_project, save_request, save_workspace_state,
+    clear_saved_responses, create_environment, create_folder, create_project, create_request,
+    delete_environment, delete_folder, delete_project, delete_request, duplicate_request,
+    ensure_seeded_workspace, import_project_bundle, init_or_load_config, load_request_response,
+    load_workspace, load_workspace_tabs, save_config_preferences, save_config_workspace_dir,
+    save_environment, save_folder, save_project, save_request, save_request_response,
+    save_workspace_state, save_workspace_tabs,
 };
 use tracing::{error, info};
 
@@ -115,6 +118,8 @@ pub struct TestrixApp {
     tabs: Vec<WorkbenchTab>,
     active_tab_ix: Option<usize>,
     context_tab_ix: Option<usize>,
+    remember_open_tabs: bool,
+    remember_responses: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,6 +149,8 @@ impl TestrixApp {
         let (profile_items, selected_ix) = build_profile_options(&workspace);
         let profile_select = cx.new(|cx| SelectState::new(profile_items, selected_ix, window, cx));
 
+        let cfg = init_or_load_config().unwrap_or_default();
+
         let mut app = Self {
             focus_handle: cx.focus_handle(),
             workspace_dir,
@@ -155,6 +162,8 @@ impl TestrixApp {
             tabs: Vec::new(),
             active_tab_ix: None,
             context_tab_ix: None,
+            remember_open_tabs: cfg.remember_open_tabs,
+            remember_responses: cfg.remember_responses,
             _subscriptions: Vec::new(),
         };
 
@@ -163,7 +172,7 @@ impl TestrixApp {
             panel.set_workspace(app.workspace.clone(), cx);
         });
         app.sync_env_editor(window, cx);
-        app.open_initial_request(window, cx);
+        app.restore_or_open_initial_tabs(window, cx);
         app
     }
 
@@ -215,6 +224,74 @@ impl TestrixApp {
         ));
 
         self._subscriptions = subs;
+    }
+
+    fn restore_or_open_initial_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remember_open_tabs {
+            let tab_state = load_workspace_tabs(&self.workspace.root_dir);
+            let mut opened_any = false;
+            for key in &tab_state.open_tabs {
+                if let Some(node) = self.resolve_node_from_key(key) {
+                    self.open_node(node, window, cx);
+                    opened_any = true;
+                }
+            }
+            if opened_any {
+                if let Some(active_key) = tab_state.active_tab_key
+                    && let Some(ix) = self.tabs.iter().position(|t| t.key(cx) == active_key)
+                {
+                    self.active_tab_ix = Some(ix);
+                    self.explorer
+                        .update(cx, |panel, cx| panel.reveal_and_select(&active_key, cx));
+                }
+                self.persist_open_tabs(cx);
+                return;
+            }
+        }
+        self.open_initial_request(window, cx);
+    }
+
+    fn resolve_node_from_key(&self, key: &str) -> Option<ExplorerNode> {
+        if let Some(pid) = key.strip_prefix("proj:") {
+            return self
+                .workspace
+                .find_project(pid)
+                .map(|p| ExplorerNode::Project {
+                    project_id: p.doc.id.clone(),
+                });
+        }
+        if let Some(fid) = key.strip_prefix("fld:") {
+            return self
+                .workspace
+                .find_folder(fid)
+                .map(|(p, _)| ExplorerNode::Folder {
+                    project_id: p.doc.id.clone(),
+                    folder_id: fid.to_string(),
+                });
+        }
+        if let Some(rid) = key.strip_prefix("req:") {
+            for proj in &self.workspace.projects {
+                if proj.find_request(rid).is_some() {
+                    return Some(ExplorerNode::Request {
+                        project_id: proj.doc.id.clone(),
+                        request_id: rid.to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn persist_open_tabs(&self, cx: &App) {
+        if !self.remember_open_tabs {
+            return;
+        }
+        let keys: Vec<String> = self.tabs.iter().map(|t| t.key(cx)).collect();
+        let active_key = self
+            .active_tab_ix
+            .and_then(|ix| self.tabs.get(ix))
+            .map(|t| t.key(cx));
+        let _ = save_workspace_tabs(&self.workspace.root_dir, &keys, active_key.as_deref());
     }
 
     fn open_initial_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -419,6 +496,7 @@ impl TestrixApp {
             self.active_tab_ix = Some(existing_ix);
             self.explorer
                 .update(cx, |panel, cx| panel.reveal_and_select(&target_key, cx));
+            self.persist_open_tabs(cx);
             cx.notify();
             return;
         }
@@ -437,10 +515,19 @@ impl TestrixApp {
                     return;
                 };
                 let runner = self.runner.clone();
+                let cached_resp = if self.remember_responses {
+                    load_request_response(&self.workspace.root_dir, &request_id)
+                } else {
+                    None
+                };
                 let view = cx.new(|cx| {
-                    RequestTabView::new(
+                    let mut tab = RequestTabView::new(
                         project, &ancestors, req_node, active_env, runner, window, cx,
-                    )
+                    );
+                    if let Some(snap) = cached_resp {
+                        tab.restore_response(snap, window, cx);
+                    }
+                    tab
                 });
                 let sub = cx.subscribe_in(
                     &view,
@@ -498,6 +585,7 @@ impl TestrixApp {
         self.explorer
             .update(cx, |panel, cx| panel.reveal_and_select(&target_key, cx));
         self.refresh_dirty_indicators(cx);
+        self.persist_open_tabs(cx);
         cx.notify();
     }
 
@@ -562,6 +650,14 @@ impl TestrixApp {
                         self.sync_env_editor(window, cx);
                         self.sync_all_tabs(window, cx);
                     }
+                }
+            }
+            RequestTabEvent::ResponseCompleted {
+                request_id,
+                snapshot,
+            } => {
+                if self.remember_responses {
+                    let _ = save_request_response(&self.workspace.root_dir, &request_id, &snapshot);
                 }
             }
         }
@@ -802,6 +898,7 @@ impl TestrixApp {
         };
         self.context_tab_ix = None;
         self.refresh_dirty_indicators(cx);
+        self.persist_open_tabs(cx);
         cx.notify();
     }
 
@@ -1122,6 +1219,114 @@ impl TestrixApp {
                                     window.close_dialog(cx);
                                 }),
                         ),
+                )
+        });
+    }
+
+    fn open_preferences_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app_entity = cx.entity();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let remember_tabs = app_entity.read(cx).remember_open_tabs;
+            let remember_responses = app_entity.read(cx).remember_responses;
+            let app_tabs = app_entity.clone();
+            let app_resps = app_entity.clone();
+
+            dialog
+                .title("Preferences")
+                .width(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(div().text_sm().font_medium().child("Remember last opened tabs"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Restore open workbench tabs and active tab on startup."),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new("pref-remember-tabs")
+                                        .checked(remember_tabs)
+                                        .on_change(move |next, window, cx| {
+                                            app_tabs.update(cx, |this, cx| {
+                                                this.remember_open_tabs = *next;
+                                                let _ = save_config_preferences(
+                                                    this.remember_open_tabs,
+                                                    this.remember_responses,
+                                                );
+                                                if *next {
+                                                    this.persist_open_tabs(cx);
+                                                } else {
+                                                    let _ = save_workspace_tabs(
+                                                        &this.workspace.root_dir,
+                                                        &[],
+                                                        None,
+                                                    );
+                                                }
+                                                cx.notify();
+                                            });
+                                            window.refresh();
+                                        }),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(div().text_sm().font_medium().child("Remember request responses"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Cache the latest HTTP response per request across restarts."),
+                                        ),
+                                )
+                                .child(
+                                    Switch::new("pref-remember-responses")
+                                        .checked(remember_responses)
+                                        .on_change(move |next, window, cx| {
+                                            app_resps.update(cx, |this, cx| {
+                                                this.remember_responses = *next;
+                                                let _ = save_config_preferences(
+                                                    this.remember_open_tabs,
+                                                    this.remember_responses,
+                                                );
+                                                if !*next {
+                                                    let _ = clear_saved_responses(
+                                                        &this.workspace.root_dir,
+                                                    );
+                                                }
+                                                cx.notify();
+                                            });
+                                            window.refresh();
+                                        }),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        DialogClose::new().child(
+                            Button::new("pref-done-btn")
+                                .primary()
+                                .label("Done"),
+                        ),
+                    ),
                 )
         });
     }
@@ -1833,6 +2038,16 @@ impl Render for TestrixApp {
                                             Theme::change(next, None, cx);
                                             crate::theme_helpers::configure_syntax_highlighting(cx);
                                         }),
+                                )
+                                .child(
+                                    Button::new("preferences-btn")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(LucideIcon::SlidersHorizontal)
+                                        .tooltip("Preferences…")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_preferences_dialog(window, cx);
+                                        })),
                                 ),
                         )
                         // Right-top corner: Profile + Environment Variables
@@ -1976,6 +2191,7 @@ impl TestrixApp {
                             let key = this.tabs[*ix].key(cx);
                             this.explorer
                                 .update(cx, |panel, cx| panel.reveal_and_select(&key, cx));
+                            this.persist_open_tabs(cx);
                             cx.notify();
                         }
                     }))

@@ -186,6 +186,10 @@ pub(crate) enum RequestTabEvent {
         env_id: String,
         vars: BTreeMap<String, String>,
     },
+    ResponseCompleted {
+        request_id: String,
+        snapshot: Box<HttpResponseSnapshot>,
+    },
     DirtyChanged,
 }
 
@@ -670,6 +674,22 @@ impl RequestTabView {
         cx.notify();
     }
 
+    pub(crate) fn restore_response(
+        &mut self,
+        snapshot: HttpResponseSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = self.response_body_format.language(&snapshot);
+        let pretty = snapshot.pretty_body.clone();
+        self.response_body_editor.update(cx, |editor, cx| {
+            editor.set_highlighter(lang, cx);
+            editor.set_value(pretty, window, cx);
+        });
+        self.execution = RequestExecutionState::Completed(Box::new(snapshot));
+        cx.notify();
+    }
+
     pub(crate) fn rename_variables(
         &mut self,
         renames: &[(String, String)],
@@ -852,6 +872,10 @@ impl RequestTabView {
                         } else {
                             this.post_script_status = None;
                         }
+                        cx.emit(RequestTabEvent::ResponseCompleted {
+                            request_id: this.request_id.clone(),
+                            snapshot: Box::new(snapshot.clone()),
+                        });
                         this.execution = RequestExecutionState::Completed(Box::new(snapshot));
                     }
                     Ok(Err(HttpError::Cancelled)) => {

@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{materialize::PreparedHeader, model::HttpMethod};
 
 /// Snapshot of the actual request transmitted over the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SentRequestSnapshot {
     pub method: HttpMethod,
     pub url: String,
@@ -10,14 +12,14 @@ pub struct SentRequestSnapshot {
 }
 
 /// Header pair returned by an HTTP response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseHeader {
     pub name: String,
     pub value: String,
 }
 
 /// Complete HTTP response snapshot rendered in the workbench response pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpResponseSnapshot {
     pub status_code: u16,
     pub reason: String,
@@ -25,6 +27,7 @@ pub struct HttpResponseSnapshot {
     pub duration_ms: u64,
     pub size_bytes: usize,
     pub headers: Vec<ResponseHeader>,
+    #[serde(default, skip_serializing)]
     pub body_bytes: Vec<u8>,
     pub body_text: String,
     pub pretty_body: String,

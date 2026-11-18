@@ -9,12 +9,14 @@ pub use error::StorageError;
 pub use seed::seed_starter_workspace;
 pub use slug::slugify;
 pub use workspace::{
-    TestrixConfig, config_file_path, create_environment, create_folder, create_project,
-    create_request, default_workspace_dir, delete_environment, delete_folder, delete_project,
-    delete_request, duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
-    init_or_load_config, init_or_load_config_at, load_project, load_workspace,
-    save_config_workspace_dir, save_config_workspace_dir_at,
-    save_environment, save_folder, save_project, save_request, save_workspace_state,
+    TestrixConfig, WorkspaceTabState, clear_saved_responses, config_file_path, create_environment,
+    create_folder, create_project, create_request, default_workspace_dir, delete_environment,
+    delete_folder, delete_project, delete_request, duplicate_request, ensure_seeded_workspace,
+    import_bundle_into_project, import_project_bundle, init_or_load_config,
+    init_or_load_config_at, load_project, load_request_response, load_workspace,
+    load_workspace_tabs, save_config_preferences, save_config_preferences_at,
+    save_config_workspace_dir, save_config_workspace_dir_at, save_environment, save_folder,
+    save_project, save_request, save_request_response, save_workspace_state, save_workspace_tabs,
     to_yaml_pretty, write_yaml_atomic,
 };
 
@@ -96,6 +98,53 @@ mod tests {
 
         let reloaded = init_or_load_config_at(&cfg_path).unwrap();
         assert_eq!(reloaded.workspace_dir, custom_ws);
+        assert!(reloaded.remember_open_tabs);
+        assert!(reloaded.remember_responses);
+
+        save_config_preferences_at(&cfg_path, false, false).unwrap();
+        let prefs_reloaded = init_or_load_config_at(&cfg_path).unwrap();
+        assert!(!prefs_reloaded.remember_open_tabs);
+        assert!(!prefs_reloaded.remember_responses);
+    }
+
+    #[test]
+    fn persists_and_restores_open_tabs_and_request_responses() {
+        let dir = TempDir::new().unwrap();
+        save_workspace_tabs(
+            dir.path(),
+            &["req:r1".to_string(), "req:r2".to_string()],
+            Some("req:r2"),
+        )
+        .unwrap();
+        let tabs = load_workspace_tabs(dir.path());
+        assert_eq!(tabs.open_tabs, vec!["req:r1", "req:r2"]);
+        assert_eq!(tabs.active_tab_key.as_deref(), Some("req:r2"));
+
+        let snap = testrix_core::HttpResponseSnapshot {
+            status_code: 200,
+            reason: "OK".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            duration_ms: 12,
+            size_bytes: 11,
+            headers: Vec::new(),
+            body_bytes: Vec::new(),
+            body_text: r#"{"ok":true}"#.to_string(),
+            pretty_body: r#"{"ok":true}"#.to_string(),
+            content_type: Some("application/json".to_string()),
+            sent_request: testrix_core::SentRequestSnapshot {
+                method: HttpMethod::Get,
+                url: "https://example.com".to_string(),
+                headers: Vec::new(),
+                body_preview: String::new(),
+            },
+        };
+        save_request_response(dir.path(), "r1", &snap).unwrap();
+        let loaded_snap = load_request_response(dir.path(), "r1").unwrap();
+        assert_eq!(loaded_snap.status_code, 200);
+        assert_eq!(loaded_snap.body_text, r#"{"ok":true}"#);
+
+        clear_saved_responses(dir.path()).unwrap();
+        assert!(load_request_response(dir.path(), "r1").is_none());
     }
 
     #[test]

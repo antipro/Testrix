@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
 };
 
 /// Fully resolved HTTP header ready to send.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedHeader {
     pub name: String,
     pub value: String,
