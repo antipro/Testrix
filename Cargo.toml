@@ -72,6 +72,9 @@ type_complexity = "allow"
 debug = "limited"
 split-debuginfo = "unpacked"
 
+[profile.dev.package."*"]
+debug = 0
+
 [profile.dev.package]
 resvg = { opt-level = 3 }
 rustybuzz = { opt-level = 3 }

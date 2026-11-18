@@ -2,7 +2,7 @@
 
 A native desktop API client and YAML-backed request workbench built with **Rust** (`1.100.0`) and **GPUI Kit (`v0.10.0`)**.
 
-![Testrix Screenshot](doc/Screenshot.png)
+![Testrix Screenshot](docs/Screenshot.png)
 
 ## Highlights
 
