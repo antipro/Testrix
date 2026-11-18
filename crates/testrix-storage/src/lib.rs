@@ -11,8 +11,8 @@ pub use slug::slugify;
 pub use workspace::{
     TestrixConfig, config_file_path, create_environment, create_folder, create_project,
     create_request, default_workspace_dir, delete_environment, delete_folder, delete_request,
-    duplicate_request, ensure_seeded_workspace, init_or_load_config, init_or_load_config_at,
-    load_project, load_workspace, save_config_workspace_dir, save_config_workspace_dir_at,
+    duplicate_request, ensure_seeded_workspace, import_project_bundle, init_or_load_config,
+    init_or_load_config_at, load_project, load_workspace, save_config_workspace_dir, save_config_workspace_dir_at,
     save_environment, save_folder, save_project, save_request, save_workspace_state,
     to_yaml_pretty, write_yaml_atomic,
 };
@@ -95,5 +95,39 @@ mod tests {
 
         let reloaded = init_or_load_config_at(&cfg_path).unwrap();
         assert_eq!(reloaded.workspace_dir, custom_ws);
+    }
+
+    #[test]
+    fn imports_openapi_3_0_bundle_and_reloads_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let openapi_json = r#"{
+          "openapi": "3.0.1",
+          "info": { "title": "AppCore", "version": "1.0.0" },
+          "tags": [{ "name": "门诊开单" }],
+          "servers": [{ "url": "http://localhost:30001/app-core", "description": "本地231" }],
+          "paths": {
+            "/outpPresc/operate/saveOutpPresc": {
+              "post": {
+                "summary": "处方保存",
+                "tags": ["门诊开单"],
+                "requestBody": {
+                  "content": {
+                    "application/json": { "example": { "packFlag": "1" } }
+                  }
+                }
+              }
+            }
+          }
+        }"#;
+        let bundle = testrix_core::parse_openapi_3_0(openapi_json).unwrap();
+        let proj = import_project_bundle(dir.path(), &bundle).unwrap();
+        assert_eq!(proj.doc.name, "AppCore");
+        assert_eq!(proj.folders.len(), 1);
+        assert_eq!(proj.folders[0].requests.len(), 1);
+        assert_eq!(proj.environments.len(), 1);
+
+        let ws = load_workspace(dir.path()).unwrap();
+        assert_eq!(ws.projects.len(), 1);
+        assert_eq!(ws.projects[0].doc.name, "AppCore");
     }
 }

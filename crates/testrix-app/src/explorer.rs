@@ -50,6 +50,7 @@ pub(crate) enum ExplorerEvent {
         project_id: String,
         folder_id: String,
     },
+    ImportOpenApi,
     ReloadWorkspace,
 }
 
@@ -309,6 +310,16 @@ impl Render for ExplorerPanel {
                                     .tooltip("New Project…")
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::NewProject);
+                                    })),
+                            )
+                            .child(
+                                Button::new("explorer-import-openapi")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(LucideIcon::FileUp)
+                                    .tooltip("Import OpenAPI 3.0 JSON…")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ExplorerEvent::ImportOpenApi);
                                     })),
                             )
                             .child(

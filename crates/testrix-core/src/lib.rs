@@ -5,6 +5,7 @@ mod auth;
 mod error;
 mod materialize;
 mod model;
+mod openapi;
 mod response;
 mod search;
 mod template;
@@ -25,6 +26,7 @@ pub use model::{
     ProjectNode, RawBodyFormat, RequestBody, RequestNode, RequestSettings, WorkspaceTree,
     generate_id,
 };
+pub use openapi::{ImportedFolder, ImportedProjectBundle, parse_openapi_3_0};
 pub use response::{
     HttpResponseSnapshot, RequestExecutionState, ResponseHeader, SentRequestSnapshot,
     format_pretty_body,

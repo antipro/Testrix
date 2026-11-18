@@ -5,8 +5,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use testrix_core::{
-    EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod, HttpRequestDoc, ProjectDoc,
-    ProjectNode, RequestNode, WorkspaceTree, generate_id,
+    EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod, HttpRequestDoc,
+    ImportedProjectBundle, ProjectDoc, ProjectNode, RequestNode, WorkspaceTree, generate_id,
 };
 use tracing::{debug, warn};
 
@@ -370,6 +370,51 @@ pub fn create_project(
 
     let env = EnvironmentDoc::new(generate_id("env"), "Development");
     write_yaml_atomic(&env_dir.join("development.env.yaml"), &env)?;
+
+    load_project(&root_dir)
+}
+
+/// Persists an [`ImportedProjectBundle`] (such as an OpenAPI 3.0 import) into `workspace_root`.
+pub fn import_project_bundle(
+    workspace_root: &Path,
+    bundle: &ImportedProjectBundle,
+) -> Result<ProjectNode, StorageError> {
+    bundle.project.validate()?;
+    let root_dir = unique_dir_path(workspace_root, &bundle.project.id);
+    let env_dir = root_dir.join(ENVIRONMENTS_DIR);
+    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.clone(),
+        source,
+    })?;
+
+    write_yaml_atomic(&root_dir.join(PROJECT_MANIFEST_FILE), &bundle.project)?;
+
+    for env in &bundle.environments {
+        env.validate()?;
+        let env_path = unique_file_path(&env_dir, &env.name, ENV_EXTENSION);
+        write_yaml_atomic(&env_path, env)?;
+    }
+
+    for req in &bundle.root_requests {
+        req.validate()?;
+        let req_path = unique_file_path(&root_dir, &req.name, REQUEST_EXTENSION);
+        write_yaml_atomic(&req_path, req)?;
+    }
+
+    for folder in &bundle.folders {
+        folder.doc.validate()?;
+        let folder_dir = unique_dir_path(&root_dir, &folder.doc.name);
+        std::fs::create_dir_all(&folder_dir).map_err(|source| StorageError::Io {
+            path: folder_dir.clone(),
+            source,
+        })?;
+        write_yaml_atomic(&folder_dir.join(FOLDER_MANIFEST_FILE), &folder.doc)?;
+        for req in &folder.requests {
+            req.validate()?;
+            let req_path = unique_file_path(&folder_dir, &req.name, REQUEST_EXTENSION);
+            write_yaml_atomic(&req_path, req)?;
+        }
+    }
 
     load_project(&root_dir)
 }
