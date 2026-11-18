@@ -38,9 +38,9 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthConfig, AuthNodeRef, EnvironmentDoc, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
-    KeyValueRow, ProjectNode, RequestBody, WorkspaceTree, merge_environments_into_bundle,
-    parse_openapi_3_0, parse_postman_collection, parse_postman_zip, rename_template_variables,
-    resolve_request_auth,
+    ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
+    merge_environments_into_bundle, parse_apifox, parse_openapi_3_0, parse_postman_collection,
+    parse_postman_zip, rename_template_variables, resolve_request_auth,
 };
 use testrix_http::HttpRunner;
 use testrix_storage::{
@@ -420,6 +420,7 @@ impl TestrixApp {
             }
             ExplorerEvent::ImportOpenApi => self.prompt_import_openapi(window, cx),
             ExplorerEvent::ImportPostmanZip => self.prompt_import_postman_zip(window, cx),
+            ExplorerEvent::ImportApifox => self.prompt_import_apifox(window, cx),
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
     }
@@ -1107,11 +1108,38 @@ impl TestrixApp {
     }
 
     fn prompt_import_openapi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_import_json_project(
+            "Select OpenAPI 3.0 JSON file",
+            "OpenAPI 3.0",
+            |json| parse_openapi_3_0(json).map_err(|err| format!("OpenAPI parse failed: {err}")),
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_import_apifox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_import_json_project(
+            "Select Apifox JSON file",
+            "Apifox",
+            |json| parse_apifox(json).map_err(|err| format!("Apifox parse failed: {err}")),
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_import_json_project(
+        &mut self,
+        prompt_title: &'static str,
+        kind_label: &'static str,
+        parser: fn(&str) -> Result<ImportedProjectBundle, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Select OpenAPI 3.0 JSON file".into()),
+            prompt: Some(prompt_title.into()),
         });
         let workspace_root = self.workspace.root_dir.clone();
         let entity = cx.entity();
@@ -1119,9 +1147,7 @@ impl TestrixApp {
             let path = prompt.await.ok()?.ok()??.into_iter().next()?;
             let parsed = std::fs::read_to_string(&path)
                 .map_err(|err| format!("Failed reading {}: {err}", path.display()))
-                .and_then(|json| {
-                    parse_openapi_3_0(&json).map_err(|err| format!("OpenAPI parse failed: {err}"))
-                });
+                .and_then(|json| parser(&json));
             window
                 .update(|window, cx| {
                     entity.update(cx, |this, cx| match parsed {
@@ -1173,7 +1199,7 @@ impl TestrixApp {
                                         panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
                                     });
                                     window.push_notification(
-                                        format!("Imported OpenAPI 3.0 project \"{proj_name}\"."),
+                                        format!("Imported {kind_label} project \"{proj_name}\"."),
                                         cx,
                                     );
                                 }

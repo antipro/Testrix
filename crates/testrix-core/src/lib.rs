@@ -1,6 +1,7 @@
 //! Core domain models, auth inheritance resolution, environment interpolation,
 //! request materialization, and explorer filtering for Testrix.
 
+mod apifox;
 mod auth;
 mod codegen;
 mod error;
@@ -12,6 +13,7 @@ mod response;
 mod search;
 mod template;
 
+pub use apifox::parse_apifox;
 pub use auth::{
     AuthChainStep, AuthNodeRef, ResolvedAuth, resolve_folder_auth, resolve_folder_chain_auth,
     resolve_project_auth, resolve_request_auth, resolve_request_doc_auth,

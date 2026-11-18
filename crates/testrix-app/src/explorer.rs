@@ -55,6 +55,7 @@ pub(crate) enum ExplorerEvent {
     },
     ImportOpenApi,
     ImportPostmanZip,
+    ImportApifox,
     ReloadWorkspace,
 }
 
@@ -334,6 +335,16 @@ impl Render for ExplorerPanel {
                                     .tooltip(crate::i18n::t("import_postman_zip"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::ImportPostmanZip);
+                                    })),
+                            )
+                            .child(
+                                Button::new("explorer-import-apifox")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(LucideIcon::Braces)
+                                    .tooltip(crate::i18n::t("import_apifox"))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ExplorerEvent::ImportApifox);
                                     })),
                             )
                             .child(
