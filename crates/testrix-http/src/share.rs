@@ -10,6 +10,8 @@ pub enum ShareChannel {
     TestrixServer,
     /// Upload YAML files directly to Cloudflare R2 storage via the Cloudflare REST API.
     CloudflareR2,
+    /// Serve the project's API documentation directly over the local network via an embedded HTTP server.
+    LocalNetwork,
 }
 
 impl ShareChannel {
@@ -18,6 +20,7 @@ impl ShareChannel {
         match self {
             Self::TestrixServer => "Testrix Share Server",
             Self::CloudflareR2 => "Cloudflare R2 Storage",
+            Self::LocalNetwork => "Local Network",
         }
     }
 }
@@ -332,4 +335,81 @@ pub async fn upload_to_cloudflare_r2(
         files_uploaded: total,
         share_url,
     })
+}
+
+/// Revokes (deletes) a shared project on `testrix-node` (`DELETE /api/my/projects/by-slug/:slug`).
+pub async fn revoke_testrix_server_share(
+    server_url: String,
+    token: String,
+    project_slug: String,
+) -> Result<(), String> {
+    let base = server_url.trim().trim_end_matches('/');
+    if base.is_empty() || token.trim().is_empty() {
+        return Err("Share server URL and login token are required to revoke".to_string());
+    }
+    let endpoint = format!("{base}/api/my/projects/by-slug/{project_slug}");
+    let client = reqwest::Client::builder()
+        .user_agent("Testrix/0.1")
+        .build()
+        .map_err(|err| format!("Failed creating HTTP client: {err}"))?;
+
+    let resp = client
+        .delete(&endpoint)
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|err| format!("Failed revoking on server: {err}"))?;
+
+    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Server revoke failed (HTTP {status}): {text}"));
+    }
+    Ok(())
+}
+
+/// Revokes (deletes) a project's uploaded YAML objects from Cloudflare R2.
+pub async fn revoke_cloudflare_r2_share(
+    account_id: String,
+    bucket: String,
+    api_token: String,
+    project_slug: String,
+    file_paths: Vec<String>,
+) -> Result<(), String> {
+    let account_id = account_id.trim();
+    let bucket = bucket.trim();
+    let api_token = api_token.trim();
+    if account_id.is_empty() || bucket.is_empty() || api_token.is_empty() {
+        return Err("Cloudflare R2 credentials are required to revoke".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("Testrix/0.1")
+        .build()
+        .map_err(|err| format!("Failed creating HTTP client: {err}"))?;
+
+    let mut keys: Vec<String> = file_paths
+        .into_iter()
+        .map(|p| format!("{project_slug}/{p}"))
+        .collect();
+    keys.push(format!("{project_slug}/.testrix-access.json"));
+
+    for key in keys {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket}/objects/{key}"
+        );
+        let resp = client
+            .delete(&url)
+            .bearer_auth(api_token)
+            .send()
+            .await
+            .map_err(|err| format!("Failed deleting {key} from R2: {err}"))?;
+
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("R2 delete failed for {key} (HTTP {status}): {text}"));
+        }
+    }
+    Ok(())
 }

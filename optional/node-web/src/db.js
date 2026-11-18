@@ -43,6 +43,15 @@ function initDb(dbPath) {
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(project_id, rel_path)
     );
+
+    CREATE TABLE IF NOT EXISTS email_verifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   const cols = db.prepare('PRAGMA table_info(shared_projects)').all();

@@ -1,7 +1,9 @@
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
 const { initDb } = require('./src/db');
+const { sendVerificationCode } = require('./src/mailer');
 const {
   COOKIE_NAME,
   hashPassword,
@@ -21,6 +23,9 @@ const PORT = Number(process.env.PORT || 3456);
 const YAML_DIR = path.resolve(process.env.YAML_DIR || process.env.DATA_DIR || path.join(__dirname, 'data'));
 const DB_PATH = path.resolve(process.env.DB_PATH || path.join(YAML_DIR, 'testrix.db'));
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
+const REQUIRE_EMAIL_VERIFICATION = !['false', '0', 'no'].includes(
+  String(process.env.REQUIRE_EMAIL_VERIFICATION || 'true').trim().toLowerCase()
+);
 
 fs.mkdirSync(YAML_DIR, { recursive: true });
 const db = initDb(DB_PATH);
@@ -52,9 +57,47 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Auth endpoints
+app.get('/api/auth/config', (_req, res) => {
+  res.json({ requireEmailVerification: REQUIRE_EMAIL_VERIFICATION });
+});
+
+app.post('/api/auth/send-code', async (req, res) => {
+  if (!REQUIRE_EMAIL_VERIFICATION) {
+    return res.json({ ok: true, skipped: true, message: 'Email verification is disabled' });
+  }
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email || !email.includes('@')) {
+    return res.status(400).json({ error: 'Valid email is required' });
+  }
+
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (existing) {
+    return res.status(409).json({ error: 'Email already registered' });
+  }
+
+  const code = crypto.randomInt(100000, 1000000).toString();
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+
+  db.prepare('UPDATE email_verifications SET used = 1 WHERE email = ? AND used = 0').run(email);
+  db.prepare('INSERT INTO email_verifications (email, code, expires_at) VALUES (?, ?, ?)').run(
+    email,
+    code,
+    expiresAt
+  );
+
+  try {
+    await sendVerificationCode(email, code);
+    res.json({ ok: true, message: 'Verification code sent to your email' });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed sending verification email' });
+  }
+});
+
 app.post('/api/auth/register', (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
+  const confirmPassword = String(req.body?.confirmPassword || '');
+  const code = String(req.body?.code || '').trim();
 
   if (!email || !email.includes('@')) {
     return res.status(400).json({ error: 'Valid email is required' });
@@ -62,10 +105,35 @@ app.post('/api/auth/register', (req, res) => {
   if (password.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   }
+  if (password !== confirmPassword) {
+    return res.status(400).json({ error: 'Passwords do not match' });
+  }
+  if (REQUIRE_EMAIL_VERIFICATION && !code) {
+    return res.status(400).json({ error: 'Verification code is required' });
+  }
 
   const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (existing) {
     return res.status(409).json({ error: 'Email already registered' });
+  }
+
+  if (REQUIRE_EMAIL_VERIFICATION) {
+    const verif = db
+      .prepare(
+        `SELECT id, code, expires_at FROM email_verifications
+         WHERE email = ? AND used = 0
+         ORDER BY id DESC LIMIT 1`
+      )
+      .get(email);
+
+    if (!verif || verif.code !== code) {
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+    if (verif.expires_at < Date.now()) {
+      return res.status(400).json({ error: 'Verification code has expired' });
+    }
+
+    db.prepare('UPDATE email_verifications SET used = 1 WHERE id = ?').run(verif.id);
   }
 
   const passwordHash = hashPassword(password);
@@ -372,6 +440,18 @@ app.patch('/api/my/projects/:id', requireAuth, (req, res) => {
   db.prepare("UPDATE shared_projects SET is_public = ?, name = ?, updated_at = datetime('now') WHERE id = ?")
     .run(isPublic, name, id);
   res.json({ ok: true, id, isPublic: Boolean(isPublic), name });
+});
+
+app.delete('/api/my/projects/by-slug/:slug', requireAuth, (req, res) => {
+  const slug = sanitizeSlug(req.params.slug);
+  const proj = db.prepare('SELECT * FROM shared_projects WHERE slug = ? AND user_id = ?').get(slug, req.user.id);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  db.prepare('DELETE FROM shared_projects WHERE id = ?').run(proj.id);
+  if (proj.dir_path && proj.dir_path.startsWith(YAML_DIR)) {
+    fs.rmSync(proj.dir_path, { recursive: true, force: true });
+  }
+  res.json({ ok: true });
 });
 
 app.delete('/api/my/projects/:id', requireAuth, (req, res) => {

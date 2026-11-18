@@ -1,15 +1,19 @@
 //! Asynchronous HTTP execution engine for Testrix built on Reqwest and Tokio.
 
 mod error;
+mod local_share;
 mod runner;
 mod share;
 
 pub use error::HttpError;
+pub use local_share::{
+    LocalShareHandle, NetworkAdapterIp, list_outbound_ipv4_addresses, start_local_share_server,
+};
 pub use runner::HttpRunner;
 pub use share::{
     ShareChannel, ShareFile, ShareLoginResult, ShareUploadResult, collect_project_yaml_files,
-    dispatch_share_future, login_testrix_server, upload_to_cloudflare_r2,
-    upload_to_testrix_server,
+    dispatch_share_future, login_testrix_server, revoke_cloudflare_r2_share,
+    revoke_testrix_server_share, upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 pub use tokio_util::sync::CancellationToken;
 
@@ -140,5 +144,38 @@ mod tests {
 
         let err = runner.execute_blocking(prepared, token).unwrap_err();
         assert!(matches!(err, HttpError::Cancelled));
+    }
+
+    #[test]
+    fn starts_and_stops_local_share_server_on_loopback() {
+        let ips = list_outbound_ipv4_addresses();
+        assert!(!ips.is_empty());
+
+        let proj_doc = ProjectDoc::new("proj", "Local Share Test");
+        let project = ProjectNode {
+            doc: proj_doc,
+            root_dir: PathBuf::from("."),
+            manifest_path: PathBuf::from("testrix.project.yaml"),
+            folders: vec![],
+            requests: vec![],
+            environments: vec![],
+        };
+
+        let handle = start_local_share_server("127.0.0.1".to_string(), 0, project, "local-test".to_string()).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp_text = rt.block_on(async {
+            reqwest::get(format!("{}/api/project", handle.share_url))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        assert!(resp_text.contains("Local Share Test"));
+        handle.stop();
     }
 }

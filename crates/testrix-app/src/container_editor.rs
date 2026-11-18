@@ -24,8 +24,9 @@ use testrix_core::{
     rename_template_variables, resolve_folder_chain_auth, resolve_project_auth,
 };
 use testrix_http::{
-    ShareChannel, ShareUploadResult, collect_project_yaml_files, dispatch_share_future,
-    upload_to_cloudflare_r2, upload_to_testrix_server,
+    LocalShareHandle, NetworkAdapterIp, ShareChannel, ShareUploadResult,
+    collect_project_yaml_files, dispatch_share_future, list_outbound_ipv4_addresses,
+    start_local_share_server, upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{ShareSettings, slugify, to_yaml_pretty};
 
@@ -45,6 +46,18 @@ enum ContainerSection {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ActiveShareRecord {
+    pub(crate) id: String,
+    pub(crate) project_name: String,
+    pub(crate) project_slug: String,
+    pub(crate) channel: ShareChannel,
+    pub(crate) share_url: String,
+    pub(crate) target_info: String,
+    pub(crate) file_paths: Vec<String>,
+    pub(crate) local_handle: Option<LocalShareHandle>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum ContainerTabEvent {
     SaveProject {
         project_id: String,
@@ -57,6 +70,7 @@ pub(crate) enum ContainerTabEvent {
     },
     OpenAuthSource(AuthNodeRef),
     DirtyChanged,
+    ShareStarted(ActiveShareRecord),
 }
 
 #[derive(Clone)]
@@ -93,6 +107,10 @@ pub(crate) struct ContainerTabView {
     share_channel: ShareChannel,
     share_in_flight: bool,
     share_status: Option<Result<ShareUploadResult, String>>,
+    project_snapshot: Option<ProjectNode>,
+    adapter_ips: Vec<NetworkAdapterIp>,
+    selected_ip_ix: usize,
+    local_port_input: Option<Entity<InputState>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -154,6 +172,13 @@ impl ContainerTabView {
                 .default_value(yaml_text)
         });
 
+        let adapter_ips = list_outbound_ipv4_addresses();
+        let local_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Port (0 = auto, or e.g. 8787)")
+                .default_value("8787")
+        });
+
         let mut view = Self {
             project_id: project.doc.id.clone(),
             project_name: project.doc.name.clone(),
@@ -177,6 +202,10 @@ impl ContainerTabView {
             share_channel: ShareChannel::TestrixServer,
             share_in_flight: false,
             share_status: None,
+            project_snapshot: Some(project.clone()),
+            adapter_ips,
+            selected_ip_ix: 0,
+            local_port_input: Some(local_port_input),
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
@@ -256,6 +285,10 @@ impl ContainerTabView {
             share_channel: ShareChannel::TestrixServer,
             share_in_flight: false,
             share_status: None,
+            project_snapshot: None,
+            adapter_ips: Vec::new(),
+            selected_ip_ix: 0,
+            local_port_input: None,
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
@@ -287,10 +320,6 @@ impl ContainerTabView {
             }
         };
 
-        self.share_in_flight = true;
-        self.share_status = None;
-        cx.notify();
-
         let channel = self.share_channel;
         let project_name = self.name_input.read(cx).value().trim().to_string();
         let project_name = if project_name.is_empty() {
@@ -305,12 +334,70 @@ impl ContainerTabView {
             .unwrap_or_else(|| slugify(&project_name));
         let settings = self.share_settings.clone();
 
+        let project_id = self.project_id.clone();
+        let file_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+
+        if channel == ShareChannel::LocalNetwork {
+            let Some(project_node) = self.project_snapshot.clone() else {
+                self.share_status = Some(Err("Project snapshot unavailable".to_string()));
+                cx.notify();
+                return;
+            };
+            let bind_ip = self
+                .adapter_ips
+                .get(self.selected_ip_ix)
+                .map(|a| a.ip.clone())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = self
+                .local_port_input
+                .as_ref()
+                .and_then(|p| p.read(cx).value().trim().parse::<u16>().ok())
+                .unwrap_or(0);
+
+            match start_local_share_server(bind_ip, port, project_node, project_slug.clone()) {
+                Ok(handle) => {
+                    let url = handle.share_url.clone();
+                    let bind_addr = handle.bind_addr.clone();
+                    self.share_status = Some(Ok(ShareUploadResult {
+                        channel: ShareChannel::LocalNetwork,
+                        files_uploaded: file_paths.len(),
+                        share_url: url.clone(),
+                    }));
+                    cx.emit(ContainerTabEvent::ShareStarted(ActiveShareRecord {
+                        id: format!("{project_id}:local"),
+                        project_name,
+                        project_slug,
+                        channel: ShareChannel::LocalNetwork,
+                        share_url: url,
+                        target_info: bind_addr,
+                        file_paths,
+                        local_handle: Some(handle),
+                    }));
+                }
+                Err(err) => {
+                    self.share_status = Some(Err(err));
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        self.share_in_flight = true;
+        self.share_status = None;
+        cx.notify();
+
+        let target_info = match channel {
+            ShareChannel::TestrixServer => settings.share_server_url.clone(),
+            ShareChannel::CloudflareR2 => format!("r2://{}", settings.cloudflare_r2_bucket),
+            ShareChannel::LocalNetwork => String::new(),
+        };
+
         let rx = match channel {
             ShareChannel::TestrixServer => dispatch_share_future(upload_to_testrix_server(
                 settings.share_server_url,
                 settings.share_token,
-                project_slug,
-                project_name,
+                project_slug.clone(),
+                project_name.clone(),
                 settings.share_access_token,
                 files,
             )),
@@ -319,20 +406,34 @@ impl ContainerTabView {
                 settings.cloudflare_r2_bucket,
                 settings.cloudflare_api_token,
                 settings.cloudflare_pages_url,
-                project_slug,
+                project_slug.clone(),
                 settings.share_access_token,
                 files,
             )),
+            ShareChannel::LocalNetwork => unreachable!(),
         };
 
         cx.spawn_in(window, async move |weak_self, cx| {
             let outcome = rx.await;
             _ = weak_self.update_in(cx, |this, _, cx| {
                 this.share_in_flight = false;
-                this.share_status = Some(match outcome {
+                let res = match outcome {
                     Ok(res) => res,
                     Err(_) => Err("Share upload task cancelled unexpectedly".to_string()),
-                });
+                };
+                if let Ok(ok) = &res {
+                    cx.emit(ContainerTabEvent::ShareStarted(ActiveShareRecord {
+                        id: format!("{project_id}:{}", ok.channel.label()),
+                        project_name: project_name.clone(),
+                        project_slug: project_slug.clone(),
+                        channel: ok.channel,
+                        share_url: ok.share_url.clone(),
+                        target_info: target_info.clone(),
+                        file_paths: file_paths.clone(),
+                        local_handle: None,
+                    }));
+                }
+                this.share_status = Some(res);
                 cx.notify();
             });
         })
@@ -847,7 +948,11 @@ impl Render for ContainerTabView {
                         )
                     })
                     .when(is_project && self.active_section == ContainerSection::Share, |this| {
-                        let channels = [ShareChannel::TestrixServer, ShareChannel::CloudflareR2];
+                        let channels = [
+                            ShareChannel::TestrixServer,
+                            ShareChannel::CloudflareR2,
+                            ShareChannel::LocalNetwork,
+                        ];
                         let settings = &self.share_settings;
                         let is_ready = match self.share_channel {
                             ShareChannel::TestrixServer => {
@@ -859,6 +964,7 @@ impl Render for ContainerTabView {
                                     && !settings.cloudflare_r2_bucket.trim().is_empty()
                                     && !settings.cloudflare_api_token.trim().is_empty()
                             }
+                            ShareChannel::LocalNetwork => !self.adapter_ips.is_empty(),
                         };
 
                         let status_text = match self.share_channel {
@@ -888,6 +994,14 @@ impl Render for ContainerTabView {
                                         settings.cloudflare_account_id
                                     )
                                 }
+                            }
+                            ShareChannel::LocalNetwork => {
+                                let selected_ip = self
+                                    .adapter_ips
+                                    .get(self.selected_ip_ix)
+                                    .map(|a| a.display_label())
+                                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                                format!("Local HTTP server will bind to outbound IP: {selected_ip}")
                             }
                         };
 
@@ -940,6 +1054,65 @@ impl Render for ContainerTabView {
                                         })
                                         .child(status_text),
                                 )
+                                .when(self.share_channel == ShareChannel::LocalNetwork, |parent| {
+                                    let ips = self.adapter_ips.clone();
+                                    let selected_ix = self.selected_ip_ix;
+                                    parent.child(
+                                        v_flex()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .justify_between()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_semibold()
+                                                            .child("Outbound Network Adapter IP"),
+                                                    )
+                                                    .child(
+                                                        Button::new("refresh-ips-btn")
+                                                            .xsmall()
+                                                            .outline()
+                                                            .label("Refresh IPs")
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                this.adapter_ips = list_outbound_ipv4_addresses();
+                                                                this.selected_ip_ix = 0;
+                                                                cx.notify();
+                                                            })),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex().gap_2().flex_wrap().children(
+                                                    ips.into_iter().enumerate().map(|(ix, adapter)| {
+                                                        let active = ix == selected_ix;
+                                                        let btn = Button::new(format!("local-ip-{ix}"))
+                                                            .xsmall()
+                                                            .label(adapter.display_label())
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                this.selected_ip_ix = ix;
+                                                                cx.notify();
+                                                            }));
+                                                        if active { btn.primary() } else { btn.outline() }
+                                                    }),
+                                                ),
+                                            )
+                                            .when_some(self.local_port_input.as_ref(), |col, port_in| {
+                                                col.child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .child("Port:"),
+                                                        )
+                                                        .child(div().w(px(140.)).child(Input::new(port_in).small())),
+                                                )
+                                            }),
+                                    )
+                                })
                                 .child(
                                     h_flex().gap_2().child(
                                         Button::new("share-upload-btn")
@@ -947,6 +1120,8 @@ impl Render for ContainerTabView {
                                             .disabled(self.share_in_flight || !is_ready)
                                             .label(if self.share_in_flight {
                                                 "Uploading YAML…"
+                                            } else if self.share_channel == ShareChannel::LocalNetwork {
+                                                "Start Local Share"
                                             } else {
                                                 "Upload Project YAML"
                                             })

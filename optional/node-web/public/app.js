@@ -1,5 +1,6 @@
 const state = {
   user: null,
+  requireEmailVerification: true,
   projects: [],
   currentProject: null,
   selectedNode: null, // { type: 'project' | 'folder' | 'request', data }
@@ -53,6 +54,10 @@ document.addEventListener('click', (e) => {
 });
 
 async function loadCurrentUser() {
+  try {
+    const cfg = await api('/api/auth/config');
+    state.requireEmailVerification = cfg.requireEmailVerification !== false;
+  } catch {}
   try {
     const data = await api('/api/auth/me');
     state.user = data.user;
@@ -551,21 +556,38 @@ async function loadProjectsList(preferredSlug = null) {
 
 function renderAuthForm(mode) {
   const isRegister = mode === 'register';
+  const needCode = isRegister && state.requireEmailVerification;
   const root = document.getElementById('appRoot');
   root.innerHTML = `
     <div class="card-container">
       <div class="card auth-card">
         <h2 style="margin-top:0">${isRegister ? 'Create Account' : 'Sign In'}</h2>
         <div id="authError" class="error-banner" style="display:none"></div>
+        <div id="authInfo" style="display:none;background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.35);color:#86efac;padding:8px 12px;border-radius:6px;margin-bottom:14px;font-size:13px;"></div>
         <form id="authForm">
           <div class="form-group">
             <label>Email</label>
-            <input class="input" type="email" name="email" required placeholder="you@example.com" />
+            <div style="display:flex;gap:8px;">
+              <input class="input" style="flex:1" type="email" name="email" id="authEmailInput" required placeholder="you@example.com" />
+              ${needCode ? '<button type="button" class="btn btn-sm" id="sendCodeBtn">Send Code</button>' : ''}
+            </div>
           </div>
+          ${needCode ? `
+            <div class="form-group">
+              <label>Verification Code</label>
+              <input class="input" type="text" name="code" required placeholder="6-digit code from email" />
+            </div>
+          ` : ''}
           <div class="form-group">
             <label>Password</label>
             <input class="input" type="password" name="password" required minlength="6" placeholder="••••••" />
           </div>
+          ${isRegister ? `
+            <div class="form-group">
+              <label>Confirm Password</label>
+              <input class="input" type="password" name="confirmPassword" required minlength="6" placeholder="••••••" />
+            </div>
+          ` : ''}
           <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">
             ${isRegister ? 'Register' : 'Login'}
           </button>
@@ -577,18 +599,70 @@ function renderAuthForm(mode) {
     </div>
   `;
 
+  if (needCode) {
+    const sendBtn = document.getElementById('sendCodeBtn');
+    sendBtn.onclick = async () => {
+      const errEl = document.getElementById('authError');
+      const infoEl = document.getElementById('authInfo');
+      errEl.style.display = 'none';
+      infoEl.style.display = 'none';
+      const email = document.getElementById('authEmailInput').value.trim();
+      if (!email) {
+        errEl.textContent = 'Please enter your email first';
+        errEl.style.display = 'block';
+        return;
+      }
+      sendBtn.disabled = true;
+      try {
+        await api('/api/auth/send-code', {
+          method: 'POST',
+          body: JSON.stringify({ email }),
+        });
+        infoEl.textContent = 'Verification code sent! Check your mailbox.';
+        infoEl.style.display = 'block';
+        let secs = 60;
+        const timer = setInterval(() => {
+          secs -= 1;
+          if (secs <= 0) {
+            clearInterval(timer);
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send Code';
+          } else {
+            sendBtn.textContent = `${secs}s`;
+          }
+        }, 1000);
+      } catch (err) {
+        sendBtn.disabled = false;
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+      }
+    };
+  }
+
   document.getElementById('authForm').onsubmit = async (e) => {
     e.preventDefault();
     const errEl = document.getElementById('authError');
     errEl.style.display = 'none';
     const form = new FormData(e.target);
+    const email = form.get('email');
+    const password = form.get('password');
+
+    if (isRegister) {
+      const confirmPassword = form.get('confirmPassword');
+      if (password !== confirmPassword) {
+        errEl.textContent = 'Passwords do not match';
+        errEl.style.display = 'block';
+        return;
+      }
+    }
+
     try {
+      const payload = isRegister
+        ? { email, password, confirmPassword: form.get('confirmPassword'), code: form.get('code') }
+        : { email, password };
       const data = await api(isRegister ? '/api/auth/register' : '/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({
-          email: form.get('email'),
-          password: form.get('password'),
-        }),
+        body: JSON.stringify(payload),
       });
       state.user = data.user;
       renderAuthBar();

@@ -7,7 +7,7 @@ use std::{
 
 use gpui_kit::{
     component::scroll::ScrollableElement as _,
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
     ImageSource, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, WindowOptions, img,
@@ -31,6 +31,7 @@ use gpui_kit::{
         status_bar::StatusBar,
         switch::Switch,
         tab::{Tab, TabBar},
+        tag::{Tag, TagVariant},
         v_flex,
     },
     div,
@@ -43,7 +44,10 @@ use testrix_core::{
     merge_environments_into_bundle, parse_apifox, parse_openapi_3_0, parse_postman_collection,
     parse_postman_zip, rename_template_variables, resolve_request_auth,
 };
-use testrix_http::{HttpRunner, dispatch_share_future, login_testrix_server};
+use testrix_http::{
+    HttpRunner, ShareChannel, dispatch_share_future, login_testrix_server,
+    revoke_cloudflare_r2_share, revoke_testrix_server_share,
+};
 use testrix_storage::{
     ShareSettings, clear_saved_responses, create_environment, create_folder, create_project,
     create_request, delete_environment, delete_folder, delete_project, delete_request,
@@ -59,7 +63,7 @@ use crate::{
         APP_KEY_CONTEXT, CancelRequest, CloseActiveTab, FocusQuickSearch, NewFolder, NewProject,
         NewRequest, Quit, ReloadWorkspace, SaveActive, SendRequest, ToggleEnvSheet, ToggleTheme,
     },
-    container_editor::{ContainerTabEvent, ContainerTabView},
+    container_editor::{ActiveShareRecord, ContainerTabEvent, ContainerTabView},
     env_editor::{EnvEditorEvent, EnvEditorView},
     explorer::{ExplorerEvent, ExplorerPanel},
     request_editor::{RequestTabEvent, RequestTabView},
@@ -156,6 +160,7 @@ pub struct TestrixApp {
     remember_open_tabs: bool,
     remember_responses: bool,
     share_settings: ShareSettings,
+    active_shares: Vec<ActiveShareRecord>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -221,6 +226,7 @@ impl TestrixApp {
             remember_open_tabs: cfg.remember_open_tabs,
             remember_responses: cfg.remember_responses,
             share_settings: ShareSettings::from(&cfg),
+            active_shares: Vec::new(),
             _subscriptions: Vec::new(),
         };
 
@@ -864,6 +870,16 @@ impl TestrixApp {
             ContainerTabEvent::DirtyChanged => {
                 self.refresh_dirty_indicators(cx);
             }
+            ContainerTabEvent::ShareStarted(record) => {
+                if let Some(prev) = self.active_shares.iter().find(|s| s.id == record.id)
+                    && let Some(handle) = &prev.local_handle
+                {
+                    handle.stop();
+                }
+                self.active_shares.retain(|s| s.id != record.id);
+                self.active_shares.push(record);
+                cx.notify();
+            }
         }
     }
 
@@ -1492,6 +1508,205 @@ impl TestrixApp {
                 view.update(cx, |v, cx| v.set_share_settings(settings.clone(), cx));
             }
         }
+    }
+
+    fn revoke_share(
+        &mut self,
+        share_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pos) = self.active_shares.iter().position(|s| s.id == share_id) else {
+            return;
+        };
+        let record = self.active_shares.remove(pos);
+        cx.notify();
+
+        match record.channel {
+            ShareChannel::LocalNetwork => {
+                if let Some(handle) = record.local_handle {
+                    handle.stop();
+                }
+                window.push_notification(
+                    format!("Stopped local network share for {}", record.project_name),
+                    cx,
+                );
+                window.refresh();
+            }
+            ShareChannel::TestrixServer => {
+                let settings = self.share_settings.clone();
+                let proj_name = record.project_name.clone();
+                let rx = dispatch_share_future(revoke_testrix_server_share(
+                    settings.share_server_url,
+                    settings.share_token,
+                    record.project_slug,
+                ));
+                window.spawn(cx, async move |window| {
+                    let outcome = rx.await;
+                    _ = window.update(|window, cx| {
+                        match outcome {
+                            Ok(Ok(())) => window.push_notification(
+                                format!("Revoked Testrix Server share for {proj_name}"),
+                                cx,
+                            ),
+                            Ok(Err(err)) => window.push_notification(
+                                format!("Failed revoking server share: {err}"),
+                                cx,
+                            ),
+                            Err(_) => window.push_notification("Revoke task cancelled", cx),
+                        }
+                        window.refresh();
+                    });
+                })
+                .detach();
+            }
+            ShareChannel::CloudflareR2 => {
+                let settings = self.share_settings.clone();
+                let proj_name = record.project_name.clone();
+                let rx = dispatch_share_future(revoke_cloudflare_r2_share(
+                    settings.cloudflare_account_id,
+                    settings.cloudflare_r2_bucket,
+                    settings.cloudflare_api_token,
+                    record.project_slug,
+                    record.file_paths,
+                ));
+                window.spawn(cx, async move |window| {
+                    let outcome = rx.await;
+                    _ = window.update(|window, cx| {
+                        match outcome {
+                            Ok(Ok(())) => window.push_notification(
+                                format!("Revoked Cloudflare R2 share for {proj_name}"),
+                                cx,
+                            ),
+                            Ok(Err(err)) => window.push_notification(
+                                format!("Failed revoking R2 share: {err}"),
+                                cx,
+                            ),
+                            Err(_) => window.push_notification("Revoke task cancelled", cx),
+                        }
+                        window.refresh();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn open_shares_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app_entity = cx.entity();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let shares = app_entity.read(cx).active_shares.clone();
+            let app_for_revoke = app_entity.clone();
+
+            dialog
+                .title("Active Shares")
+                .width(px(580.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .max_h(px(460.))
+                        .overflow_y_scrollbar()
+                        .when(shares.is_empty(), |parent| {
+                            parent.child(
+                                div()
+                                    .py_6()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("No active shares in this session. Open any project's Share tab to publish via Testrix Server, Cloudflare R2, or Local Network."),
+                            )
+                        })
+                        .children(shares.into_iter().map(|share| {
+                            let share_id = share.id.clone();
+                            let url_copy = share.share_url.clone();
+                            let app_revoke = app_for_revoke.clone();
+                            v_flex()
+                                .gap_1p5()
+                                .p_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().secondary)
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .child(share.project_name.clone()),
+                                                )
+                                                .child(
+                                                    Tag::new()
+                                                        .with_variant(TagVariant::Secondary)
+                                                        .outline()
+                                                        .small()
+                                                        .child(share.channel.label()),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1p5()
+                                                .child(
+                                                    Button::new(format!("copy-active-share-{}", share.id))
+                                                        .xsmall()
+                                                        .outline()
+                                                        .label("Copy URL")
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.write_to_clipboard(
+                                                                ClipboardItem::new_string(
+                                                                    url_copy.clone(),
+                                                                ),
+                                                            );
+                                                            window.push_notification(
+                                                                "Share URL copied to clipboard",
+                                                                cx,
+                                                            );
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new(format!("revoke-share-{}", share.id))
+                                                        .xsmall()
+                                                        .danger()
+                                                        .label("Revoke")
+                                                        .on_click(move |_, window, cx| {
+                                                            let id = share_id.clone();
+                                                            app_revoke.update(cx, |this, cx| {
+                                                                this.revoke_share(id, window, cx);
+                                                            });
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .child(share.share_url),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("Target: {}", share.target_info)),
+                                )
+                        })),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        DialogClose::new().child(
+                            Button::new("shares-done-btn")
+                                .primary()
+                                .label(crate::i18n::t("done")),
+                        ),
+                    ),
+                )
+        });
     }
 
     fn open_preferences_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2615,6 +2830,21 @@ impl Render for TestrixApp {
                                             Theme::change(next, None, cx);
                                             crate::theme_helpers::configure_syntax_highlighting(cx);
                                         }),
+                                )
+                                .child(
+                                    Button::new("shares-window-btn")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(LucideIcon::Globe)
+                                        .label(if self.active_shares.is_empty() {
+                                            "Shares".to_string()
+                                        } else {
+                                            format!("Shares ({})", self.active_shares.len())
+                                        })
+                                        .tooltip("View and revoke active shares")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_shares_dialog(window, cx);
+                                        })),
                                 )
                                 .child(
                                     Button::new("preferences-btn")
