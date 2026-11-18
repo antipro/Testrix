@@ -532,6 +532,30 @@ impl TestrixApp {
             RequestTabEvent::DirtyChanged => {
                 self.refresh_dirty_indicators(cx);
             }
+            RequestTabEvent::ApplyPostScriptEnv {
+                project_id,
+                env_id,
+                vars,
+            } => {
+                if let Some(proj) = self.workspace.find_project_mut(&project_id)
+                    && let Some(env_node) =
+                        proj.environments.iter_mut().find(|e| e.doc.id == env_id)
+                {
+                    let changed =
+                        crate::post_script::apply_vars_to_environment(&mut env_node.doc, &vars);
+                    if !changed.is_empty() {
+                        if let Err(err) = save_environment(env_node) {
+                            window.push_notification(
+                                format!("Failed saving post-script environment: {err}"),
+                                cx,
+                            );
+                            return;
+                        }
+                        self.sync_env_editor(window, cx);
+                        self.sync_all_tabs(window, cx);
+                    }
+                }
+            }
         }
     }
 
@@ -1809,6 +1833,7 @@ fn remove_request_from_folder(folder: &mut testrix_core::FolderNode, request_id:
 /// Initializes Testrix keybindings and GPUI Kit components.
 pub fn init_app(cx: &mut App) {
     gpui_kit::init(cx);
+    gpui_shell::init(cx);
     crate::actions::init_keybindings(cx);
 }
 

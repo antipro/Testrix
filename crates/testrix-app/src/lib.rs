@@ -8,6 +8,7 @@ mod editable_combobox;
 mod env_editor;
 mod explorer;
 mod kv_editor;
+mod post_script;
 mod request_editor;
 mod theme_helpers;
 

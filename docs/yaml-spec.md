@@ -173,6 +173,7 @@ request:
 | `headers` | `KeyValueRow[]` | `[]` | Request headers. Applied after `Project.defaultHeaders` and Auth headers. |
 | `auth` | `AuthConfig` | `{ type: inherit }` | Request authentication configuration. |
 | `body` | `RequestBody` | `{ type: none }` | Payload configuration (discriminated by `type`). |
+| `postScript` | `string` | `""` | Optional JavaScript post-response script executed via `gpui-shell`. See [post-script.md](./post-script.md). |
 | `settings` | `RequestSettings` | `{ 30000, true, true }` | Per-request execution options. |
 
 #### `KeyValueRow`

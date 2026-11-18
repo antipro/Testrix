@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
@@ -37,6 +37,7 @@ use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
     editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent},
     kv_editor::{KeyValueTable, MultipartTable, TableChangeEvent, common_http_header_options},
+    post_script::run_post_script,
     theme_helpers::{apply_unresolved_var_border, format_bytes, method_color, status_badge},
 };
 
@@ -72,6 +73,7 @@ enum RequestSection {
     Headers,
     Body,
     Auth,
+    PostScript,
     YamlSpec,
     Settings,
 }
@@ -137,6 +139,11 @@ pub(crate) enum RequestTabEvent {
         project_id: String,
         node: AuthNodeRef,
     },
+    ApplyPostScriptEnv {
+        project_id: String,
+        env_id: String,
+        vars: BTreeMap<String, String>,
+    },
     DirtyChanged,
 }
 
@@ -171,8 +178,10 @@ pub(crate) struct RequestTabView {
     binary_path_input: Entity<InputState>,
     binary_ct_input: Entity<InputState>,
 
-    // Auth + YAML + Settings controls
+    // Auth + Post-Script + YAML + Settings controls
     auth_editor: Entity<AuthEditor>,
+    post_script_editor: Entity<EditorState>,
+    post_script_status: Option<Result<String, String>>,
     yaml_editor: Entity<EditorState>,
     timeout_input: Entity<InputState>,
     follow_redirects: bool,
@@ -336,6 +345,13 @@ impl RequestTabView {
             editor
         });
 
+        let post_script_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("javascript")
+                .folding(true)
+                .default_value(doc.request.post_script.clone())
+        });
+
         let yaml_text = to_yaml_pretty(doc).unwrap_or_default();
         let yaml_editor = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -386,6 +402,8 @@ impl RequestTabView {
             binary_path_input,
             binary_ct_input,
             auth_editor,
+            post_script_editor,
+            post_script_status: None,
             yaml_editor,
             timeout_input,
             follow_redirects: doc.request.settings.follow_redirects,
@@ -469,6 +487,15 @@ impl RequestTabView {
         ));
         subs.push(cx.subscribe_in(
             &self.raw_editor,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_edited(window, cx);
+                }
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &self.post_script_editor,
             window,
             |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -716,6 +743,43 @@ impl RequestTabView {
                             editor.set_highlighter(lang, cx);
                             editor.set_value(pretty, window, cx);
                         });
+                        let script = this.post_script_editor.read(cx).value().to_string();
+                        if !script.trim().is_empty() {
+                            let req_name = this.name_input.read(cx).value().trim().to_string();
+                            match run_post_script(
+                                &script,
+                                &this.request_id,
+                                &req_name,
+                                this.active_env.as_ref(),
+                                &snapshot,
+                            ) {
+                                Ok(res) => {
+                                    let count = res.changed_keys.len();
+                                    if count > 0
+                                        && let Some(env) = &this.active_env
+                                    {
+                                        cx.emit(RequestTabEvent::ApplyPostScriptEnv {
+                                            project_id: this.project_id.clone(),
+                                            env_id: env.id.clone(),
+                                            vars: res.next_vars,
+                                        });
+                                    }
+                                    this.post_script_status = Some(Ok(format!(
+                                        "Post-script executed ({count} variable(s) updated)"
+                                    )));
+                                }
+                                Err(err) => {
+                                    let msg = err.to_string();
+                                    this.post_script_status = Some(Err(msg.clone()));
+                                    window.push_notification(
+                                        format!("Post-script error: {msg}"),
+                                        cx,
+                                    );
+                                }
+                            }
+                        } else {
+                            this.post_script_status = None;
+                        }
                         this.execution = RequestExecutionState::Completed(Box::new(snapshot));
                     }
                     Ok(Err(HttpError::Cancelled)) => {
@@ -807,6 +871,7 @@ impl RequestTabView {
         doc.request.params = self.params_table.read(cx).snapshot(cx);
         doc.request.headers = self.headers_table.read(cx).snapshot(cx);
         doc.request.auth = self.auth_editor.read(cx).snapshot(cx);
+        doc.request.post_script = self.post_script_editor.read(cx).value().to_string();
         doc.request.body = match self.body_mode {
             BodyMode::None => RequestBody::None,
             BodyMode::Json => RequestBody::Json {
@@ -1038,9 +1103,11 @@ impl RequestTabView {
             RequestSection::Headers,
             RequestSection::Body,
             RequestSection::Auth,
+            RequestSection::PostScript,
             RequestSection::YamlSpec,
             RequestSection::Settings,
         ];
+        let has_post_script = !self.post_script_editor.read(cx).value().trim().is_empty();
         let selected_ix = sections
             .iter()
             .position(|s| *s == self.active_request_section)
@@ -1074,6 +1141,11 @@ impl RequestTabView {
                     }))
                     .child(Tab::new().label(format!("Body ({})", self.body_mode.label())))
                     .child(Tab::new().label("Auth"))
+                    .child(Tab::new().label(if has_post_script {
+                        "Post-Script •"
+                    } else {
+                        "Post-Script"
+                    }))
                     .child(Tab::new().label("YAML Spec"))
                     .child(Tab::new().label("Settings")),
             )
@@ -1126,6 +1198,9 @@ impl RequestTabView {
                                 .overflow_y_scrollbar()
                                 .child(self.auth_editor.clone()),
                         )
+                    })
+                    .when(self.active_request_section == RequestSection::PostScript, |this| {
+                        this.child(self.render_post_script_pane(cx))
                     })
                     .when(self.active_request_section == RequestSection::YamlSpec, |this| {
                         this.child(self.render_yaml_spec_pane(cx))
@@ -1279,6 +1354,51 @@ impl RequestTabView {
                                 ),
                         )
                     }),
+            )
+    }
+
+    fn render_post_script_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Globals: environment, request, response (runs in gpui-shell after response)"),
+                    )
+                    .when_some(self.post_script_status.as_ref(), |row, status| match status {
+                        Ok(msg) => row.child(
+                            Tag::new()
+                                .with_variant(TagVariant::Success)
+                                .outline()
+                                .xsmall()
+                                .child(msg.clone()),
+                        ),
+                        Err(err) => row.child(
+                            Tag::new()
+                                .with_variant(TagVariant::Danger)
+                                .outline()
+                                .xsmall()
+                                .child(err.clone()),
+                        ),
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .overflow_hidden()
+                    .child(Editor::new(&self.post_script_editor).size_full()),
             )
     }
 

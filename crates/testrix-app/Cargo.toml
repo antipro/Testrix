@@ -16,8 +16,10 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 gpui-kit.workspace = true
+gpui-shell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 testrix-core.workspace = true
 testrix-http.workspace = true
 testrix-storage.workspace = true
@@ -26,4 +28,3 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["tree-sitter-yaml", "tree-sitter-html", "test-support"] }
-tempfile.workspace = true

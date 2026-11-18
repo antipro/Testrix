@@ -469,6 +469,8 @@ pub struct HttpRequestSpec {
     pub auth: AuthConfig,
     #[serde(default)]
     pub body: RequestBody,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub post_script: String,
     #[serde(default)]
     pub settings: RequestSettings,
 }
@@ -482,6 +484,7 @@ impl Default for HttpRequestSpec {
             headers: Vec::new(),
             auth: AuthConfig::Inherit,
             body: RequestBody::None,
+            post_script: String::new(),
             settings: RequestSettings::default(),
         }
     }

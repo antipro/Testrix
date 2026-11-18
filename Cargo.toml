@@ -23,6 +23,7 @@ testrix-http = { path = "crates/testrix-http" }
 
 # UI framework
 gpui-kit = { version = "0.10.0", features = ["tree-sitter-yaml", "tree-sitter-html"] }
+gpui-shell = { version = "0.10.0", default-features = false, features = ["quickjs"] }
 
 # Serialization & data formats
 serde = { version = "1.0", features = ["derive"] }
