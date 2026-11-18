@@ -677,6 +677,34 @@ impl RequestTabView {
         changed
     }
 
+    pub(crate) fn replace_url_base(
+        &mut self,
+        old_base: &str,
+        new_base: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current_prefix = self.url_prefix_combo.read(cx).value(cx);
+        let old_trimmed = old_base.trim().trim_end_matches('/');
+        let new_trimmed = new_base.trim().trim_end_matches('/');
+        if old_trimmed.is_empty()
+            || new_trimmed.is_empty()
+            || old_trimmed == new_trimmed
+            || current_prefix.trim().trim_end_matches('/') != old_trimmed
+        {
+            return false;
+        }
+        self.url_prefix_combo.update(cx, |combo, cx| {
+            combo.set_value(new_trimmed.to_string(), window, cx);
+        });
+        if !self.dirty {
+            self.saved_doc = self.build_doc(cx);
+        }
+        self.refresh_yaml_preview(window, cx);
+        cx.notify();
+        true
+    }
+
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
         let doc = self.build_doc(cx);
         cx.emit(RequestTabEvent::SaveRequest {

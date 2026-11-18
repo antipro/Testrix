@@ -576,16 +576,35 @@ impl TestrixApp {
         match event {
             ContainerTabEvent::SaveProject { project_id, doc } => {
                 if let Some(proj) = self.workspace.find_project_mut(&project_id) {
+                    let old_base_url = proj.doc.base_url.trim().to_string();
+                    let new_base_url = doc.base_url.trim().to_string();
                     proj.doc = doc;
                     if let Err(err) = save_project(proj) {
                         window.push_notification(format!("Failed saving project: {err}"), cx);
                         return;
+                    }
+                    let base_changed = !old_base_url.is_empty()
+                        && !new_base_url.is_empty()
+                        && old_base_url != new_base_url;
+                    if base_changed {
+                        propagate_base_url_in_project(proj, &old_base_url, &new_base_url);
                     }
                     let target_key = format!("proj:{project_id}");
                     if let Some(WorkbenchTab::Container(tab)) =
                         self.tabs.iter().find(|t| t.key(cx) == target_key)
                     {
                         tab.update(cx, |view, cx| view.mark_saved(cx));
+                    }
+                    if base_changed {
+                        for tab in &self.tabs {
+                            if let WorkbenchTab::Request(view) = tab
+                                && view.read(cx).project_id() == project_id
+                            {
+                                view.update(cx, |v, cx| {
+                                    v.replace_url_base(&old_base_url, &new_base_url, window, cx);
+                                });
+                            }
+                        }
                     }
                     self.explorer.update(cx, |panel, cx| {
                         panel.set_workspace(self.workspace.clone(), cx);
@@ -2273,5 +2292,69 @@ fn propagate_variable_renames_in_project(proj: &mut ProjectNode, renames: &[(Str
     }
     for folder in &mut proj.folders {
         propagate_variable_renames_in_folder(folder, renames);
+    }
+}
+
+fn replace_url_base_prefix(url: &str, old_base: &str, new_base: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let old_trimmed = old_base.trim().trim_end_matches('/');
+    let new_trimmed = new_base.trim().trim_end_matches('/');
+    if old_trimmed.is_empty() || new_trimmed.is_empty() || old_trimmed == new_trimmed {
+        return None;
+    }
+    let rest = trimmed.strip_prefix(old_trimmed)?;
+    if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#') {
+        Some(format!("{new_trimmed}{rest}"))
+    } else {
+        None
+    }
+}
+
+fn propagate_base_url_in_folder(folder: &mut FolderNode, old_base: &str, new_base: &str) {
+    for req in &mut folder.requests {
+        if let Some(next_url) = replace_url_base_prefix(&req.doc.request.url, old_base, new_base) {
+            req.doc.request.url = next_url;
+            let _ = save_request(req);
+        }
+    }
+    for sub in &mut folder.folders {
+        propagate_base_url_in_folder(sub, old_base, new_base);
+    }
+}
+
+fn propagate_base_url_in_project(proj: &mut ProjectNode, old_base: &str, new_base: &str) {
+    for req in &mut proj.requests {
+        if let Some(next_url) = replace_url_base_prefix(&req.doc.request.url, old_base, new_base) {
+            req.doc.request.url = next_url;
+            let _ = save_request(req);
+        }
+    }
+    for folder in &mut proj.folders {
+        propagate_base_url_in_folder(folder, old_base, new_base);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replaces_matching_base_url_prefix_and_preserves_other_variables() {
+        assert_eq!(
+            replace_url_base_prefix("{{base_url}}/get", "{{base_url}}", "{{base_url_emr}}"),
+            Some("{{base_url_emr}}/get".to_string())
+        );
+        assert_eq!(
+            replace_url_base_prefix("{{base_url}}", "{{base_url}}", "{{base_url_emr}}"),
+            Some("{{base_url_emr}}".to_string())
+        );
+        assert_eq!(
+            replace_url_base_prefix("{{other_var}}/get", "{{base_url}}", "{{base_url_emr}}"),
+            None
+        );
+        assert_eq!(
+            replace_url_base_prefix("/get", "{{base_url}}", "{{base_url_emr}}"),
+            None
+        );
     }
 }

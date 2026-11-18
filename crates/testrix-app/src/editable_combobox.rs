@@ -153,6 +153,19 @@ impl EditableCombobox {
         self.input.read(cx).value().to_string()
     }
 
+    pub(crate) fn set_value(
+        &mut self,
+        value: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = value.into();
+        self.input.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+        });
+        cx.notify();
+    }
+
     pub(crate) fn set_placeholder(
         &mut self,
         placeholder: impl Into<SharedString>,
