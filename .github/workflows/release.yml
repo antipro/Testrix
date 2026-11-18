@@ -108,6 +108,7 @@ jobs:
           # Create standard macOS .app directory layout
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
           cp target/release/testrix "${APP_DIR}/Contents/MacOS/testrix"
+          strip -x "${APP_DIR}/Contents/MacOS/testrix"
           cp crates/testrix-app/assets/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
           cp crates/testrix-app/assets/Info.plist "${APP_DIR}/Contents/Info.plist"
           cp docs/SKILL.md "${APP_DIR}/Contents/Resources/SKILL.md"
@@ -124,10 +125,14 @@ jobs:
           cp -R "${APP_DIR}" "${DMG_STAGING}/"
           ln -s /Applications "${DMG_STAGING}/Applications"
 
+          # Compute generous image size so hdiutil does not run out of space on large binaries
+          SIZE_MB=$(du -sm "${DMG_STAGING}" | awk '{print int($1 * 1.5) + 64}')
+
           # Create compressed UDZO disk image
           hdiutil create \
             -volname "Testrix" \
             -srcfolder "${DMG_STAGING}" \
+            -size "${SIZE_MB}m" \
             -ov \
             -format UDZO \
             "dist/${DMG_NAME}"
