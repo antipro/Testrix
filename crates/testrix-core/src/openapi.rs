@@ -305,6 +305,48 @@ pub fn parse_openapi_3_0(json_str: &str) -> Result<ImportedProjectBundle, CoreEr
     })
 }
 
+/// Merges existing environment profiles into `bundle.environments` without overwriting
+/// existing variables, then appends any new profiles/variables from the OpenAPI import.
+pub fn merge_environments_into_bundle(
+    bundle: &mut ImportedProjectBundle,
+    existing_envs: &[EnvironmentDoc],
+) {
+    if existing_envs.is_empty() {
+        return;
+    }
+
+    let imported_envs = std::mem::take(&mut bundle.environments);
+    let mut merged: Vec<EnvironmentDoc> = existing_envs
+        .iter()
+        .map(|env| {
+            let mut copy = env.clone();
+            copy.id = generate_id("env");
+            copy
+        })
+        .collect();
+
+    for incoming in imported_envs {
+        if let Some(target) = merged
+            .iter_mut()
+            .find(|e| e.name.eq_ignore_ascii_case(&incoming.name))
+        {
+            for var in incoming.variables {
+                if !target
+                    .variables
+                    .iter()
+                    .any(|v| v.key.trim() == var.key.trim())
+                {
+                    target.variables.push(var);
+                }
+            }
+        } else {
+            merged.push(incoming);
+        }
+    }
+
+    bundle.environments = merged;
+}
+
 fn resolve_security_requirement(
     security: &[Value],
     schemes: Option<&serde_json::Map<String, Value>>,
@@ -718,5 +760,37 @@ mod tests {
     fn rejects_non_openapi_3_0_documents() {
         let err = parse_openapi_3_0(r#"{"swagger":"2.0","info":{"title":"Legacy"}}"#).unwrap_err();
         assert!(err.to_string().contains("3.0"));
+    }
+
+    #[test]
+    fn merges_existing_profiles_into_new_project_bundle_without_overwriting() {
+        let json = r#"{
+          "openapi": "3.0.1",
+          "info": { "title": "AppCore", "version": "1.0.0" },
+          "servers": [{ "url": "http://localhost:30001/app-core", "description": "Development" }],
+          "paths": {}
+        }"#;
+        let mut bundle = parse_openapi_3_0(json).unwrap();
+
+        let mut existing = EnvironmentDoc::new("env-old", "Development");
+        existing
+            .variables
+            .push(EnvVariable::new("base_url", "http://192.168.1.231:4433"));
+        existing
+            .variables
+            .push(EnvVariable::new("api_token", "keep-secret-token"));
+
+        merge_environments_into_bundle(&mut bundle, &[existing]);
+
+        assert_eq!(bundle.environments.len(), 1);
+        assert_eq!(bundle.environments[0].name, "Development");
+        assert_eq!(
+            bundle.environments[0].variables[0].value,
+            "http://192.168.1.231:4433"
+        );
+        assert_eq!(
+            bundle.environments[0].variables[1].value,
+            "keep-secret-token"
+        );
     }
 }

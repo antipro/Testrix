@@ -26,7 +26,9 @@ pub use model::{
     ProjectNode, RawBodyFormat, RequestBody, RequestNode, RequestSettings, WorkspaceTree,
     generate_id,
 };
-pub use openapi::{ImportedFolder, ImportedProjectBundle, parse_openapi_3_0};
+pub use openapi::{
+    ImportedFolder, ImportedProjectBundle, merge_environments_into_bundle, parse_openapi_3_0,
+};
 pub use response::{
     HttpResponseSnapshot, RequestExecutionState, ResponseHeader, SentRequestSnapshot,
     format_pretty_body,
