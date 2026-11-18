@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use gpui_kit::{
     App, Hsla, IntoElement, ParentElement as _, Styled as _,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Sizable as _, StyledExt as _,
+        ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
+        highlighter::{LanguageConfig, LanguageRegistry, ThemeStyle},
         input::Input,
         tag::{Tag, TagVariant},
     },
@@ -118,6 +121,78 @@ pub(crate) fn apply_unresolved_var_border(
     input.when(has_unresolved_variables(text, active_env), |i| {
         i.border_color(cx.theme().danger).focus_bordered(false)
     })
+}
+
+const JSON_HIGHLIGHTS_WITH_BRACKETS: &str = r#"
+(comment) @comment
+
+(string) @string
+(escape_sequence) @string.escape
+
+(number) @number
+
+(pair key: (string) @property)
+
+[
+  (true)
+  (false)
+] @boolean
+
+(null) @constant.builtin
+
+[
+  "{"
+  "}"
+  "["
+  "]"
+] @punctuation.bracket
+
+[
+  ","
+  ":"
+] @punctuation.delimiter
+"#;
+
+/// Registers brace/bracket tree-sitter captures for JSON and applies bracket/delimiter
+/// colors to the active [`HighlightTheme`].
+pub(crate) fn configure_syntax_highlighting(cx: &mut App) {
+    let registry = LanguageRegistry::singleton();
+    if let Some(json_cfg) = registry.language("json")
+        && let Some(lang) = json_cfg.language
+    {
+        let updated = LanguageConfig::new(
+            json_cfg.name,
+            lang,
+            json_cfg.injection_languages,
+            JSON_HIGHLIGHTS_WITH_BRACKETS,
+            &json_cfg.injections,
+            &json_cfg.locals,
+        );
+        registry.register("json", &updated);
+    }
+
+    let is_dark = cx.theme().is_dark();
+    let bracket_hex = if is_dark { "#fbbf24" } else { "#b45309" };
+    let delim_hex = if is_dark { "#9ca3af" } else { "#6b7280" };
+
+    let bracket_style: Option<ThemeStyle> =
+        serde_json::from_value(serde_json::json!({ "color": bracket_hex })).ok();
+    let delim_style: Option<ThemeStyle> =
+        serde_json::from_value(serde_json::json!({ "color": delim_hex })).ok();
+
+    let mut highlight = (*cx.theme().highlight_theme).clone();
+    if let Some(style) = bracket_style {
+        highlight.style.syntax.punctuation_bracket = Some(style);
+        if highlight.style.syntax.punctuation.is_none() {
+            highlight.style.syntax.punctuation = Some(style);
+        }
+    }
+    if let Some(style) = delim_style
+        && highlight.style.syntax.punctuation_delimiter.is_none()
+    {
+        highlight.style.syntax.punctuation_delimiter = Some(style);
+    }
+    Theme::global_mut(cx).highlight_theme = Arc::new(highlight);
 }
 
 #[cfg(test)]

@@ -1763,6 +1763,7 @@ impl Render for TestrixApp {
                     ThemeMode::Dark
                 };
                 Theme::change(next, None, cx);
+                crate::theme_helpers::configure_syntax_highlighting(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleEnvSheet, window, cx| {
                 this.open_env_sheet(window, cx);
@@ -1830,6 +1831,7 @@ impl Render for TestrixApp {
                                                 ThemeMode::Dark
                                             };
                                             Theme::change(next, None, cx);
+                                            crate::theme_helpers::configure_syntax_highlighting(cx);
                                         }),
                                 ),
                         )
@@ -2172,6 +2174,7 @@ fn remove_request_from_folder(folder: &mut testrix_core::FolderNode, request_id:
 pub fn init_app(cx: &mut App) {
     gpui_kit::init(cx);
     gpui_shell::init(cx);
+    crate::theme_helpers::configure_syntax_highlighting(cx);
     crate::actions::init_keybindings(cx);
 }
 
