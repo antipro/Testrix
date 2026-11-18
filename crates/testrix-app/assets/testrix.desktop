@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Testrix
+Comment=YAML API Workbench
+Exec=testrix
+Icon=testrix
+Terminal=false
+Categories=Development;WebDevelopment;Utility;
+StartupWMClass=testrix

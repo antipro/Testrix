@@ -28,3 +28,12 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["tree-sitter-yaml", "tree-sitter-html", "test-support"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[package.metadata.bundle]
+name = "Testrix"
+identifier = "io.testrix.app"
+icon = ["assets/AppIcon.icns", "assets/icon-1024.png", "assets/icon.png"]
+short_description = "Testrix — YAML API Workbench"
