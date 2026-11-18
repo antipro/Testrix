@@ -76,7 +76,14 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = 0
 
-[profile.dev.package]
-resvg = { opt-level = 3 }
-rustybuzz = { opt-level = 3 }
-taffy = { opt-level = 3 }
+[profile.dev.package.resvg]
+opt-level = 3
+
+[profile.dev.package.rustybuzz]
+opt-level = 3
+
+[profile.dev.package.taffy]
+opt-level = 3
+
+[profile.dev.package.libquickjs-sys]
+opt-level = 3
