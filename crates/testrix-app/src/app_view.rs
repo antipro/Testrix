@@ -1775,6 +1775,9 @@ pub fn open_main_window(
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
         window_min_size: Some(size(px(960.), px(620.))),
+        kind: gpui_kit::WindowKind::Normal,
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(gpui_kit::WindowDecorations::Client),
         ..TitleBar::window_options()
     };
 
