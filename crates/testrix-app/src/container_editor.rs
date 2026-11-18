@@ -5,12 +5,14 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, WindowExt as _,
+        ActiveTheme as _, Disableable as _, Icon, IndexPath, Sizable as _, StyledExt as _,
+        WindowExt as _,
         button::{Button, ButtonVariants as _},
         form::{Field, Form},
         h_flex,
         input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
         scroll::ScrollableElement as _,
+        select::{Select, SelectItem, SelectState},
         tab::{Tab, TabBar},
         tag::{Tag, TagVariant},
         v_flex,
@@ -43,6 +45,33 @@ enum ContainerSection {
     DefaultHeaders,
     YamlSpec,
     Share,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdapterIpOption {
+    ip: String,
+    label: SharedString,
+}
+
+impl AdapterIpOption {
+    fn from_adapter(adapter: &NetworkAdapterIp) -> Self {
+        Self {
+            ip: adapter.ip.clone(),
+            label: adapter.display_label().into(),
+        }
+    }
+}
+
+impl SelectItem for AdapterIpOption {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.ip
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +137,7 @@ pub(crate) struct ContainerTabView {
     share_in_flight: bool,
     share_status: Option<Result<ShareUploadResult, String>>,
     project_snapshot: Option<ProjectNode>,
-    adapter_ips: Vec<NetworkAdapterIp>,
-    selected_ip_ix: usize,
+    ip_select: Option<Entity<SelectState<Vec<AdapterIpOption>>>>,
     local_port_input: Option<Entity<InputState>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -172,7 +200,16 @@ impl ContainerTabView {
                 .default_value(yaml_text)
         });
 
-        let adapter_ips = list_outbound_ipv4_addresses();
+        let adapter_options: Vec<AdapterIpOption> = list_outbound_ipv4_addresses()
+            .iter()
+            .map(AdapterIpOption::from_adapter)
+            .collect();
+        let selected_ip_ix = if adapter_options.is_empty() {
+            None
+        } else {
+            Some(IndexPath::default())
+        };
+        let ip_select = cx.new(|cx| SelectState::new(adapter_options, selected_ip_ix, window, cx));
         let local_port_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Port (0 = auto, or e.g. 8787)")
@@ -203,8 +240,7 @@ impl ContainerTabView {
             share_in_flight: false,
             share_status: None,
             project_snapshot: Some(project.clone()),
-            adapter_ips,
-            selected_ip_ix: 0,
+            ip_select: Some(ip_select),
             local_port_input: Some(local_port_input),
             _subscriptions: Vec::new(),
         };
@@ -286,8 +322,7 @@ impl ContainerTabView {
             share_in_flight: false,
             share_status: None,
             project_snapshot: None,
-            adapter_ips: Vec::new(),
-            selected_ip_ix: 0,
+            ip_select: None,
             local_port_input: None,
             _subscriptions: Vec::new(),
         };
@@ -344,9 +379,9 @@ impl ContainerTabView {
                 return;
             };
             let bind_ip = self
-                .adapter_ips
-                .get(self.selected_ip_ix)
-                .map(|a| a.ip.clone())
+                .ip_select
+                .as_ref()
+                .and_then(|sel| sel.read(cx).selected_value().cloned())
                 .unwrap_or_else(|| "127.0.0.1".to_string());
             let port = self
                 .local_port_input
@@ -964,7 +999,7 @@ impl Render for ContainerTabView {
                                     && !settings.cloudflare_r2_bucket.trim().is_empty()
                                     && !settings.cloudflare_api_token.trim().is_empty()
                             }
-                            ShareChannel::LocalNetwork => !self.adapter_ips.is_empty(),
+                            ShareChannel::LocalNetwork => self.ip_select.is_some(),
                         };
 
                         let status_text = match self.share_channel {
@@ -997,9 +1032,9 @@ impl Render for ContainerTabView {
                             }
                             ShareChannel::LocalNetwork => {
                                 let selected_ip = self
-                                    .adapter_ips
-                                    .get(self.selected_ip_ix)
-                                    .map(|a| a.display_label())
+                                    .ip_select
+                                    .as_ref()
+                                    .and_then(|sel| sel.read(cx).selected_value().cloned())
                                     .unwrap_or_else(|| "127.0.0.1".to_string());
                                 format!("Local HTTP server will bind to outbound IP: {selected_ip}")
                             }
@@ -1055,8 +1090,6 @@ impl Render for ContainerTabView {
                                         .child(status_text),
                                 )
                                 .when(self.share_channel == ShareChannel::LocalNetwork, |parent| {
-                                    let ips = self.adapter_ips.clone();
-                                    let selected_ix = self.selected_ip_ix;
                                     parent.child(
                                         v_flex()
                                             .gap_2()
@@ -1075,28 +1108,35 @@ impl Render for ContainerTabView {
                                                             .xsmall()
                                                             .outline()
                                                             .label("Refresh IPs")
-                                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                                this.adapter_ips = list_outbound_ipv4_addresses();
-                                                                this.selected_ip_ix = 0;
+                                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                                let options: Vec<AdapterIpOption> =
+                                                                    list_outbound_ipv4_addresses()
+                                                                        .iter()
+                                                                        .map(AdapterIpOption::from_adapter)
+                                                                        .collect();
+                                                                let sel_ix = if options.is_empty() {
+                                                                    None
+                                                                } else {
+                                                                    Some(IndexPath::default())
+                                                                };
+                                                                if let Some(ip_sel) = &this.ip_select {
+                                                                    ip_sel.update(cx, |state, cx| {
+                                                                        state.set_items(options, window, cx);
+                                                                        state.set_selected_index(sel_ix, window, cx);
+                                                                    });
+                                                                }
                                                                 cx.notify();
                                                             })),
                                                     ),
                                             )
-                                            .child(
-                                                h_flex().gap_2().flex_wrap().children(
-                                                    ips.into_iter().enumerate().map(|(ix, adapter)| {
-                                                        let active = ix == selected_ix;
-                                                        let btn = Button::new(format!("local-ip-{ix}"))
-                                                            .xsmall()
-                                                            .label(adapter.display_label())
-                                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                                this.selected_ip_ix = ix;
-                                                                cx.notify();
-                                                            }));
-                                                        if active { btn.primary() } else { btn.outline() }
-                                                    }),
-                                                ),
-                                            )
+                                            .when_some(self.ip_select.as_ref(), |col, ip_sel| {
+                                                col.child(
+                                                    Select::new(ip_sel)
+                                                        .id("local-ip-select")
+                                                        .small()
+                                                        .placeholder("Select outbound IP"),
+                                                )
+                                            })
                                             .when_some(self.local_port_input.as_ref(), |col, port_in| {
                                                 col.child(
                                                     h_flex()

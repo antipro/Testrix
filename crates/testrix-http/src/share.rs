@@ -252,6 +252,45 @@ pub async fn upload_to_testrix_server(
     })
 }
 
+#[derive(Deserialize)]
+struct CfAccountsResponse {
+    result: Option<Vec<CfAccount>>,
+}
+
+#[derive(Deserialize)]
+struct CfAccount {
+    id: String,
+}
+
+async fn resolve_cloudflare_account_id(
+    client: &reqwest::Client,
+    account_id: &str,
+    api_token: &str,
+) -> Result<String, String> {
+    let trimmed = account_id.trim();
+    if !trimmed.is_empty() && !trimmed.contains('@') {
+        return Ok(trimmed.to_string());
+    }
+
+    if let Ok(resp) = client
+        .get("https://api.cloudflare.com/client/v4/accounts")
+        .bearer_auth(api_token)
+        .send()
+        .await
+        && resp.status().is_success()
+        && let Ok(parsed) = resp.json::<CfAccountsResponse>().await
+        && let Some(first) = parsed.result.and_then(|v| v.into_iter().next())
+        && !first.id.trim().is_empty()
+    {
+        return Ok(first.id.trim().to_string());
+    }
+
+    Err(
+        "Cloudflare Account ID must be your 32-character hex Account ID from the Cloudflare Dashboard (not your email address)."
+            .to_string(),
+    )
+}
+
 /// Uploads a project's YAML files directly to Cloudflare R2 using the Cloudflare R2 REST API.
 pub async fn upload_to_cloudflare_r2(
     account_id: String,
@@ -262,10 +301,9 @@ pub async fn upload_to_cloudflare_r2(
     access_token: String,
     files: Vec<ShareFile>,
 ) -> Result<ShareUploadResult, String> {
-    let account_id = account_id.trim();
     let bucket = bucket.trim();
     let api_token = api_token.trim();
-    if account_id.is_empty() || bucket.is_empty() || api_token.is_empty() {
+    if bucket.is_empty() || api_token.is_empty() {
         return Err(
             "Cloudflare Account ID, R2 Bucket, and API Token must be configured in Preferences."
                 .to_string(),
@@ -276,6 +314,9 @@ pub async fn upload_to_cloudflare_r2(
         .user_agent("Testrix/0.1")
         .build()
         .map_err(|err| format!("Failed creating HTTP client: {err}"))?;
+
+    let account_id = resolve_cloudflare_account_id(&client, &account_id, api_token).await?;
+    let account_id = account_id.as_str();
 
     let total = files.len();
     for file in files {
@@ -376,10 +417,9 @@ pub async fn revoke_cloudflare_r2_share(
     project_slug: String,
     file_paths: Vec<String>,
 ) -> Result<(), String> {
-    let account_id = account_id.trim();
     let bucket = bucket.trim();
     let api_token = api_token.trim();
-    if account_id.is_empty() || bucket.is_empty() || api_token.is_empty() {
+    if bucket.is_empty() || api_token.is_empty() {
         return Err("Cloudflare R2 credentials are required to revoke".to_string());
     }
 
@@ -387,6 +427,9 @@ pub async fn revoke_cloudflare_r2_share(
         .user_agent("Testrix/0.1")
         .build()
         .map_err(|err| format!("Failed creating HTTP client: {err}"))?;
+
+    let account_id = resolve_cloudflare_account_id(&client, &account_id, api_token).await?;
+    let account_id = account_id.as_str();
 
     let mut keys: Vec<String> = file_paths
         .into_iter()

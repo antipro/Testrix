@@ -59,7 +59,76 @@ pub fn list_outbound_ipv4_addresses() -> Vec<NetworkAdapterIp> {
         }
     }
 
-    // 2. Parse `ifconfig` on macOS/BSD/Unix for all adapter IPv4 addresses.
+    // 2. Windows: parse `ipconfig` (works across locales since "IPv4" is ASCII) and fallback to PowerShell.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        if let Ok(out) = std::process::Command::new("ipconfig")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut current_iface = String::new();
+            for line in text.lines() {
+                let raw = line.trim_end();
+                if raw.is_empty() {
+                    continue;
+                }
+                if !raw.starts_with(char::is_whitespace) && raw.ends_with(':') {
+                    current_iface = raw.trim_end_matches(':').trim().to_string();
+                    continue;
+                }
+                let trimmed = raw.trim();
+                if let Some((key, val)) = trimmed.split_once(':') {
+                    if key.contains("IPv4") || key.contains("IP Address") {
+                        let ip = val
+                            .split('(')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if is_valid_ipv4(ip) && !ip.starts_with("127.") && seen.insert(ip.to_string()) {
+                            results.push(NetworkAdapterIp {
+                                interface_name: current_iface.clone(),
+                                ip: ip.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if results.len() <= 1
+            && let Ok(out) = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { \"$($_.InterfaceAlias)|$($_.IPAddress)\" }",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Some((iface, ip)) = line.trim().split_once('|') {
+                    let ip = ip.trim();
+                    if is_valid_ipv4(ip) && !ip.starts_with("127.") && seen.insert(ip.to_string()) {
+                        results.push(NetworkAdapterIp {
+                            interface_name: iface.trim().to_string(),
+                            ip: ip.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Parse `ifconfig` on macOS/BSD/Unix for all adapter IPv4 addresses.
+    #[cfg(not(target_os = "windows"))]
     if let Ok(out) = std::process::Command::new("ifconfig").output()
         && out.status.success()
     {
@@ -85,8 +154,9 @@ pub fn list_outbound_ipv4_addresses() -> Vec<NetworkAdapterIp> {
         }
     }
 
-    // 3. Parse `ip -4 -o addr show` on Linux if available.
-    if results.is_empty()
+    // 4. Parse `ip -4 -o addr show` on Linux if available.
+    #[cfg(not(target_os = "windows"))]
+    if results.len() <= 1
         && let Ok(out) = std::process::Command::new("ip")
             .args(["-4", "-o", "addr", "show"])
             .output()

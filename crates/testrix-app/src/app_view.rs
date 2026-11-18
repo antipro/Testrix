@@ -1731,7 +1731,7 @@ impl TestrixApp {
 
         let cf_account_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Cloudflare Account ID")
+                .placeholder("Account ID (32-char hex, NOT email)")
                 .default_value(current_share.cloudflare_account_id.clone())
         });
         let cf_bucket_input = cx.new(|cx| {
