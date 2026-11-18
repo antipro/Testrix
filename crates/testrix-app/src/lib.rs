@@ -7,6 +7,7 @@ mod container_editor;
 mod editable_combobox;
 mod env_editor;
 mod explorer;
+mod i18n;
 mod kv_editor;
 mod post_script;
 mod request_editor;

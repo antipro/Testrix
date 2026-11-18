@@ -77,6 +77,21 @@ impl SelectItem for ProfileOption {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LanguageOption(crate::i18n::AppLanguage);
+
+impl SelectItem for LanguageOption {
+    type Value = crate::i18n::AppLanguage;
+
+    fn title(&self) -> SharedString {
+        self.0.native_name().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
 #[derive(Clone)]
 enum WorkbenchTab {
     Request(Entity<RequestTabView>),
@@ -115,6 +130,7 @@ pub struct TestrixApp {
     explorer: Entity<ExplorerPanel>,
     env_editor: Entity<EnvEditorView>,
     profile_select: Entity<SelectState<Vec<ProfileOption>>>,
+    language_select: Entity<SelectState<Vec<LanguageOption>>>,
     tabs: Vec<WorkbenchTab>,
     active_tab_ix: Option<usize>,
     context_tab_ix: Option<usize>,
@@ -150,6 +166,25 @@ impl TestrixApp {
         let profile_select = cx.new(|cx| SelectState::new(profile_items, selected_ix, window, cx));
 
         let cfg = init_or_load_config().unwrap_or_default();
+        let initial_lang = crate::i18n::AppLanguage::from_code(&cfg.language);
+        crate::i18n::set_language(initial_lang);
+        let language_items: Vec<LanguageOption> = crate::i18n::AppLanguage::ALL
+            .iter()
+            .copied()
+            .map(LanguageOption)
+            .collect();
+        let language_ix = crate::i18n::AppLanguage::ALL
+            .iter()
+            .position(|&l| l == initial_lang)
+            .unwrap_or(0);
+        let language_select = cx.new(|cx| {
+            SelectState::new(
+                language_items,
+                Some(IndexPath::default().row(language_ix)),
+                window,
+                cx,
+            )
+        });
 
         let mut app = Self {
             focus_handle: cx.focus_handle(),
@@ -159,6 +194,7 @@ impl TestrixApp {
             explorer,
             env_editor,
             profile_select,
+            language_select,
             tabs: Vec::new(),
             active_tab_ix: None,
             context_tab_ix: None,
@@ -203,6 +239,23 @@ impl TestrixApp {
             |this, _, event: &SelectEvent<Vec<ProfileOption>>, window, cx| {
                 if let SelectEvent::Confirm(Some(env_id)) = event {
                     this.select_environment(env_id.clone(), window, cx);
+                }
+            },
+        ));
+
+        subs.push(cx.subscribe_in(
+            &self.language_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<LanguageOption>>, window, cx| {
+                if let SelectEvent::Confirm(Some(lang)) = event {
+                    crate::i18n::set_language(*lang);
+                    let _ = save_config_preferences(
+                        this.remember_open_tabs,
+                        this.remember_responses,
+                        lang.code(),
+                    );
+                    cx.notify();
+                    window.refresh();
                 }
             },
         ));
@@ -1003,14 +1056,14 @@ impl TestrixApp {
                         .child(
                             DialogClose::new().child(
                                 Button::new("tab-close-cancel-btn")
-                                    .label("Cancel")
+                                    .label(crate::i18n::t("cancel"))
                                     .outline(),
                             ),
                         )
                         .child(
                             Button::new("tab-close-discard-btn")
                                 .danger()
-                                .label("Don't Save")
+                                .label(crate::i18n::t("dont_save"))
                                 .on_click(move |_, window, cx| {
                                     app_discard.update(cx, |this, cx| {
                                         this.close_tabs_by_keys(&keys_discard, cx);
@@ -1021,7 +1074,7 @@ impl TestrixApp {
                         .child(
                             Button::new("tab-close-save-btn")
                                 .primary()
-                                .label("Save & Close")
+                                .label(crate::i18n::t("save_and_close"))
                                 .on_click(move |_, window, cx| {
                                     app_save.update(cx, |this, cx| {
                                         this.save_tabs_by_keys(&keys_save, cx);
@@ -1268,12 +1321,13 @@ impl TestrixApp {
         window.open_dialog(cx, move |dialog, _, cx| {
             let remember_tabs = app_entity.read(cx).remember_open_tabs;
             let remember_responses = app_entity.read(cx).remember_responses;
+            let language_select = app_entity.read(cx).language_select.clone();
             let app_tabs = app_entity.clone();
             let app_resps = app_entity.clone();
 
             dialog
-                .title("Preferences")
-                .width(px(460.))
+                .title(crate::i18n::t("preferences"))
+                .width(px(480.))
                 .child(
                     v_flex()
                         .gap_3()
@@ -1286,12 +1340,47 @@ impl TestrixApp {
                                 .child(
                                     v_flex()
                                         .gap_0p5()
-                                        .child(div().text_sm().font_medium().child("Remember last opened tabs"))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(crate::i18n::t("language")),
+                                        )
                                         .child(
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child("Restore open workbench tabs and active tab on startup."),
+                                                .child(crate::i18n::t("language_desc")),
+                                        ),
+                                )
+                                .child(
+                                    div().w(px(172.)).flex_none().child(
+                                        Select::new(&language_select)
+                                            .id("pref-language-select")
+                                            .small(),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(crate::i18n::t("remember_tabs")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(crate::i18n::t("remember_tabs_desc")),
                                         ),
                                 )
                                 .child(
@@ -1303,6 +1392,7 @@ impl TestrixApp {
                                                 let _ = save_config_preferences(
                                                     this.remember_open_tabs,
                                                     this.remember_responses,
+                                                    crate::i18n::current_language().code(),
                                                 );
                                                 if *next {
                                                     this.persist_open_tabs(cx);
@@ -1328,12 +1418,17 @@ impl TestrixApp {
                                 .child(
                                     v_flex()
                                         .gap_0p5()
-                                        .child(div().text_sm().font_medium().child("Remember request responses"))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(crate::i18n::t("remember_responses")),
+                                        )
                                         .child(
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child("Cache the latest HTTP response per request across restarts."),
+                                                .child(crate::i18n::t("remember_responses_desc")),
                                         ),
                                 )
                                 .child(
@@ -1345,6 +1440,7 @@ impl TestrixApp {
                                                 let _ = save_config_preferences(
                                                     this.remember_open_tabs,
                                                     this.remember_responses,
+                                                    crate::i18n::current_language().code(),
                                                 );
                                                 if !*next {
                                                     let _ = clear_saved_responses(
@@ -1363,7 +1459,7 @@ impl TestrixApp {
                         DialogClose::new().child(
                             Button::new("pref-done-btn")
                                 .primary()
-                                .label("Done"),
+                                .label(crate::i18n::t("done")),
                         ),
                     ),
                 )
@@ -2045,7 +2141,7 @@ impl Render for TestrixApp {
                                         .ghost()
                                         .xsmall()
                                         .icon(LucideIcon::FolderOpen)
-                                        .label("Workspace")
+                                        .label(crate::i18n::t("workspace"))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.choose_workspace_dir(window, cx);
                                         })),
@@ -2083,7 +2179,7 @@ impl Render for TestrixApp {
                                         .ghost()
                                         .xsmall()
                                         .icon(LucideIcon::SlidersHorizontal)
-                                        .tooltip("Preferences…")
+                                        .tooltip(crate::i18n::t("preferences"))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_preferences_dialog(window, cx);
                                         })),
@@ -2111,7 +2207,7 @@ impl Render for TestrixApp {
                                         .outline()
                                         .xsmall()
                                         .icon(LucideIcon::SlidersHorizontal)
-                                        .label(format!("Env Vars ({enabled_var_count})"))
+                                        .label(format!("{} ({enabled_var_count})", crate::i18n::t("env_vars")))
                                         .tooltip("Manage profiles and environment variables")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_env_sheet(window, cx);
@@ -2191,7 +2287,7 @@ impl TestrixApp {
                 let app_others = app_entity.clone();
                 let app_all = app_entity.clone();
 
-                menu.item(PopupMenuItem::new("Close Current Tab").on_click(
+                menu.item(PopupMenuItem::new(crate::i18n::t("close_current_tab")).on_click(
                     move |_, window, cx| {
                         app_close.update(cx, |this, cx| {
                             this.close_tab(target_ix, window, cx);
@@ -2199,7 +2295,7 @@ impl TestrixApp {
                     },
                 ))
                 .when(has_others, |m| {
-                    m.item(PopupMenuItem::new("Close Other Tabs").on_click(
+                    m.item(PopupMenuItem::new(crate::i18n::t("close_other_tabs")).on_click(
                         move |_, window, cx| {
                             app_others.update(cx, |this, cx| {
                                 this.close_other_tabs(target_ix, window, cx);
@@ -2208,7 +2304,7 @@ impl TestrixApp {
                     ))
                 })
                 .separator()
-                .item(PopupMenuItem::new("Close All Tabs").on_click(
+                .item(PopupMenuItem::new(crate::i18n::t("close_all_tabs")).on_click(
                     move |_, window, cx| {
                         app_all.update(cx, |this, cx| {
                             this.close_all_tabs(window, cx);

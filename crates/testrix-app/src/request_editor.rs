@@ -1159,9 +1159,13 @@ impl RequestTabView {
                             .when(!loading, |b| {
                                 b.primary()
                                     .icon(Icon::new(LucideIcon::SendHorizontal))
-                                    .label("Send")
+                                    .label(crate::i18n::t("send"))
                             })
-                            .when(loading, |b| b.danger().icon(Spinner::new()).label("Cancel"))
+                            .when(loading, |b| {
+                                b.danger()
+                                    .icon(Spinner::new())
+                                    .label(crate::i18n::t("cancel_req"))
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.is_loading() {
                                     this.cancel_request(cx);
@@ -1174,7 +1178,11 @@ impl RequestTabView {
                         Button::new(SharedString::from(format!("req-save-{id_base}")))
                             .outline()
                             .icon(Icon::new(LucideIcon::Save))
-                            .label(if self.dirty { "Save*" } else { "Save" })
+                            .label(if self.dirty {
+                                format!("{}*", crate::i18n::t("save"))
+                            } else {
+                                crate::i18n::t("save").to_string()
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.save(cx);
                             })),
@@ -1260,25 +1268,29 @@ impl RequestTabView {
                         }
                     }))
                     .child(Tab::new().label(if param_count > 0 {
-                        format!("Params ({param_count})")
+                        format!("{} ({param_count})", crate::i18n::t("params"))
                     } else {
-                        "Params".to_string()
+                        crate::i18n::t("params").to_string()
                     }))
                     .child(Tab::new().label(if header_count > 0 {
-                        format!("Headers ({header_count})")
+                        format!("{} ({header_count})", crate::i18n::t("headers"))
                     } else {
-                        "Headers".to_string()
+                        crate::i18n::t("headers").to_string()
                     }))
-                    .child(Tab::new().label(format!("Body ({})", self.body_mode.label())))
-                    .child(Tab::new().label("Auth"))
+                    .child(Tab::new().label(format!(
+                        "{} ({})",
+                        crate::i18n::t("body"),
+                        self.body_mode.label()
+                    )))
+                    .child(Tab::new().label(crate::i18n::t("auth")))
                     .child(Tab::new().label(if has_post_script {
-                        "Post-Script •"
+                        format!("{} •", crate::i18n::t("post_script"))
                     } else {
-                        "Post-Script"
+                        crate::i18n::t("post_script").to_string()
                     }))
-                    .child(Tab::new().label("YAML Spec"))
-                    .child(Tab::new().label("Settings"))
-                    .child(Tab::new().label("Code")),
+                    .child(Tab::new().label(crate::i18n::t("yaml_spec")))
+                    .child(Tab::new().label(crate::i18n::t("settings")))
+                    .child(Tab::new().label(crate::i18n::t("code"))),
             )
             .child(
                 div()
@@ -1380,7 +1392,7 @@ impl RequestTabView {
                                 .outline()
                                 .xsmall()
                                 .icon(Icon::new(LucideIcon::Sparkles))
-                                .label("Format JSON")
+                                .label(crate::i18n::t("format_json"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.format_json_body(window, cx);
                                 })),
@@ -1415,7 +1427,7 @@ impl RequestTabView {
                                     .outline()
                                     .xsmall()
                                     .icon(Icon::new(LucideIcon::Sparkles))
-                                    .label("Detect")
+                                    .label(crate::i18n::t("detect"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         let text = this.raw_editor.read(cx).value().to_string();
                                         let detected = detect_body_language(&text, None);
@@ -1602,7 +1614,7 @@ impl RequestTabView {
                             .outline()
                             .xsmall()
                             .icon(IconName::Copy)
-                            .label("Copy YAML")
+                            .label(crate::i18n::t("copy_yaml"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let yaml = this.yaml_editor.read(cx).value().to_string();
                                 cx.write_to_clipboard(ClipboardItem::new_string(yaml));
@@ -1697,7 +1709,7 @@ impl RequestTabView {
                             .outline()
                             .xsmall()
                             .icon(IconName::Copy)
-                            .label("Copy Code")
+                            .label(crate::i18n::t("copy_code"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let code = this.code_editor.read(cx).value().to_string();
                                 cx.write_to_clipboard(ClipboardItem::new_string(code));
@@ -1735,14 +1747,12 @@ impl RequestTabView {
                             .large()
                             .text_color(cx.theme().muted_foreground),
                     )
-                    .child(div().text_sm().font_medium().child("Ready to send"))
+                    .child(div().text_sm().font_medium().child(crate::i18n::t("ready_to_send")))
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(
-                                "Press Send or hit Enter in the URL bar to execute this request.",
-                            ),
+                            .child(crate::i18n::t("ready_to_send_hint")),
                     )
                     .into_any_element(),
                 RequestExecutionState::Loading { .. } => v_flex()
@@ -1756,13 +1766,13 @@ impl RequestTabView {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Executing HTTP request…"),
+                            .child(crate::i18n::t("executing_request")),
                     )
                     .child(
                         Button::new(SharedString::from(format!("cancel-req-{id_base}")))
                             .outline()
                             .small()
-                            .label("Cancel")
+                            .label(crate::i18n::t("cancel_req"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.cancel_request(cx);
                             })),
@@ -1851,7 +1861,7 @@ impl RequestTabView {
                             .outline()
                             .xsmall()
                             .icon(IconName::Copy)
-                            .label("Copy Body")
+                            .label(crate::i18n::t("copy_body"))
                             .on_click(cx.listener({
                                 let body = snapshot.pretty_body.clone();
                                 move |_, _, window, cx| {
@@ -1878,8 +1888,12 @@ impl RequestTabView {
                             cx.notify();
                         }
                     }))
-                    .child(Tab::new().label("Body"))
-                    .child(Tab::new().label(format!("Headers ({})", snapshot.headers.len())))
+                    .child(Tab::new().label(crate::i18n::t("body")))
+                    .child(Tab::new().label(format!(
+                        "{} ({})",
+                        crate::i18n::t("headers"),
+                        snapshot.headers.len()
+                    )))
                     .child(Tab::new().label("Effective Request")),
             )
             // Response content

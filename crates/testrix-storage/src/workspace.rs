@@ -831,10 +831,16 @@ pub struct TestrixConfig {
     pub remember_open_tabs: bool,
     #[serde(default = "default_true")]
     pub remember_responses: bool,
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_config_api_version() -> String {
     testrix_core::API_VERSION.to_string()
+}
+
+fn default_language() -> String {
+    "en".to_string()
 }
 
 const fn default_true() -> bool {
@@ -848,6 +854,7 @@ impl Default for TestrixConfig {
             workspace_dir: default_workspace_dir(),
             remember_open_tabs: true,
             remember_responses: true,
+            language: default_language(),
         }
     }
 }
@@ -891,19 +898,26 @@ pub fn save_config_workspace_dir_at(
     write_yaml_atomic(config_path, &cfg)
 }
 
-/// Persists preference toggles into `~/.testrix/config.yaml`.
+/// Persists preference toggles and language into `~/.testrix/config.yaml`.
 pub fn save_config_preferences(
     remember_open_tabs: bool,
     remember_responses: bool,
+    language: &str,
 ) -> Result<(), StorageError> {
-    save_config_preferences_at(&config_file_path(), remember_open_tabs, remember_responses)
+    save_config_preferences_at(
+        &config_file_path(),
+        remember_open_tabs,
+        remember_responses,
+        language,
+    )
 }
 
-/// Persists preference toggles into `config_path`.
+/// Persists preference toggles and language into `config_path`.
 pub fn save_config_preferences_at(
     config_path: &Path,
     remember_open_tabs: bool,
     remember_responses: bool,
+    language: &str,
 ) -> Result<(), StorageError> {
     let mut cfg = if config_path.is_file() {
         read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
@@ -912,5 +926,8 @@ pub fn save_config_preferences_at(
     };
     cfg.remember_open_tabs = remember_open_tabs;
     cfg.remember_responses = remember_responses;
+    if !language.trim().is_empty() {
+        cfg.language = language.trim().to_string();
+    }
     write_yaml_atomic(config_path, &cfg)
 }
