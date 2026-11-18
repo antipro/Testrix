@@ -2,8 +2,8 @@ use std::{cell::Cell, collections::HashSet, path::PathBuf};
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    Subscription, Window, WindowOptions,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowOptions,
     assets::IconName as LucideIcon,
     base::TestSupportExt as _,
     component::{
@@ -1261,6 +1261,7 @@ impl Render for TestrixApp {
 
         v_flex()
             .id("testrix-root")
+            .role(gpui_kit::Role::Application)
             .key_context(APP_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
@@ -1672,11 +1673,13 @@ pub fn open_main_window(
     };
 
     let (handle, entity) = gpui_kit::open_window(options, cx, move |window, cx| {
-        window.set_window_title("Testrix — YAML API Workbench");
-        window.activate_window();
         tracing::info!(actual_bounds = ?window.bounds(), viewport = ?window.viewport_size(), "created Testrix window");
         cx.new(|cx| TestrixApp::new(workspace_dir, window, cx))
     })?;
+    let _ = handle.update(cx, |_, window, _| {
+        window.set_window_title("Testrix — YAML API Workbench");
+        window.activate_window();
+    });
     tracing::info!(?window_bounds, "opened main Testrix window");
     Ok((handle, entity))
 }
