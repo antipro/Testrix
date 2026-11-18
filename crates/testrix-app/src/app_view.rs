@@ -37,8 +37,8 @@ use testrix_http::HttpRunner;
 use testrix_storage::{
     create_environment, create_folder, create_project, create_request, delete_environment,
     delete_folder, delete_request, duplicate_request, ensure_seeded_workspace,
-    import_project_bundle, load_workspace, save_config_workspace_dir, save_environment,
-    save_folder, save_project, save_request, save_workspace_state,
+    import_bundle_into_project, import_project_bundle, load_workspace, save_config_workspace_dir,
+    save_environment, save_folder, save_project, save_request, save_workspace_state,
 };
 use tracing::{error, info};
 
@@ -767,45 +767,75 @@ impl TestrixApp {
         let entity = cx.entity();
         cx.spawn_in(window, async move |_, window| {
             let path = prompt.await.ok()?.ok()??.into_iter().next()?;
-            let result = std::fs::read_to_string(&path)
+            let parsed = std::fs::read_to_string(&path)
                 .map_err(|err| format!("Failed reading {}: {err}", path.display()))
                 .and_then(|json| {
-                    parse_openapi_3_0(&json)
-                        .map_err(|err| format!("OpenAPI parse failed: {err}"))
-                })
-                .and_then(|bundle| {
-                    import_project_bundle(&workspace_root, &bundle)
-                        .map_err(|err| format!("Failed writing imported project: {err}"))
+                    parse_openapi_3_0(&json).map_err(|err| format!("OpenAPI parse failed: {err}"))
                 });
             window
                 .update(|window, cx| {
-                    entity.update(cx, |this, cx| match result {
-                        Ok(proj) => {
-                            let proj_id = proj.doc.id.clone();
-                            let proj_name = proj.doc.name.clone();
-                            let first_env_id =
-                                proj.environments.first().map(|e| e.doc.id.clone());
-                            this.workspace.projects.push(proj);
-                            this.workspace
-                                .projects
-                                .sort_by_key(|p| p.doc.name.to_lowercase());
-                            this.workspace.active_project_id = Some(proj_id.clone());
-                            this.workspace.active_environment_id = first_env_id;
-                            let _ = save_workspace_state(
-                                &this.workspace.root_dir,
-                                this.workspace.active_project_id.as_deref(),
-                                this.workspace.active_environment_id.as_deref(),
-                            );
-                            this.refresh_profile_selector(window, cx);
-                            this.sync_env_editor(window, cx);
-                            this.explorer.update(cx, |panel, cx| {
-                                panel.set_workspace(this.workspace.clone(), cx);
-                                panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
-                            });
-                            window.push_notification(
-                                format!("Imported OpenAPI 3.0 project \"{proj_name}\"."),
-                                cx,
-                            );
+                    entity.update(cx, |this, cx| match parsed {
+                        Ok(bundle) => {
+                            if let Some(active_proj) = this.workspace.active_project_mut() {
+                                let proj_id = active_proj.doc.id.clone();
+                                if let Err(err) = import_bundle_into_project(active_proj, &bundle) {
+                                    window.push_notification(
+                                        format!("Failed merging OpenAPI import: {err}"),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                this.refresh_profile_selector(window, cx);
+                                this.sync_env_editor(window, cx);
+                                this.sync_all_tabs(window, cx);
+                                this.explorer.update(cx, |panel, cx| {
+                                    panel.set_workspace(this.workspace.clone(), cx);
+                                    panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
+                                });
+                                window.push_notification(
+                                    format!(
+                                        "Merged OpenAPI 3.0 \"{}\" into current project.",
+                                        bundle.project.name
+                                    ),
+                                    cx,
+                                );
+                            } else {
+                                match import_project_bundle(&workspace_root, &bundle) {
+                                    Ok(proj) => {
+                                        let proj_id = proj.doc.id.clone();
+                                        let proj_name = proj.doc.name.clone();
+                                        let first_env_id =
+                                            proj.environments.first().map(|e| e.doc.id.clone());
+                                        this.workspace.projects.push(proj);
+                                        this.workspace
+                                            .projects
+                                            .sort_by_key(|p| p.doc.name.to_lowercase());
+                                        this.workspace.active_project_id = Some(proj_id.clone());
+                                        this.workspace.active_environment_id = first_env_id;
+                                        let _ = save_workspace_state(
+                                            &this.workspace.root_dir,
+                                            this.workspace.active_project_id.as_deref(),
+                                            this.workspace.active_environment_id.as_deref(),
+                                        );
+                                        this.refresh_profile_selector(window, cx);
+                                        this.sync_env_editor(window, cx);
+                                        this.explorer.update(cx, |panel, cx| {
+                                            panel.set_workspace(this.workspace.clone(), cx);
+                                            panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
+                                        });
+                                        window.push_notification(
+                                            format!("Imported OpenAPI 3.0 project \"{proj_name}\"."),
+                                            cx,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        window.push_notification(
+                                            format!("Failed writing imported project: {err}"),
+                                            cx,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(msg) => {
                             window.push_notification(msg, cx);

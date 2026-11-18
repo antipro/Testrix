@@ -419,6 +419,112 @@ pub fn import_project_bundle(
     load_project(&root_dir)
 }
 
+/// Merges folders, requests, and missing environment variables from `bundle` into an existing
+/// [`ProjectNode`] without deleting or overwriting any existing profiles or their variables.
+pub fn import_bundle_into_project(
+    project: &mut ProjectNode,
+    bundle: &ImportedProjectBundle,
+) -> Result<(), StorageError> {
+    let root_dir = project.root_dir.clone();
+    let env_dir = root_dir.join(ENVIRONMENTS_DIR);
+    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.clone(),
+        source,
+    })?;
+
+    // Merge environments: never delete or overwrite existing profiles or variables.
+    for incoming_env in &bundle.environments {
+        if let Some(existing_env) = project
+            .environments
+            .iter_mut()
+            .find(|e| e.doc.name.eq_ignore_ascii_case(&incoming_env.name))
+        {
+            let mut changed = false;
+            for var in &incoming_env.variables {
+                if !existing_env
+                    .doc
+                    .variables
+                    .iter()
+                    .any(|v| v.key.trim() == var.key.trim())
+                {
+                    existing_env.doc.variables.push(var.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                save_environment(existing_env)?;
+            }
+        } else if project.environments.is_empty() {
+            incoming_env.validate()?;
+            let env_path = unique_file_path(&env_dir, &incoming_env.name, ENV_EXTENSION);
+            write_yaml_atomic(&env_path, incoming_env)?;
+        }
+    }
+
+    // Merge root requests (match existing by method + url, else create new).
+    for req in &bundle.root_requests {
+        merge_or_create_request(&root_dir, &mut project.requests, req)?;
+    }
+
+    // Merge folders by name; create if missing, then merge their requests.
+    for folder in &bundle.folders {
+        if let Some(existing_folder) = project
+            .folders
+            .iter_mut()
+            .find(|f| f.doc.name == folder.doc.name)
+        {
+            for req in &folder.requests {
+                merge_or_create_request(
+                    &existing_folder.dir_path,
+                    &mut existing_folder.requests,
+                    req,
+                )?;
+            }
+        } else {
+            folder.doc.validate()?;
+            let folder_dir = unique_dir_path(&root_dir, &folder.doc.name);
+            std::fs::create_dir_all(&folder_dir).map_err(|source| StorageError::Io {
+                path: folder_dir.clone(),
+                source,
+            })?;
+            write_yaml_atomic(&folder_dir.join(FOLDER_MANIFEST_FILE), &folder.doc)?;
+            for req in &folder.requests {
+                req.validate()?;
+                let req_path = unique_file_path(&folder_dir, &req.name, REQUEST_EXTENSION);
+                write_yaml_atomic(&req_path, req)?;
+            }
+        }
+    }
+
+    *project = load_project(&root_dir)?;
+    Ok(())
+}
+
+fn merge_or_create_request(
+    target_dir: &Path,
+    existing_requests: &mut [RequestNode],
+    incoming: &HttpRequestDoc,
+) -> Result<(), StorageError> {
+    if let Some(existing) = existing_requests.iter_mut().find(|r| {
+        r.doc.request.method == incoming.request.method
+            && r.doc.request.url == incoming.request.url
+    }) {
+        existing.doc.name = incoming.name.clone();
+        if !incoming.description.is_empty() {
+            existing.doc.description = incoming.description.clone();
+        }
+        existing.doc.request.params = incoming.request.params.clone();
+        existing.doc.request.headers = incoming.request.headers.clone();
+        existing.doc.request.body = incoming.request.body.clone();
+        save_request(existing)?;
+    } else {
+        incoming.validate()?;
+        let req_path = unique_file_path(target_dir, &incoming.name, REQUEST_EXTENSION);
+        write_yaml_atomic(&req_path, incoming)?;
+    }
+    Ok(())
+}
+
 /// Saves a folder manifest (`_folder.yaml`).
 pub fn save_folder(folder: &FolderNode) -> Result<(), StorageError> {
     folder.doc.validate()?;

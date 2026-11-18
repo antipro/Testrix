@@ -11,8 +11,9 @@ pub use slug::slugify;
 pub use workspace::{
     TestrixConfig, config_file_path, create_environment, create_folder, create_project,
     create_request, default_workspace_dir, delete_environment, delete_folder, delete_request,
-    duplicate_request, ensure_seeded_workspace, import_project_bundle, init_or_load_config,
-    init_or_load_config_at, load_project, load_workspace, save_config_workspace_dir, save_config_workspace_dir_at,
+    duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
+    init_or_load_config, init_or_load_config_at, load_project, load_workspace,
+    save_config_workspace_dir, save_config_workspace_dir_at,
     save_environment, save_folder, save_project, save_request, save_workspace_state,
     to_yaml_pretty, write_yaml_atomic,
 };
@@ -129,5 +130,26 @@ mod tests {
         let ws = load_workspace(dir.path()).unwrap();
         assert_eq!(ws.projects.len(), 1);
         assert_eq!(ws.projects[0].doc.name, "AppCore");
+
+        // Importing another OpenAPI bundle into the existing project preserves its profiles & variables.
+        let mut target_proj = ws.projects[0].clone();
+        let mut custom_env = testrix_core::EnvironmentDoc::new("env-custom", "Custom");
+        custom_env
+            .variables
+            .push(testrix_core::EnvVariable::new("api-token", "keep-me"));
+        let env_path = target_proj.root_dir.join("environments/custom.env.yaml");
+        write_yaml_atomic(&env_path, &custom_env).unwrap();
+        target_proj = load_project(&target_proj.root_dir).unwrap();
+
+        import_bundle_into_project(&mut target_proj, &bundle).unwrap();
+        let custom_reloaded = target_proj
+            .environments
+            .iter()
+            .find(|e| e.doc.id == "env-custom")
+            .expect("custom profile should be preserved");
+        assert_eq!(custom_reloaded.doc.variables[0].value, "keep-me");
+        // Merging the same folder name reuses the existing folder instead of duplicating it.
+        assert_eq!(target_proj.folders.len(), 1);
+        assert_eq!(target_proj.folders[0].requests.len(), 1);
     }
 }
