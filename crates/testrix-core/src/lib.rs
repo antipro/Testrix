@@ -15,8 +15,8 @@ pub use auth::{
 };
 pub use error::CoreError;
 pub use materialize::{
-    PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest, materialize_request,
-    materialize_request_doc,
+    PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,
+    extract_url_query_params, materialize_request, materialize_request_doc,
 };
 pub use model::{
     API_VERSION, ApiKeyLocation, AuthConfig, DocumentKind, EffectiveAuth, EnvVariable,
@@ -30,7 +30,10 @@ pub use response::{
     format_pretty_body,
 };
 pub use search::{FilteredFolder, FilteredProject, filter_workspace};
-pub use template::{TemplateResult, env_variable_map, interpolate_template, interpolate_with_map};
+pub use template::{
+    TemplateResult, env_variable_map, interpolate_template, interpolate_with_map,
+    rename_template_variables,
+};
 
 #[cfg(test)]
 mod tests {

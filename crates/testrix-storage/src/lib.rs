@@ -53,6 +53,10 @@ mod tests {
     fn creates_updates_and_persists_request_and_folder_yaml_files() {
         let dir = TempDir::new().unwrap();
         let proj = create_project(dir.path(), "Orders API", "https://orders.test").unwrap();
+        assert_eq!(
+            proj.root_dir.file_name().and_then(|n| n.to_str()),
+            Some(proj.doc.id.as_str())
+        );
 
         let mut folder = create_folder(&proj.root_dir, "V1 Orders", 5).unwrap();
         folder.doc.auth = AuthConfig::Basic {

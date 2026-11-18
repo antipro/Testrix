@@ -21,13 +21,14 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthNodeRef, EnvironmentDoc, FolderDoc, FolderNode, ProjectDoc, ProjectNode,
-    resolve_folder_chain_auth, resolve_project_auth,
+    rename_template_variables, resolve_folder_chain_auth, resolve_project_auth,
 };
 use testrix_storage::to_yaml_pretty;
 
 use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
     kv_editor::{KeyValueTable, TableChangeEvent, common_http_header_options},
+    theme_helpers::apply_unresolved_var_border,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,7 @@ pub(crate) struct ContainerTabView {
     default_headers: Option<Entity<KeyValueTable>>,
     auth_editor: Entity<AuthEditor>,
     yaml_editor: Entity<EditorState>,
+    active_env: Option<EnvironmentDoc>,
     breadcrumb: SharedString,
     dirty: bool,
     _subscriptions: Vec<Subscription>,
@@ -120,6 +122,7 @@ impl ContainerTabView {
                 cx,
             )
             .with_name_suggestions(common_http_header_options(), window, cx)
+            .with_variable_validation(active_env.clone())
         });
         let auth_editor = cx.new(|cx| {
             let mut editor = AuthEditor::new(
@@ -129,7 +132,7 @@ impl ContainerTabView {
                 window,
                 cx,
             );
-            editor.set_context(Some(resolve_project_auth(project)), active_env, cx);
+            editor.set_context(Some(resolve_project_auth(project)), active_env.clone(), cx);
             editor
         });
         let yaml_text = to_yaml_pretty(&project.doc).unwrap_or_default();
@@ -155,6 +158,7 @@ impl ContainerTabView {
             default_headers: Some(default_headers),
             auth_editor,
             yaml_editor,
+            active_env,
             breadcrumb: project.doc.name.clone().into(),
             dirty: false,
             _subscriptions: Vec::new(),
@@ -196,7 +200,7 @@ impl ContainerTabView {
                 window,
                 cx,
             );
-            editor.set_context(Some(resolved), active_env, cx);
+            editor.set_context(Some(resolved), active_env.clone(), cx);
             editor
         });
         let yaml_text = to_yaml_pretty(&folder.doc).unwrap_or_default();
@@ -229,6 +233,7 @@ impl ContainerTabView {
             default_headers: None,
             auth_editor,
             yaml_editor,
+            active_env,
             breadcrumb,
             dirty: false,
             _subscriptions: Vec::new(),
@@ -334,6 +339,10 @@ impl ContainerTabView {
         cx: &mut Context<Self>,
     ) {
         self.project_name = project.doc.name.clone();
+        self.active_env = active_env.clone();
+        if let Some(headers) = &self.default_headers {
+            headers.update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
+        }
         match &self.kind {
             ContainerKind::Project { .. } => {
                 let mut draft = self.build_project_doc(cx);
@@ -399,6 +408,37 @@ impl ContainerTabView {
         self.dirty = false;
         cx.emit(ContainerTabEvent::DirtyChanged);
         cx.notify();
+    }
+
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(base_url) = &self.base_url_input {
+            let current = base_url.read(cx).value().to_string();
+            if let Some(updated) = rename_template_variables(&current, renames) {
+                base_url.update(cx, |state, cx| state.set_value(updated, window, cx));
+                changed = true;
+            }
+        }
+        if let Some(headers) = &self.default_headers {
+            changed |= headers.update(cx, |t, cx| t.rename_variables(renames, window, cx));
+        }
+        changed |= self
+            .auth_editor
+            .update(cx, |e, cx| e.rename_variables(renames, window, cx));
+
+        if changed {
+            if !self.dirty {
+                self.mark_saved(cx);
+            }
+            self.refresh_yaml_preview(window, cx);
+            cx.notify();
+        }
+        changed
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
@@ -661,11 +701,17 @@ impl Render for ContainerTabView {
                                         .child(Input::new(&self.name_input).small()),
                                 )
                                 .when_some(self.base_url_input.as_ref(), |form, base_url| {
+                                    let base_text = base_url.read(cx).value().to_string();
                                     form.child(
                                         Field::new()
                                             .label("Base URL")
                                             .description("Prepended when a request URL starts with /")
-                                            .child(Input::new(base_url).small()),
+                                            .child(apply_unresolved_var_border(
+                                                Input::new(base_url).small(),
+                                                &base_text,
+                                                self.active_env.as_ref(),
+                                                cx,
+                                            )),
                                     )
                                 })
                                 .when_some(self.order_input.as_ref(), |form, order| {

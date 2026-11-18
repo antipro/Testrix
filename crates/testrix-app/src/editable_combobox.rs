@@ -1,7 +1,7 @@
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TestSupportExt as _, Window,
+    MouseButton, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
     base::input::{Escape, IndentInline, MoveDown, MoveUp},
     component::{
         ActiveTheme as _, IconName, Sizable as _, ThemeStyled as _,
@@ -15,6 +15,9 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px, relative,
 };
+use testrix_core::EnvironmentDoc;
+
+use crate::theme_helpers::apply_unresolved_var_border;
 
 /// A selectable suggestion displayed in an [`EditableCombobox`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +60,8 @@ pub(crate) struct EditableCombobox {
     selected_ix: usize,
     small: bool,
     cleanable: bool,
+    validate_variables: bool,
+    active_env: Option<EnvironmentDoc>,
     menu_width: Pixels,
     _subscription: Subscription,
 }
@@ -91,6 +96,8 @@ impl EditableCombobox {
             selected_ix: 0,
             small: false,
             cleanable: false,
+            validate_variables: false,
+            active_env: None,
             menu_width: px(280.),
             _subscription: subscription,
         }
@@ -109,6 +116,37 @@ impl EditableCombobox {
     pub(crate) fn menu_width(mut self, width: Pixels) -> Self {
         self.menu_width = width;
         self
+    }
+
+    pub(crate) fn validate_variables(mut self, validate: bool) -> Self {
+        self.validate_variables = validate;
+        self
+    }
+
+    pub(crate) fn set_active_env(
+        &mut self,
+        env: Option<EnvironmentDoc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_env = env;
+        cx.notify();
+    }
+
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current = self.value(cx);
+        if let Some(updated) = testrix_core::rename_template_variables(&current, renames) {
+            self.input.update(cx, |state, cx| {
+                state.set_value(updated, window, cx);
+            });
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     pub(crate) fn value(&self, cx: &App) -> String {
@@ -281,8 +319,8 @@ impl Render for EditableCombobox {
                     this.accept_selected(window, cx);
                 }
             }))
-            .child(
-                Input::new(&self.input)
+            .child({
+                let input = Input::new(&self.input)
                     .id(self.id.clone())
                     .w_full()
                     .when(self.small, |i| i.small())
@@ -297,8 +335,14 @@ impl Render for EditableCombobox {
                                 cx.stop_propagation();
                                 this.toggle_dropdown(window, cx);
                             })),
-                    ),
-            )
+                    );
+                if self.validate_variables {
+                    let text = self.input.read(cx).value().to_string();
+                    apply_unresolved_var_border(input, &text, self.active_env.as_ref(), cx)
+                } else {
+                    input
+                }
+            })
             .when(show_menu, |this| {
                 this.child(deferred(
                     div().absolute().left_0().top(relative(1.)).pt_1().child(
@@ -324,14 +368,19 @@ impl Render for EditableCombobox {
                             .children(matches.into_iter().enumerate().map(|(ix, opt)| {
                                 let val = opt.value.clone();
                                 let detail = opt.detail.clone();
-                                ListItem::new(("combo-opt", ix))
+                                let opt_id = SharedString::from(format!("{}-opt-{ix}", self.id));
+                                ListItem::new(opt_id)
                                     .rounded(cx.theme().radius)
                                     .px_2()
                                     .py_1()
                                     .selected(ix == self.selected_ix)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.accept_value(val.clone(), window, cx);
-                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.accept_value(val.clone(), window, cx);
+                                        }),
+                                    )
                                     .child(
                                         h_flex()
                                             .w_full()
@@ -353,5 +402,89 @@ impl Render for EditableCombobox {
                     ),
                 ))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{
+        Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size,
+        test::TestWindowExt as _,
+    };
+
+    use super::*;
+
+    #[gpui_kit::test]
+    fn clicking_dropdown_option_changes_value_and_closes_menu(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::component::init);
+
+        let options = vec![
+            ComboboxOption::new("{{base_url}}").with_detail("Project baseUrl"),
+            ComboboxOption::new("{{base_url_emr}}").with_detail("http://192.168.1.231:4433/emr"),
+        ];
+
+        let (window, combo) = cx.update(|cx| {
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(px(600.), px(400.)),
+            };
+            let (window, content) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        EditableCombobox::new(
+                            "url-prefix",
+                            "{{base_url}}",
+                            "{{base_url}}",
+                            options,
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open test window");
+            (
+                window
+                    .downcast::<gpui_kit::base::Root>()
+                    .expect("Base Root"),
+                content,
+            )
+        });
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+
+            // Open the dropdown via the chevron toggle button.
+            window.click("url-prefix-toggle", cx);
+            window.render_frame(cx);
+
+            assert!(
+                window.try_find("url-prefix-menu").is_some(),
+                "dropdown menu should open after clicking toggle"
+            );
+
+            // Click the second option ({{base_url_emr}}).
+            window.click("url-prefix-opt-1", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.run_until_parked();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            let combo_ref = combo.read(cx);
+            assert_eq!(combo_ref.value(cx), "{{base_url_emr}}");
+            assert!(!combo_ref.open, "dropdown menu should close after selecting");
+        });
     }
 }

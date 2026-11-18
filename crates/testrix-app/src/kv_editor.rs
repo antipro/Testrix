@@ -15,9 +15,14 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px,
 };
-use testrix_core::{KeyValueRow, MultipartField, MultipartFieldType};
+use testrix_core::{
+    EnvironmentDoc, KeyValueRow, MultipartField, MultipartFieldType, rename_template_variables,
+};
 
-use crate::editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent};
+use crate::{
+    editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent},
+    theme_helpers::apply_unresolved_var_border,
+};
 
 /// Standard HTTP request header suggestions for editable header comboboxes.
 pub(crate) fn common_http_header_options() -> Vec<ComboboxOption> {
@@ -84,6 +89,8 @@ pub(crate) struct KeyValueTable {
     value_placeholder: SharedString,
     add_label: SharedString,
     name_suggestions: Vec<ComboboxOption>,
+    validate_variables: bool,
+    active_env: Option<EnvironmentDoc>,
     rows: Vec<KeyValueRowState>,
     next_row_id: u64,
 }
@@ -106,6 +113,8 @@ impl KeyValueTable {
             value_placeholder: value_placeholder.into(),
             add_label: add_label.into(),
             name_suggestions: Vec::new(),
+            validate_variables: false,
+            active_env: None,
             rows: Vec::new(),
             next_row_id: 1,
         };
@@ -124,6 +133,65 @@ impl KeyValueTable {
         self.next_row_id = 1;
         self.set_rows(&existing, window, cx);
         self
+    }
+
+    pub(crate) fn with_variable_validation(
+        mut self,
+        active_env: Option<EnvironmentDoc>,
+    ) -> Self {
+        self.validate_variables = true;
+        self.active_env = active_env;
+        self
+    }
+
+    pub(crate) fn set_active_env(
+        &mut self,
+        active_env: Option<EnvironmentDoc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.validate_variables = true;
+        self.active_env = active_env.clone();
+        for row in &self.rows {
+            if let NameField::Combobox(combo) = &row.name {
+                combo.update(cx, |c, cx| c.set_active_env(active_env.clone(), cx));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+        for row in &self.rows {
+            match &row.name {
+                NameField::Input(input) => {
+                    let current = input.read(cx).value().to_string();
+                    if let Some(updated) = rename_template_variables(&current, renames) {
+                        input.update(cx, |state, cx| state.set_value(updated, window, cx));
+                        changed = true;
+                    }
+                }
+                NameField::Combobox(combo) => {
+                    if combo.update(cx, |c, cx| c.rename_variables(renames, window, cx)) {
+                        changed = true;
+                    }
+                }
+            }
+            let current_val = row.value.read(cx).value().to_string();
+            if let Some(updated) = rename_template_variables(&current_val, renames) {
+                row.value
+                    .update(cx, |state, cx| state.set_value(updated, window, cx));
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub(crate) fn set_rows(
@@ -185,10 +253,24 @@ impl KeyValueTable {
             let suggestions = self.name_suggestions.clone();
             let placeholder = self.name_placeholder.clone();
             let default_val = item.name.clone();
+            let validate = self.validate_variables;
+            let active_env = self.active_env.clone();
             let combo = cx.new(|cx| {
-                EditableCombobox::new(combo_id, placeholder, default_val, suggestions, window, cx)
-                    .small(true)
-                    .menu_width(px(300.))
+                let mut combo = EditableCombobox::new(
+                    combo_id,
+                    placeholder,
+                    default_val,
+                    suggestions,
+                    window,
+                    cx,
+                )
+                .small(true)
+                .menu_width(px(300.))
+                .validate_variables(validate);
+                if validate {
+                    combo.set_active_env(active_env, cx);
+                }
+                combo
             });
             let sub = cx.subscribe(&combo, |_, _, _: &EditableComboboxEvent, cx| {
                 cx.emit(TableChangeEvent::Changed);
@@ -295,16 +377,36 @@ impl Render for KeyValueTable {
                             )
                             .child(div().flex_1().min_w_0().child(match &row.name {
                                 NameField::Input(input) => {
-                                    Input::new(input).small().into_any_element()
+                                    let elem = Input::new(input).small();
+                                    if self.validate_variables {
+                                        let text = input.read(cx).value().to_string();
+                                        apply_unresolved_var_border(
+                                            elem,
+                                            &text,
+                                            self.active_env.as_ref(),
+                                            cx,
+                                        )
+                                        .into_any_element()
+                                    } else {
+                                        elem.into_any_element()
+                                    }
                                 }
                                 NameField::Combobox(combo) => combo.clone().into_any_element(),
                             }))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Input::new(&row.value).small()),
-                            )
+                            .child(div().flex_1().min_w_0().child({
+                                let elem = Input::new(&row.value).small();
+                                if self.validate_variables {
+                                    let text = row.value.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        elem,
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                } else {
+                                    elem
+                                }
+                            }))
                             .child(
                                 div()
                                     .flex_1()
@@ -353,6 +455,8 @@ struct MultipartRowState {
 /// Stateful table for `multipart/form-data` text and file fields.
 pub(crate) struct MultipartTable {
     id_prefix: SharedString,
+    validate_variables: bool,
+    active_env: Option<EnvironmentDoc>,
     rows: Vec<MultipartRowState>,
     next_row_id: u64,
 }
@@ -368,11 +472,54 @@ impl MultipartTable {
     ) -> Self {
         let mut table = Self {
             id_prefix: id_prefix.into(),
+            validate_variables: false,
+            active_env: None,
             rows: Vec::new(),
             next_row_id: 1,
         };
         table.set_rows(initial, window, cx);
         table
+    }
+
+    pub(crate) fn with_variable_validation(
+        mut self,
+        active_env: Option<EnvironmentDoc>,
+    ) -> Self {
+        self.validate_variables = true;
+        self.active_env = active_env;
+        self
+    }
+
+    pub(crate) fn set_active_env(
+        &mut self,
+        active_env: Option<EnvironmentDoc>,
+        cx: &mut Context<Self>,
+    ) {
+        self.validate_variables = true;
+        self.active_env = active_env;
+        cx.notify();
+    }
+
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+        for row in &self.rows {
+            for input in [&row.name, &row.value] {
+                let current = input.read(cx).value().to_string();
+                if let Some(updated) = rename_template_variables(&current, renames) {
+                    input.update(cx, |state, cx| state.set_value(updated, window, cx));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub(crate) fn set_rows(
@@ -556,13 +703,39 @@ impl Render for MultipartTable {
                                         }
                                     })),
                             )
-                            .child(div().flex_1().min_w_0().child(Input::new(&row.name).small()))
+                            .child(div().flex_1().min_w_0().child({
+                                let elem = Input::new(&row.name).small();
+                                if self.validate_variables {
+                                    let text = row.name.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        elem,
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                } else {
+                                    elem
+                                }
+                            }))
                             .child(
                                 h_flex()
                                     .flex_1()
                                     .min_w_0()
                                     .gap_1()
-                                    .child(div().flex_1().min_w_0().child(Input::new(&row.value).small()))
+                                    .child(div().flex_1().min_w_0().child({
+                                        let elem = Input::new(&row.value).small();
+                                        if self.validate_variables {
+                                            let text = row.value.read(cx).value().to_string();
+                                            apply_unresolved_var_border(
+                                                elem,
+                                                &text,
+                                                self.active_env.as_ref(),
+                                                cx,
+                                            )
+                                        } else {
+                                            elem
+                                        }
+                                    }))
                                     .when(is_file, |this| {
                                         this.child(
                                             Button::new(SharedString::from(format!(

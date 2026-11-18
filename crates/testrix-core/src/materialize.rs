@@ -406,3 +406,57 @@ fn upsert_header_if_missing(
         });
     }
 }
+
+/// Extracts `key=value` query parameters from `raw_url` when a `?query` with `=` is present.
+///
+/// Returns `Some((url_without_query, params))` if at least one non-empty parameter was parsed.
+pub fn extract_url_query_params(raw_url: &str) -> Option<(String, Vec<(String, String)>)> {
+    let q_ix = raw_url.find('?')?;
+    let base = &raw_url[..q_ix];
+    let after_q = &raw_url[q_ix + 1..];
+    let (query_str, fragment) = match after_q.find('#') {
+        Some(f_ix) => (&after_q[..f_ix], &after_q[f_ix..]),
+        None => (after_q, ""),
+    };
+    if !query_str.contains('=') {
+        return None;
+    }
+
+    let params: Vec<(String, String)> = url::form_urlencoded::parse(query_str.as_bytes())
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if params.is_empty() {
+        return None;
+    }
+
+    Some((format!("{base}{fragment}"), params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_query_params_from_pasted_url() {
+        assert_eq!(
+            extract_url_query_params("/index/visitId?visitId=1167904573952622592"),
+            Some((
+                "/index/visitId".to_string(),
+                vec![("visitId".to_string(), "1167904573952622592".to_string())],
+            ))
+        );
+        assert_eq!(
+            extract_url_query_params("/users?page=2&q={{query}}#top"),
+            Some((
+                "/users#top".to_string(),
+                vec![
+                    ("page".to_string(), "2".to_string()),
+                    ("q".to_string(), "{{query}}".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(extract_url_query_params("/users?"), None);
+        assert_eq!(extract_url_query_params("/users?pending"), None);
+    }
+}

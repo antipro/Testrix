@@ -17,10 +17,10 @@ use gpui_kit::{
 };
 use testrix_core::{
     ApiKeyLocation, AuthConfig, AuthNodeRef, EffectiveAuth, EnvironmentDoc, ResolvedAuth,
-    interpolate_template,
+    interpolate_template, rename_template_variables,
 };
 
-use crate::theme_helpers::{auth_icon, effective_auth_icon};
+use crate::theme_helpers::{apply_unresolved_var_border, auth_icon, effective_auth_icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthModeChoice {
@@ -229,6 +229,33 @@ impl AuthEditor {
         cx.notify();
     }
 
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = false;
+        for input in [
+            &self.bearer_token,
+            &self.bearer_prefix,
+            &self.basic_username,
+            &self.basic_password,
+            &self.api_key_name,
+            &self.api_key_value,
+        ] {
+            let current = input.read(cx).value().to_string();
+            if let Some(updated) = rename_template_variables(&current, renames) {
+                input.update(cx, |state, cx| state.set_value(updated, window, cx));
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
     pub(crate) fn snapshot(&self, cx: &App) -> AuthConfig {
         match self.mode {
             AuthModeChoice::Inherit => AuthConfig::Inherit,
@@ -423,12 +450,28 @@ impl Render for AuthEditor {
                         .child(
                             Field::new()
                                 .label("Token")
-                                .child(Input::new(&self.bearer_token).small()),
+                                .child({
+                                    let text = self.bearer_token.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        Input::new(&self.bearer_token).small(),
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                }),
                         )
                         .child(
                             Field::new()
                                 .label("Header Prefix")
-                                .child(Input::new(&self.bearer_prefix).small()),
+                                .child({
+                                    let text = self.bearer_prefix.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        Input::new(&self.bearer_prefix).small(),
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                }),
                         ),
                 )
             })
@@ -439,14 +482,26 @@ impl Render for AuthEditor {
                         .child(
                             Field::new()
                                 .label("Username")
-                                .child(Input::new(&self.basic_username).small()),
+                                .child({
+                                    let text = self.basic_username.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        Input::new(&self.basic_username).small(),
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                }),
                         )
                         .child(
-                            Field::new().label("Password").child(
-                                Input::new(&self.basic_password)
-                                    .small()
-                                    .mask_toggle(),
-                            ),
+                            Field::new().label("Password").child({
+                                let text = self.basic_password.read(cx).value().to_string();
+                                apply_unresolved_var_border(
+                                    Input::new(&self.basic_password).small().mask_toggle(),
+                                    &text,
+                                    self.active_env.as_ref(),
+                                    cx,
+                                )
+                            }),
                         ),
                 )
             })
@@ -457,12 +512,28 @@ impl Render for AuthEditor {
                         .child(
                             Field::new()
                                 .label("Key Name")
-                                .child(Input::new(&self.api_key_name).small()),
+                                .child({
+                                    let text = self.api_key_name.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        Input::new(&self.api_key_name).small(),
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                }),
                         )
                         .child(
                             Field::new()
                                 .label("Value")
-                                .child(Input::new(&self.api_key_value).small()),
+                                .child({
+                                    let text = self.api_key_value.read(cx).value().to_string();
+                                    apply_unresolved_var_border(
+                                        Input::new(&self.api_key_value).small(),
+                                        &text,
+                                        self.active_env.as_ref(),
+                                        cx,
+                                    )
+                                }),
                         )
                         .child(
                             Field::new().label("Add To").child(

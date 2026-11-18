@@ -28,7 +28,10 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px, size,
 };
-use testrix_core::{AuthNodeRef, ExplorerNode, HttpMethod, WorkspaceTree, resolve_request_auth};
+use testrix_core::{
+    AuthConfig, AuthNodeRef, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc, KeyValueRow,
+    ProjectNode, RequestBody, WorkspaceTree, rename_template_variables, resolve_request_auth,
+};
 use testrix_http::HttpRunner;
 use testrix_storage::{
     create_environment, create_folder, create_project, create_request, delete_environment,
@@ -271,7 +274,13 @@ impl TestrixApp {
         cx: &mut Context<Self>,
     ) {
         match event {
-            EnvEditorEvent::Save { env_id, updated } => {
+            EnvEditorEvent::Save {
+                env_id,
+                updated,
+                renamed_keys,
+            } => {
+                let is_active =
+                    self.workspace.active_environment_id.as_deref() == Some(&env_id);
                 if let Some(proj) = self.workspace.active_project_mut()
                     && let Some(env_node) =
                         proj.environments.iter_mut().find(|e| e.doc.id == env_id)
@@ -282,8 +291,14 @@ impl TestrixApp {
                         return;
                     }
                     proj.environments.sort_by_key(|a| a.doc.name.to_lowercase());
+                    if is_active && !renamed_keys.is_empty() {
+                        propagate_variable_renames_in_project(proj, &renamed_keys);
+                    }
                     self.refresh_profile_selector(window, cx);
                     self.sync_env_editor(window, cx);
+                    if is_active && !renamed_keys.is_empty() {
+                        self.rename_variables_in_open_tabs(&renamed_keys, window, cx);
+                    }
                     self.sync_all_tabs(window, cx);
                     window.push_notification("Profile saved.", cx);
                 }
@@ -618,6 +633,37 @@ impl TestrixApp {
                     window,
                     cx,
                 );
+            }
+        }
+    }
+
+    fn rename_variables_in_open_tabs(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active_project_id = self
+            .workspace
+            .active_project()
+            .map(|p| p.doc.id.clone());
+        for tab in &self.tabs {
+            match tab {
+                WorkbenchTab::Request(view) => {
+                    let belongs_to_active = active_project_id
+                        .as_deref()
+                        .is_some_and(|pid| pid == view.read(cx).project_id());
+                    if belongs_to_active {
+                        view.update(cx, |v, cx| {
+                            v.rename_variables(renames, window, cx);
+                        });
+                    }
+                }
+                WorkbenchTab::Container(view) => {
+                    view.update(cx, |v, cx| {
+                        v.rename_variables(renames, window, cx);
+                    });
+                }
             }
         }
     }
@@ -1791,4 +1837,97 @@ pub fn open_main_window(
     });
     tracing::info!(?window_bounds, "opened main Testrix window");
     Ok((handle, entity))
+}
+
+fn rewrite_string_in_place(target: &mut String, renames: &[(String, String)]) -> bool {
+    if let Some(updated) = rename_template_variables(target, renames) {
+        *target = updated;
+        true
+    } else {
+        false
+    }
+}
+
+fn rewrite_kv_rows(rows: &mut [KeyValueRow], renames: &[(String, String)]) -> bool {
+    let mut changed = false;
+    for row in rows {
+        changed |= rewrite_string_in_place(&mut row.name, renames);
+        changed |= rewrite_string_in_place(&mut row.value, renames);
+    }
+    changed
+}
+
+fn rewrite_auth_config(auth: &mut AuthConfig, renames: &[(String, String)]) -> bool {
+    match auth {
+        AuthConfig::Inherit | AuthConfig::None => false,
+        AuthConfig::Bearer { token, prefix } => {
+            let mut changed = rewrite_string_in_place(token, renames);
+            changed |= rewrite_string_in_place(prefix, renames);
+            changed
+        }
+        AuthConfig::Basic { username, password } => {
+            let mut changed = rewrite_string_in_place(username, renames);
+            changed |= rewrite_string_in_place(password, renames);
+            changed
+        }
+        AuthConfig::ApiKey { key, value, .. } => {
+            let mut changed = rewrite_string_in_place(key, renames);
+            changed |= rewrite_string_in_place(value, renames);
+            changed
+        }
+    }
+}
+
+fn rewrite_request_doc(doc: &mut HttpRequestDoc, renames: &[(String, String)]) -> bool {
+    let mut changed = rewrite_string_in_place(&mut doc.request.url, renames);
+    changed |= rewrite_kv_rows(&mut doc.request.params, renames);
+    changed |= rewrite_kv_rows(&mut doc.request.headers, renames);
+    changed |= rewrite_auth_config(&mut doc.request.auth, renames);
+    match &mut doc.request.body {
+        RequestBody::None | RequestBody::Binary { .. } => {}
+        RequestBody::Json { content } | RequestBody::Raw { content, .. } => {
+            changed |= rewrite_string_in_place(content, renames);
+        }
+        RequestBody::FormUrlEncoded { fields } => {
+            changed |= rewrite_kv_rows(fields, renames);
+        }
+        RequestBody::Multipart { fields } => {
+            for field in fields {
+                changed |= rewrite_string_in_place(&mut field.name, renames);
+                changed |= rewrite_string_in_place(&mut field.value, renames);
+            }
+        }
+    }
+    changed
+}
+
+fn propagate_variable_renames_in_folder(folder: &mut FolderNode, renames: &[(String, String)]) {
+    if rewrite_auth_config(&mut folder.doc.auth, renames) {
+        let _ = save_folder(folder);
+    }
+    for req in &mut folder.requests {
+        if rewrite_request_doc(&mut req.doc, renames) {
+            let _ = save_request(req);
+        }
+    }
+    for sub in &mut folder.folders {
+        propagate_variable_renames_in_folder(sub, renames);
+    }
+}
+
+fn propagate_variable_renames_in_project(proj: &mut ProjectNode, renames: &[(String, String)]) {
+    let mut proj_changed = rewrite_string_in_place(&mut proj.doc.base_url, renames);
+    proj_changed |= rewrite_kv_rows(&mut proj.doc.default_headers, renames);
+    proj_changed |= rewrite_auth_config(&mut proj.doc.auth, renames);
+    if proj_changed {
+        let _ = save_project(proj);
+    }
+    for req in &mut proj.requests {
+        if rewrite_request_doc(&mut req.doc, renames) {
+            let _ = save_request(req);
+        }
+    }
+    for folder in &mut proj.folders {
+        propagate_variable_renames_in_folder(folder, renames);
+    }
 }

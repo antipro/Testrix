@@ -26,8 +26,9 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthNodeRef, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc, HttpResponseSnapshot,
-    ProjectNode, RawBodyFormat, RequestBody, RequestExecutionState, RequestNode, RequestSettings,
-    materialize_request_doc, resolve_request_doc_auth,
+    KeyValueRow, ProjectNode, RawBodyFormat, RequestBody, RequestExecutionState, RequestNode,
+    RequestSettings, extract_url_query_params, materialize_request_doc, rename_template_variables,
+    resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -36,7 +37,7 @@ use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
     editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent},
     kv_editor::{KeyValueTable, MultipartTable, TableChangeEvent, common_http_header_options},
-    theme_helpers::{format_bytes, method_color, status_badge},
+    theme_helpers::{apply_unresolved_var_border, format_bytes, method_color, status_badge},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +223,7 @@ impl RequestTabView {
         };
         let prefix_options = build_url_prefix_options(project, active_env.as_ref());
         let url_prefix_combo = cx.new(|cx| {
-            EditableCombobox::new(
+            let mut combo = EditableCombobox::new(
                 format!("req-url-prefix-{}", doc.id),
                 prefix_placeholder,
                 initial_prefix,
@@ -232,6 +233,9 @@ impl RequestTabView {
             )
             .cleanable(true)
             .menu_width(px(320.))
+            .validate_variables(true);
+            combo.set_active_env(active_env.clone(), cx);
+            combo
         });
         let url_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -260,6 +264,7 @@ impl RequestTabView {
                 window,
                 cx,
             )
+            .with_variable_validation(active_env.clone())
         });
         let headers_table = cx.new(|cx| {
             KeyValueTable::new(
@@ -272,6 +277,7 @@ impl RequestTabView {
                 cx,
             )
             .with_name_suggestions(common_http_header_options(), window, cx)
+            .with_variable_validation(active_env.clone())
         });
 
         let body_mode = BodyMode::from_body(&doc.request.body);
@@ -300,9 +306,11 @@ impl RequestTabView {
                 window,
                 cx,
             )
+            .with_variable_validation(active_env.clone())
         });
         let multipart_table = cx.new(|cx| {
             MultipartTable::new(format!("req-mp-{}", doc.id), &multipart_rows, window, cx)
+                .with_variable_validation(active_env.clone())
         });
         let binary_path_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -420,7 +428,7 @@ impl RequestTabView {
             &self.url_input,
             window,
             |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.on_edited(window, cx),
+                InputEvent::Change => this.on_url_input_changed(window, cx),
                 InputEvent::PressEnter { .. } => this.send_request(window, cx),
                 _ => {}
             },
@@ -567,7 +575,16 @@ impl RequestTabView {
         self.url_prefix_combo.update(cx, |combo, cx| {
             combo.set_options(prefix_options, cx);
             combo.set_placeholder(prefix_placeholder, window, cx);
+            combo.set_active_env(active_env.clone(), cx);
         });
+        self.params_table
+            .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
+        self.headers_table
+            .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
+        self.form_table
+            .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
+        self.multipart_table
+            .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
         self.auth_editor.update(cx, |editor, cx| {
             editor.set_context(Some(resolved_auth), active_env, cx);
         });
@@ -580,6 +597,57 @@ impl RequestTabView {
         self.dirty = false;
         cx.emit(RequestTabEvent::DirtyChanged);
         cx.notify();
+    }
+
+    pub(crate) fn rename_variables(
+        &mut self,
+        renames: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed = self
+            .url_prefix_combo
+            .update(cx, |combo, cx| combo.rename_variables(renames, window, cx));
+
+        let url_val = self.url_input.read(cx).value().to_string();
+        if let Some(updated) = rename_template_variables(&url_val, renames) {
+            self.url_input
+                .update(cx, |state, cx| state.set_value(updated, window, cx));
+            changed = true;
+        }
+
+        changed |= self
+            .params_table
+            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+        changed |= self
+            .headers_table
+            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+        changed |= self
+            .form_table
+            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+        changed |= self
+            .multipart_table
+            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+        changed |= self
+            .auth_editor
+            .update(cx, |e, cx| e.rename_variables(renames, window, cx));
+
+        for editor in [&self.json_editor, &self.raw_editor] {
+            let current = editor.read(cx).value().to_string();
+            if let Some(updated) = rename_template_variables(&current, renames) {
+                editor.update(cx, |state, cx| state.set_value(updated, window, cx));
+                changed = true;
+            }
+        }
+
+        if changed {
+            if !self.dirty {
+                self.saved_doc = self.build_doc(cx);
+            }
+            self.refresh_yaml_preview(window, cx);
+            cx.notify();
+        }
+        changed
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
@@ -675,6 +743,25 @@ impl RequestTabView {
             .find_request(&self.request_id)
             .map(|(ancestors, _)| ancestors)
             .unwrap_or_default()
+    }
+
+    fn on_url_input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.url_input.read(cx).value().to_string();
+        if let Some((clean_url, extracted)) = extract_url_query_params(&raw) {
+            let mut rows = self.params_table.read(cx).snapshot(cx);
+            for (key, value) in extracted {
+                if let Some(existing) = rows.iter_mut().find(|r| r.enabled && r.name == key) {
+                    existing.value = value;
+                } else {
+                    rows.push(KeyValueRow::new(key, value));
+                }
+            }
+            self.params_table
+                .update(cx, |table, cx| table.set_rows(&rows, window, cx));
+            self.url_input
+                .update(cx, |state, cx| state.set_value(clean_url, window, cx));
+        }
+        self.on_edited(window, cx);
     }
 
     fn on_edited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -860,12 +947,18 @@ impl RequestTabView {
                             .child(self.url_prefix_combo.clone()),
                     )
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.url_input)
-                                .id(SharedString::from(format!("req-url-{id_base}")))
-                                .w_full()
-                                .cleanable(true),
-                        ),
+                        div().flex_1().min_w_0().child({
+                            let url_text = self.url_input.read(cx).value().to_string();
+                            apply_unresolved_var_border(
+                                Input::new(&self.url_input)
+                                    .id(SharedString::from(format!("req-url-{id_base}")))
+                                    .w_full()
+                                    .cleanable(true),
+                                &url_text,
+                                self.active_env.as_ref(),
+                                cx,
+                            )
+                        }),
                     )
                     .child(
                         Button::new(SharedString::from(format!("req-send-{id_base}")))

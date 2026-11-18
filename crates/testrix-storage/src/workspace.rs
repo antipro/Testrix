@@ -350,19 +350,20 @@ pub fn create_project(
     base_url: &str,
 ) -> Result<ProjectNode, StorageError> {
     let trimmed = name.trim();
-    let dir_name = if trimmed.is_empty() {
+    let project_name = if trimmed.is_empty() {
         "New Project"
     } else {
         trimmed
     };
-    let root_dir = unique_dir_path(workspace_root, dir_name);
+    let project_id = generate_id("proj");
+    let root_dir = unique_dir_path(workspace_root, &project_id);
     let env_dir = root_dir.join(ENVIRONMENTS_DIR);
     std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
         path: env_dir.clone(),
         source,
     })?;
 
-    let mut project = ProjectDoc::new(generate_id("proj"), dir_name);
+    let mut project = ProjectDoc::new(project_id, project_name);
     project.base_url = base_url.to_string();
     let manifest_path = root_dir.join(PROJECT_MANIFEST_FILE);
     write_yaml_atomic(&manifest_path, &project)?;

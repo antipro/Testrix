@@ -23,6 +23,7 @@ struct EnvVarRowState {
     id: u64,
     enabled: bool,
     secret: bool,
+    original_key: String,
     key: Entity<InputState>,
     value: Entity<InputState>,
     description: Entity<InputState>,
@@ -34,6 +35,7 @@ pub(crate) enum EnvEditorEvent {
     Save {
         env_id: String,
         updated: EnvironmentDoc,
+        renamed_keys: Vec<(String, String)>,
     },
     Create {
         name: String,
@@ -184,6 +186,7 @@ impl EnvEditorView {
             id,
             enabled: var.enabled,
             secret: var.secret,
+            original_key: var.key.trim().to_string(),
             key,
             value,
             description,
@@ -214,12 +217,23 @@ impl EnvEditorView {
             return;
         }
         updated.name = next_name;
+        let mut renamed_keys = Vec::new();
         updated.variables = self
             .rows
-            .iter()
+            .iter_mut()
             .map(|row| {
+                let next_key_raw = row.key.read(cx).value().to_string();
+                let next_key = next_key_raw.trim().to_string();
+                if !row.original_key.is_empty()
+                    && !next_key.is_empty()
+                    && row.original_key != next_key
+                {
+                    renamed_keys.push((row.original_key.clone(), next_key.clone()));
+                }
+                row.original_key = next_key;
+
                 let mut v = EnvVariable::new(
-                    row.key.read(cx).value().to_string(),
+                    next_key_raw,
                     row.value.read(cx).value().to_string(),
                 )
                 .with_secret(row.secret)
@@ -230,7 +244,11 @@ impl EnvEditorView {
             .collect();
 
         self.dirty = false;
-        cx.emit(EnvEditorEvent::Save { env_id, updated });
+        cx.emit(EnvEditorEvent::Save {
+            env_id,
+            updated,
+            renamed_keys,
+        });
         cx.notify();
     }
 }

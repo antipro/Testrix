@@ -66,3 +66,68 @@ pub fn interpolate_with_map(input: &str, vars: &BTreeMap<String, String>) -> Tem
         unresolved,
     }
 }
+
+/// Rewrites `{{old_name}}` placeholders according to `(old_name, new_name)` pairs.
+///
+/// Returns `Some(updated)` only when at least one placeholder was rewritten.
+pub fn rename_template_variables(input: &str, renames: &[(String, String)]) -> Option<String> {
+    if renames.is_empty() || !input.contains("{{") {
+        return None;
+    }
+
+    let mut rendered = String::with_capacity(input.len());
+    let mut changed = false;
+    let mut rest = input;
+
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("}}") {
+            let raw_name = &after_open[..end];
+            let name = raw_name.trim();
+            if let Some((_, next_name)) = renames.iter().find(|(old, _)| old == name) {
+                rendered.push_str("{{");
+                rendered.push_str(next_name);
+                rendered.push_str("}}");
+                if next_name != raw_name {
+                    changed = true;
+                }
+            } else {
+                rendered.push_str(&rest[start..start + 2 + end + 2]);
+            }
+            rest = &after_open[end + 2..];
+        } else {
+            rendered.push_str("{{");
+            rest = after_open;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    rendered.push_str(rest);
+    Some(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renames_template_variables_without_double_swapping() {
+        let renames = vec![
+            ("base_url".to_string(), "base_url_emr".to_string()),
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+
+        assert_eq!(
+            rename_template_variables("{{base_url}}/{{a}}/{{b}}/{{other}}", &renames),
+            Some("{{base_url_emr}}/{{b}}/{{a}}/{{other}}".to_string())
+        );
+        assert_eq!(
+            rename_template_variables("https://example.com/{{other}}", &renames),
+            None
+        );
+    }
+}
