@@ -170,9 +170,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/testrix.exe "dist/Testrix-$env:VERSION-windows-x86_64.exe"
 
-      # Install WiX Toolset CLI via .NET to build the .msi from packaging/wix/main.wxs
+      # Install WiX Toolset v5 CLI via .NET to build the .msi from packaging/wix/main.wxs
       - name: Install WiX Toolset
-        run: dotnet tool install --global wix
+        run: dotnet tool install --global wix --version 5.0.2
 
       - name: Build .msi installer
         shell: pwsh
