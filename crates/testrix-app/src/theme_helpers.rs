@@ -172,11 +172,12 @@ pub(crate) fn configure_syntax_highlighting(cx: &mut App) {
     }
 
     let is_dark = cx.theme().is_dark();
-    let bracket_hex = if is_dark { "#fbbf24" } else { "#b45309" };
+    let bracket_hex = if is_dark { "#fde047" } else { "#2563eb" };
     let delim_hex = if is_dark { "#9ca3af" } else { "#6b7280" };
 
     let bracket_style: Option<ThemeStyle> =
-        serde_json::from_value(serde_json::json!({ "color": bracket_hex })).ok();
+        serde_json::from_value(serde_json::json!({ "color": bracket_hex, "font_weight": 700 }))
+            .ok();
     let delim_style: Option<ThemeStyle> =
         serde_json::from_value(serde_json::json!({ "color": delim_hex })).ok();
 
