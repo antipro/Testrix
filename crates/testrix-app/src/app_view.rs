@@ -485,7 +485,46 @@ impl TestrixApp {
         });
     }
 
+    fn set_active_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.active_project_id.as_deref() == Some(project_id) {
+            return;
+        }
+        let Some(proj) = self.workspace.find_project(project_id) else {
+            return;
+        };
+        let current_env_name = self
+            .workspace
+            .active_environment()
+            .map(|e| e.doc.name.clone());
+        let next_env_id = current_env_name
+            .as_deref()
+            .and_then(|name| {
+                proj.environments
+                    .iter()
+                    .find(|e| e.doc.name.eq_ignore_ascii_case(name))
+                    .map(|e| e.doc.id.clone())
+            })
+            .or_else(|| proj.environments.first().map(|e| e.doc.id.clone()));
+
+        self.workspace.active_project_id = Some(project_id.to_string());
+        self.workspace.active_environment_id = next_env_id;
+        let _ = save_workspace_state(
+            &self.workspace.root_dir,
+            self.workspace.active_project_id.as_deref(),
+            self.workspace.active_environment_id.as_deref(),
+        );
+        self.refresh_profile_selector(window, cx);
+        self.sync_env_editor(window, cx);
+    }
+
     pub fn open_node(&mut self, node: ExplorerNode, window: &mut Window, cx: &mut Context<Self>) {
+        let project_id = match &node {
+            ExplorerNode::Project { project_id }
+            | ExplorerNode::Folder { project_id, .. }
+            | ExplorerNode::Request { project_id, .. } => project_id.clone(),
+        };
+        self.set_active_project(&project_id, window, cx);
+
         let target_key = match &node {
             ExplorerNode::Project { project_id } => format!("proj:{project_id}"),
             ExplorerNode::Folder { folder_id, .. } => format!("fld:{folder_id}"),
@@ -2185,9 +2224,16 @@ impl TestrixApp {
                     .menu(true)
                     .max_width(px(220.))
                     .selected_index(selected_ix)
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                    .on_click(cx.listener(|this, ix: &usize, window, cx| {
                         if *ix < this.tabs.len() {
                             this.active_tab_ix = Some(*ix);
+                            let project_id = match &this.tabs[*ix] {
+                                WorkbenchTab::Request(view) => view.read(cx).project_id().to_string(),
+                                WorkbenchTab::Container(view) => {
+                                    view.read(cx).project_id().to_string()
+                                }
+                            };
+                            this.set_active_project(&project_id, window, cx);
                             let key = this.tabs[*ix].key(cx);
                             this.explorer
                                 .update(cx, |panel, cx| panel.reveal_and_select(&key, cx));

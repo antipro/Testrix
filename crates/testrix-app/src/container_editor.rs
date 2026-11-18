@@ -304,6 +304,10 @@ impl ContainerTabView {
         self._subscriptions = subs;
     }
 
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     pub(crate) fn tab_key(&self) -> String {
         match &self.kind {
             ContainerKind::Project { .. } => format!("proj:{}", self.project_id),
