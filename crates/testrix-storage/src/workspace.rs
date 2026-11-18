@@ -459,7 +459,58 @@ pub fn create_project(
     load_project(&root_dir)
 }
 
-/// Persists an [`ImportedProjectBundle`] (such as an OpenAPI 3.0 import) into `workspace_root`.
+fn persist_imported_folder(
+    parent_dir: &Path,
+    folder: &testrix_core::ImportedFolder,
+) -> Result<(), StorageError> {
+    folder.doc.validate()?;
+    let folder_dir = unique_dir_path(parent_dir, &folder.doc.name);
+    std::fs::create_dir_all(&folder_dir).map_err(|source| StorageError::Io {
+        path: folder_dir.clone(),
+        source,
+    })?;
+    write_yaml_atomic(&folder_dir.join(FOLDER_MANIFEST_FILE), &folder.doc)?;
+    for req in &folder.requests {
+        req.validate()?;
+        let req_path = unique_file_path(&folder_dir, &req.name, REQUEST_EXTENSION);
+        write_yaml_atomic(&req_path, req)?;
+    }
+    for sub in &folder.folders {
+        persist_imported_folder(&folder_dir, sub)?;
+    }
+    Ok(())
+}
+
+fn merge_imported_folder(
+    parent_dir: &Path,
+    existing_folders: &mut [FolderNode],
+    folder: &testrix_core::ImportedFolder,
+) -> Result<(), StorageError> {
+    if let Some(existing_folder) = existing_folders
+        .iter_mut()
+        .find(|f| f.doc.name == folder.doc.name)
+    {
+        for req in &folder.requests {
+            merge_or_create_request(
+                &existing_folder.dir_path,
+                &mut existing_folder.requests,
+                req,
+            )?;
+        }
+        for sub in &folder.folders {
+            merge_imported_folder(
+                &existing_folder.dir_path,
+                &mut existing_folder.folders,
+                sub,
+            )?;
+        }
+    } else {
+        persist_imported_folder(parent_dir, folder)?;
+    }
+    Ok(())
+}
+
+/// Persists an [`ImportedProjectBundle`] (such as an OpenAPI 3.0 or Postman import) into `workspace_root`.
 pub fn import_project_bundle(
     workspace_root: &Path,
     bundle: &ImportedProjectBundle,
@@ -487,18 +538,7 @@ pub fn import_project_bundle(
     }
 
     for folder in &bundle.folders {
-        folder.doc.validate()?;
-        let folder_dir = unique_dir_path(&root_dir, &folder.doc.name);
-        std::fs::create_dir_all(&folder_dir).map_err(|source| StorageError::Io {
-            path: folder_dir.clone(),
-            source,
-        })?;
-        write_yaml_atomic(&folder_dir.join(FOLDER_MANIFEST_FILE), &folder.doc)?;
-        for req in &folder.requests {
-            req.validate()?;
-            let req_path = unique_file_path(&folder_dir, &req.name, REQUEST_EXTENSION);
-            write_yaml_atomic(&req_path, req)?;
-        }
+        persist_imported_folder(&root_dir, folder)?;
     }
 
     load_project(&root_dir)
@@ -553,32 +593,7 @@ pub fn import_bundle_into_project(
 
     // Merge folders by name; create if missing, then merge their requests.
     for folder in &bundle.folders {
-        if let Some(existing_folder) = project
-            .folders
-            .iter_mut()
-            .find(|f| f.doc.name == folder.doc.name)
-        {
-            for req in &folder.requests {
-                merge_or_create_request(
-                    &existing_folder.dir_path,
-                    &mut existing_folder.requests,
-                    req,
-                )?;
-            }
-        } else {
-            folder.doc.validate()?;
-            let folder_dir = unique_dir_path(&root_dir, &folder.doc.name);
-            std::fs::create_dir_all(&folder_dir).map_err(|source| StorageError::Io {
-                path: folder_dir.clone(),
-                source,
-            })?;
-            write_yaml_atomic(&folder_dir.join(FOLDER_MANIFEST_FILE), &folder.doc)?;
-            for req in &folder.requests {
-                req.validate()?;
-                let req_path = unique_file_path(&folder_dir, &req.name, REQUEST_EXTENSION);
-                write_yaml_atomic(&req_path, req)?;
-            }
-        }
+        merge_imported_folder(&root_dir, &mut project.folders, folder)?;
     }
 
     *project = load_project(&root_dir)?;

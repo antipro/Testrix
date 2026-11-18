@@ -39,7 +39,8 @@ use gpui_kit::{
 use testrix_core::{
     AuthConfig, AuthNodeRef, EnvironmentDoc, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
     KeyValueRow, ProjectNode, RequestBody, WorkspaceTree, merge_environments_into_bundle,
-    parse_openapi_3_0, rename_template_variables, resolve_request_auth,
+    parse_openapi_3_0, parse_postman_collection, parse_postman_zip, rename_template_variables,
+    resolve_request_auth,
 };
 use testrix_http::HttpRunner;
 use testrix_storage::{
@@ -418,6 +419,7 @@ impl TestrixApp {
                 self.confirm_delete_project(project_id, window, cx)
             }
             ExplorerEvent::ImportOpenApi => self.prompt_import_openapi(window, cx),
+            ExplorerEvent::ImportPostmanZip => self.prompt_import_postman_zip(window, cx),
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
     }
@@ -1181,6 +1183,126 @@ impl TestrixApp {
                                         cx,
                                     );
                                 }
+                            }
+                        }
+                        Err(msg) => {
+                            window.push_notification(msg, cx);
+                        }
+                    });
+                })
+                .ok()
+        })
+        .detach();
+    }
+
+    fn prompt_import_postman_zip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select Postman Collection (.zip or .json)".into()),
+        });
+        let workspace_root = self.workspace.root_dir.clone();
+        let entity = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let path = prompt.await.ok()?.ok()??.into_iter().next()?;
+            let is_zip = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+            let parsed = if is_zip {
+                std::fs::read(&path)
+                    .map_err(|err| format!("Failed reading {}: {err}", path.display()))
+                    .and_then(|bytes| {
+                        parse_postman_zip(&bytes)
+                            .map_err(|err| format!("Postman ZIP parse failed: {err}"))
+                    })
+            } else {
+                std::fs::read_to_string(&path)
+                    .map_err(|err| format!("Failed reading {}: {err}", path.display()))
+                    .and_then(|json| {
+                        parse_postman_collection(&json)
+                            .map(|b| vec![b])
+                            .map_err(|err| format!("Postman JSON parse failed: {err}"))
+                    })
+            };
+
+            window
+                .update(|window, cx| {
+                    entity.update(cx, |this, cx| match parsed {
+                        Ok(bundles) => {
+                            let active_env_name = this
+                                .workspace
+                                .active_environment()
+                                .map(|e| e.doc.name.clone());
+                            let existing_envs: Vec<EnvironmentDoc> = this
+                                .workspace
+                                .active_project()
+                                .map(|p| p.environments.iter().map(|e| e.doc.clone()).collect())
+                                .unwrap_or_default();
+
+                            let mut imported_names = Vec::new();
+                            let mut last_proj_id = None;
+                            let mut last_env_id = None;
+
+                            for mut bundle in bundles {
+                                if !existing_envs.is_empty() {
+                                    merge_environments_into_bundle(&mut bundle, &existing_envs);
+                                }
+                                match import_project_bundle(&workspace_root, &bundle) {
+                                    Ok(proj) => {
+                                        let proj_id = proj.doc.id.clone();
+                                        let proj_name = proj.doc.name.clone();
+                                        let matched_env_id = active_env_name
+                                            .as_deref()
+                                            .and_then(|name| {
+                                                proj.environments
+                                                    .iter()
+                                                    .find(|e| e.doc.name.eq_ignore_ascii_case(name))
+                                                    .map(|e| e.doc.id.clone())
+                                            })
+                                            .or_else(|| {
+                                                proj.environments.first().map(|e| e.doc.id.clone())
+                                            });
+                                        this.workspace.projects.push(proj);
+                                        imported_names.push(proj_name);
+                                        last_proj_id = Some(proj_id);
+                                        last_env_id = matched_env_id;
+                                    }
+                                    Err(err) => {
+                                        window.push_notification(
+                                            format!("Failed writing imported project: {err}"),
+                                            cx,
+                                        );
+                                    }
+                                }
+                            }
+
+                            if let Some(proj_id) = last_proj_id {
+                                this.workspace
+                                    .projects
+                                    .sort_by_key(|p| p.doc.name.to_lowercase());
+                                this.workspace.active_project_id = Some(proj_id.clone());
+                                this.workspace.active_environment_id = last_env_id;
+                                let _ = save_workspace_state(
+                                    &this.workspace.root_dir,
+                                    this.workspace.active_project_id.as_deref(),
+                                    this.workspace.active_environment_id.as_deref(),
+                                );
+                                this.refresh_profile_selector(window, cx);
+                                this.sync_env_editor(window, cx);
+                                this.sync_all_tabs(window, cx);
+                                this.explorer.update(cx, |panel, cx| {
+                                    panel.set_workspace(this.workspace.clone(), cx);
+                                    panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
+                                });
+                                window.push_notification(
+                                    format!(
+                                        "Imported Postman project(s): {}.",
+                                        imported_names.join(", ")
+                                    ),
+                                    cx,
+                                );
                             }
                         }
                         Err(msg) => {

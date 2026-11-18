@@ -57,6 +57,7 @@ base64 = "0.22"
 bytes = "1.12"
 url = "2.5"
 uuid = { version = "1.26", features = ["v4"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Testing
 tempfile = "3.20"

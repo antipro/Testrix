@@ -54,6 +54,7 @@ pub(crate) enum ExplorerEvent {
         project_id: String,
     },
     ImportOpenApi,
+    ImportPostmanZip,
     ReloadWorkspace,
 }
 
@@ -323,6 +324,16 @@ impl Render for ExplorerPanel {
                                     .tooltip(crate::i18n::t("import_openapi"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::ImportOpenApi);
+                                    })),
+                            )
+                            .child(
+                                Button::new("explorer-import-postman")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(LucideIcon::FolderArchive)
+                                    .tooltip(crate::i18n::t("import_postman_zip"))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(ExplorerEvent::ImportPostmanZip);
                                     })),
                             )
                             .child(

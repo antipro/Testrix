@@ -7,6 +7,7 @@ mod error;
 mod materialize;
 mod model;
 mod openapi;
+mod postman;
 mod response;
 mod search;
 mod template;
@@ -30,6 +31,9 @@ pub use model::{
 };
 pub use openapi::{
     ImportedFolder, ImportedProjectBundle, merge_environments_into_bundle, parse_openapi_3_0,
+};
+pub use postman::{
+    parse_postman_collection, parse_postman_environment, parse_postman_zip,
 };
 pub use response::{
     HttpResponseSnapshot, RequestExecutionState, ResponseHeader, SentRequestSnapshot,

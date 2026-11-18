@@ -16,6 +16,7 @@ use crate::{
 pub struct ImportedFolder {
     pub doc: FolderDoc,
     pub requests: Vec<HttpRequestDoc>,
+    pub folders: Vec<ImportedFolder>,
 }
 
 /// Complete in-memory project bundle parsed from an OpenAPI 3.0 document.
@@ -172,6 +173,7 @@ pub fn parse_openapi_3_0(json_str: &str) -> Result<ImportedProjectBundle, CoreEr
             folders.push(ImportedFolder {
                 doc: folder_doc,
                 requests: Vec::new(),
+                folders: Vec::new(),
             });
         }
     }
@@ -286,6 +288,7 @@ pub fn parse_openapi_3_0(json_str: &str) -> Result<ImportedProjectBundle, CoreEr
                         folders.push(ImportedFolder {
                             doc: folder_doc,
                             requests: Vec::new(),
+                            folders: Vec::new(),
                         });
                         ix
                     };
