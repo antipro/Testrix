@@ -289,7 +289,7 @@ fn generate_powershell(req: &PreparedRequest) -> String {
     }
 
     let mut invoke = format!(
-        "Invoke-RestMethod -Uri '{}' -Method {}",
+        "$response = Invoke-WebRequest -Uri '{}' -Method {} -UseBasicParsing",
         escape_ps_single(&req.url),
         req.method.as_str()
     );
@@ -303,6 +303,7 @@ fn generate_powershell(req: &PreparedRequest) -> String {
         invoke.push_str(" -Body $body");
     }
     out.push(invoke);
+    out.push("$response.Content".to_string());
 
     out.join("\n")
 }
@@ -362,8 +363,9 @@ mod tests {
         assert!(wget.contains("--body-data='{\"name\":\"Ada\"}'"));
 
         let ps = generate_request_code(&req, CodegenTarget::PowerShell);
-        assert!(ps.contains("Invoke-RestMethod -Uri 'https://api.example.com/users?active=true' -Method POST"));
+        assert!(ps.contains("Invoke-WebRequest -Uri 'https://api.example.com/users?active=true' -Method POST -UseBasicParsing"));
         assert!(ps.contains("-ContentType 'application/json'"));
         assert!(ps.contains("-Body $body"));
+        assert!(ps.contains("$response.Content"));
     }
 }
