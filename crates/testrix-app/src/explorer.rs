@@ -11,7 +11,7 @@ use gpui_kit::{
         h_flex,
         input::{Input, InputEvent, InputState},
         list::ListItem,
-        menu::PopupMenuItem,
+        menu::{DropdownMenu as _, PopupMenuItem},
         tree::{TreeEvent, TreeItem, TreeState, tree},
         v_flex,
     },
@@ -317,36 +317,46 @@ impl Render for ExplorerPanel {
                                         cx.emit(ExplorerEvent::NewProject);
                                     })),
                             )
-                            .child(
-                                Button::new("explorer-import-openapi")
+                            .child({
+                                let view = cx.entity();
+                                Button::new("explorer-import-menu")
                                     .ghost()
                                     .xsmall()
                                     .icon(LucideIcon::FileUp)
-                                    .tooltip(crate::i18n::t("import_openapi"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExplorerEvent::ImportOpenApi);
-                                    })),
-                            )
-                            .child(
-                                Button::new("explorer-import-postman")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(LucideIcon::FolderArchive)
-                                    .tooltip(crate::i18n::t("import_postman_zip"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExplorerEvent::ImportPostmanZip);
-                                    })),
-                            )
-                            .child(
-                                Button::new("explorer-import-apifox")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(LucideIcon::Braces)
-                                    .tooltip(crate::i18n::t("import_apifox"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExplorerEvent::ImportApifox);
-                                    })),
-                            )
+                                    .tooltip(crate::i18n::t("import_menu"))
+                                    .dropdown_menu(move |menu, _, _| {
+                                        let v1 = view.clone();
+                                        let v2 = view.clone();
+                                        let v3 = view.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(crate::i18n::t("import_openapi"))
+                                                .icon(LucideIcon::FileUp)
+                                                .on_click(move |_, _, cx| {
+                                                    v1.update(cx, |_, cx| {
+                                                        cx.emit(ExplorerEvent::ImportOpenApi);
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new(crate::i18n::t("import_postman_zip"))
+                                                .icon(LucideIcon::FolderArchive)
+                                                .on_click(move |_, _, cx| {
+                                                    v2.update(cx, |_, cx| {
+                                                        cx.emit(ExplorerEvent::ImportPostmanZip);
+                                                    });
+                                                }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new(crate::i18n::t("import_apifox"))
+                                                .icon(LucideIcon::Braces)
+                                                .on_click(move |_, _, cx| {
+                                                    v3.update(cx, |_, cx| {
+                                                        cx.emit(ExplorerEvent::ImportApifox);
+                                                    });
+                                                }),
+                                        )
+                                    })
+                            })
                             .child(
                                 Button::new("explorer-reload")
                                     .ghost()
