@@ -88,6 +88,8 @@ jobs:
       # Automatically reads rust-toolchain.toml (1.100.0)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -150,6 +152,8 @@ jobs:
       # Automatically reads rust-toolchain.toml (1.100.0)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -226,6 +230,8 @@ jobs:
       # Automatically reads rust-toolchain.toml (1.100.0)
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
