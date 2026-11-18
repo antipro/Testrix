@@ -2,21 +2,35 @@ use std::path::PathBuf;
 
 use gpui_kit::assets::AllAssets;
 use testrix_app::{init_app, open_main_window};
-use testrix_storage::default_workspace_dir;
+use testrix_storage::{default_workspace_dir, init_or_load_config};
 use tracing_subscriber::EnvFilter;
 
-fn parse_workspace_arg() -> PathBuf {
+fn parse_workspace_arg() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--workspace"
             && let Some(path) = args.next()
         {
-            return PathBuf::from(path);
+            return Some(PathBuf::from(path));
         } else if let Some(path) = arg.strip_prefix("--workspace=") {
-            return PathBuf::from(path);
+            return Some(PathBuf::from(path));
         }
     }
-    default_workspace_dir()
+    None
+}
+
+fn resolve_startup_workspace_dir() -> PathBuf {
+    let cfg = init_or_load_config();
+    if let Some(cli_dir) = parse_workspace_arg() {
+        return cli_dir;
+    }
+    match cfg {
+        Ok(cfg) => cfg.workspace_dir,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed loading ~/.testrix/config.yaml; falling back to default workspace");
+            default_workspace_dir()
+        }
+    }
 }
 
 fn main() {
@@ -26,7 +40,7 @@ fn main() {
         )
         .init();
 
-    let workspace_dir = parse_workspace_arg();
+    let workspace_dir = resolve_startup_workspace_dir();
 
     gpui_kit::application()
         .with_assets(AllAssets)

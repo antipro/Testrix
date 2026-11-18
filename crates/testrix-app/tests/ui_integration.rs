@@ -483,3 +483,24 @@ fn url_prefix_and_header_editable_comboboxes_select_and_edit(cx: &mut TestAppCon
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn workspace_button_in_titlebar_opens_workspace_dialog(cx: &mut TestAppContext) {
+    let dir = TempDir::new().unwrap();
+    cx.update(init_app);
+
+    let (handle, _) = open_testrix_test_window(cx, dir.path().to_path_buf());
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-workspace-btn", cx);
+    })
+    .unwrap();
+
+    cx.wait_for(handle.into(), Duration::from_secs(1), |window, _| {
+        window.try_find("workspace-dir-input").is_some()
+            && window.try_find("workspace-browse-btn").is_some()
+            && window.try_find("workspace-apply-btn").is_some()
+    })
+    .await;
+}

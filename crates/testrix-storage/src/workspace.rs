@@ -554,11 +554,87 @@ fn sort_requests(requests: &mut [RequestNode]) {
     });
 }
 
-/// Returns the default workspace directory (`$HOME/.testrix/workspace` fallback `./.testrix-workspace`).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Returns the default workspace directory (`~/.testrix/workspace`, fallback `./.testrix-workspace`).
 pub fn default_workspace_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".testrix").join("workspace")
+    if let Some(home) = home_dir() {
+        home.join(".testrix").join("workspace")
     } else {
         PathBuf::from(".testrix-workspace")
     }
+}
+
+/// Returns the Testrix user configuration file path (`~/.testrix/config.yaml`).
+pub fn config_file_path() -> PathBuf {
+    if let Some(home) = home_dir() {
+        home.join(".testrix").join("config.yaml")
+    } else {
+        PathBuf::from(".testrix").join("config.yaml")
+    }
+}
+
+/// Persistent Testrix application configuration stored at `~/.testrix/config.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestrixConfig {
+    #[serde(default = "default_config_api_version")]
+    pub api_version: String,
+    pub workspace_dir: PathBuf,
+}
+
+fn default_config_api_version() -> String {
+    testrix_core::API_VERSION.to_string()
+}
+
+impl Default for TestrixConfig {
+    fn default() -> Self {
+        Self {
+            api_version: default_config_api_version(),
+            workspace_dir: default_workspace_dir(),
+        }
+    }
+}
+
+/// Loads `~/.testrix/config.yaml`, initializing it with defaults on first startup if missing.
+pub fn init_or_load_config() -> Result<TestrixConfig, StorageError> {
+    init_or_load_config_at(&config_file_path())
+}
+
+/// Loads a Testrix config file at `config_path`, creating it if missing.
+pub fn init_or_load_config_at(config_path: &Path) -> Result<TestrixConfig, StorageError> {
+    if config_path.is_file() {
+        let mut cfg: TestrixConfig = read_yaml_file(config_path)?;
+        if cfg.workspace_dir.as_os_str().is_empty() {
+            cfg.workspace_dir = default_workspace_dir();
+        }
+        return Ok(cfg);
+    }
+
+    let cfg = TestrixConfig::default();
+    write_yaml_atomic(config_path, &cfg)?;
+    Ok(cfg)
+}
+
+/// Persists `workspace_dir` into `~/.testrix/config.yaml`.
+pub fn save_config_workspace_dir(workspace_dir: &Path) -> Result<(), StorageError> {
+    save_config_workspace_dir_at(&config_file_path(), workspace_dir)
+}
+
+/// Persists `workspace_dir` into `config_path`.
+pub fn save_config_workspace_dir_at(
+    config_path: &Path,
+    workspace_dir: &Path,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    cfg.workspace_dir = workspace_dir.to_path_buf();
+    write_yaml_atomic(config_path, &cfg)
 }

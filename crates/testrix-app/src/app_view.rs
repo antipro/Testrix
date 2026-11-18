@@ -2,7 +2,7 @@ use std::{cell::Cell, collections::HashSet, path::PathBuf};
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowOptions,
     assets::IconName as LucideIcon,
     base::TestSupportExt as _,
@@ -33,7 +33,8 @@ use testrix_http::HttpRunner;
 use testrix_storage::{
     create_environment, create_folder, create_project, create_request, delete_environment,
     delete_folder, delete_request, duplicate_request, ensure_seeded_workspace, load_workspace,
-    save_environment, save_folder, save_project, save_request, save_workspace_state,
+    save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
+    save_workspace_state,
 };
 use tracing::{error, info};
 
@@ -702,30 +703,133 @@ impl TestrixApp {
     }
 
     fn choose_workspace_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Select Testrix Workspace Folder".into()),
+        let current_dir = self.workspace_dir.to_string_lossy().to_string();
+        let path_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("/path/to/testrix-workspace")
+                .default_value(current_dir)
         });
-        let entity = cx.entity();
-        cx.spawn_in(window, async move |_, window| {
-            let path = prompt.await.ok()?.ok()??.into_iter().next()?;
-            window
-                .update(|window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.switch_workspace_dir(path, window, cx);
-                    });
-                })
-                .ok()
-        })
-        .detach();
+        let app_entity = cx.entity();
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let path_browse = path_input.clone();
+            let path_ok = path_input.clone();
+            let app_ok = app_entity.clone();
+            dialog
+                .title("Workspace Directory")
+                .w(px(520.))
+                .child(
+                    v_flex().gap_2().child(
+                        Form::new().child(
+                            Field::new()
+                                .label("Workspace Path")
+                                .description(
+                                    "Saved in ~/.testrix/config.yaml; empty folders are seeded automatically.",
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_2()
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Input::new(&path_input)
+                                                    .id("workspace-dir-input")
+                                                    .w_full(),
+                                            ),
+                                        )
+                                        .child(
+                                            Button::new("workspace-browse-btn")
+                                                .outline()
+                                                .icon(LucideIcon::FolderOpen)
+                                                .label("Browse…")
+                                                .on_click(move |_, window, cx| {
+                                                    let prompt = cx.prompt_for_paths(PathPromptOptions {
+                                                        files: false,
+                                                        directories: true,
+                                                        multiple: false,
+                                                        prompt: Some(
+                                                            "Select Testrix Workspace Folder"
+                                                                .into(),
+                                                        ),
+                                                    });
+                                                    let path_browse = path_browse.clone();
+                                                    window
+                                                        .spawn(cx, async move |window| {
+                                                            match prompt.await {
+                                                            Ok(Ok(Some(paths))) => {
+                                                                if let Some(dir) =
+                                                                    paths.into_iter().next()
+                                                                {
+                                                                    let _ = window.update(
+                                                                        |window, cx| {
+                                                                            path_browse.update(
+                                                                                cx,
+                                                                                |state, cx| {
+                                                                                    state.set_value(
+                                                                                        dir.to_string_lossy()
+                                                                                            .to_string(),
+                                                                                        window,
+                                                                                        cx,
+                                                                                    );
+                                                                                },
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }
+                                                            }
+                                                            Ok(Err(err)) => {
+                                                                tracing::warn!(error = %err, "folder picker failed");
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    })
+                                                    .detach();
+                                                }),
+                                        ),
+                                ),
+                        ),
+                    ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("workspace-cancel-btn")
+                                    .label("Cancel")
+                                    .outline(),
+                            ),
+                        )
+                        .child(
+                            Button::new("workspace-apply-btn")
+                                .primary()
+                                .label("Switch Workspace")
+                                .on_click(move |_, window, cx| {
+                                    let raw = path_ok.read(cx).value().trim().to_string();
+                                    if raw.is_empty() {
+                                        window.push_notification(
+                                            "Workspace path must not be empty.",
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    app_ok.update(cx, |this, cx| {
+                                        this.switch_workspace_dir(PathBuf::from(raw), window, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
     }
 
     fn switch_workspace_dir(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match ensure_seeded_workspace(&dir) {
             Ok(tree) => {
                 info!(dir = %dir.display(), "switched workspace directory");
+                if let Err(err) = save_config_workspace_dir(&dir) {
+                    tracing::warn!(error = %err, "failed updating ~/.testrix/config.yaml");
+                }
                 self.workspace_dir = dir;
                 self.workspace = tree;
                 self.tabs.clear();
@@ -1324,6 +1428,7 @@ impl Render for TestrixApp {
                             h_flex()
                                 .gap_2()
                                 .items_center()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     h_flex()
                                         .gap_1p5()
@@ -1378,6 +1483,7 @@ impl Render for TestrixApp {
                             h_flex()
                                 .id("top-right-profile-bar")
                                 .test_support()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .gap_1p5()
                                 .items_center()
                                 .child(

@@ -9,10 +9,12 @@ pub use error::StorageError;
 pub use seed::seed_starter_workspace;
 pub use slug::slugify;
 pub use workspace::{
-    create_environment, create_folder, create_project, create_request, default_workspace_dir,
-    delete_environment, delete_folder, delete_request, duplicate_request, ensure_seeded_workspace,
-    load_project, load_workspace, save_environment, save_folder, save_project, save_request,
-    save_workspace_state, to_yaml_pretty, write_yaml_atomic,
+    TestrixConfig, config_file_path, create_environment, create_folder, create_project,
+    create_request, default_workspace_dir, delete_environment, delete_folder, delete_request,
+    duplicate_request, ensure_seeded_workspace, init_or_load_config, init_or_load_config_at,
+    load_project, load_workspace, save_config_workspace_dir, save_config_workspace_dir_at,
+    save_environment, save_folder, save_project, save_request, save_workspace_state,
+    to_yaml_pretty, write_yaml_atomic,
 };
 
 #[cfg(test)]
@@ -73,5 +75,21 @@ mod tests {
         assert!(matches!(auth.effective, EffectiveAuth::Basic { .. }));
         let (_, found_req) = reloaded_proj.find_request(&req.doc.id).unwrap();
         assert_eq!(found_req.doc.request.method, HttpMethod::Post);
+    }
+
+    #[test]
+    fn initializes_loads_and_updates_testrix_config_yaml() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+
+        let created = init_or_load_config_at(&cfg_path).unwrap();
+        assert!(cfg_path.is_file());
+        assert_eq!(created.api_version, testrix_core::API_VERSION);
+
+        let custom_ws = dir.path().join("custom-ws");
+        save_config_workspace_dir_at(&cfg_path, &custom_ws).unwrap();
+
+        let reloaded = init_or_load_config_at(&cfg_path).unwrap();
+        assert_eq!(reloaded.workspace_dir, custom_ws);
     }
 }
