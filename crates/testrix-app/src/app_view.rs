@@ -18,6 +18,7 @@ use gpui_kit::{
         form::{Field, Form},
         h_flex,
         input::{Input, InputState},
+        menu::{ContextMenuExt as _, PopupMenuItem},
         resizable::{h_resizable, resizable_panel},
         select::{Select, SelectEvent, SelectItem, SelectState},
         status_bar::StatusBar,
@@ -113,6 +114,7 @@ pub struct TestrixApp {
     profile_select: Entity<SelectState<Vec<ProfileOption>>>,
     tabs: Vec<WorkbenchTab>,
     active_tab_ix: Option<usize>,
+    context_tab_ix: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -152,6 +154,7 @@ impl TestrixApp {
             profile_select,
             tabs: Vec::new(),
             active_tab_ix: None,
+            context_tab_ix: None,
             _subscriptions: Vec::new(),
         };
 
@@ -737,26 +740,143 @@ impl TestrixApp {
             .update(cx, |panel, cx| panel.set_dirty_keys(dirty, cx));
     }
 
-    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.tabs.len() {
+    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(ix) {
+            let key = tab.key(cx);
+            self.request_close_tabs(vec![key], window, cx);
+        }
+    }
+
+    fn close_other_tabs(&mut self, keep_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| *ix != keep_ix)
+            .map(|(_, t)| t.key(cx))
+            .collect();
+        self.request_close_tabs(keys, window, cx);
+    }
+
+    fn close_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self.tabs.iter().map(|t| t.key(cx)).collect();
+        self.request_close_tabs(keys, window, cx);
+    }
+
+    fn close_tabs_by_keys(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        if keys.is_empty() {
             return;
         }
-        self.tabs.remove(ix);
+        let active_key = self
+            .active_tab_ix
+            .and_then(|ix| self.tabs.get(ix))
+            .map(|t| t.key(cx));
+        self.tabs.retain(|t| !keys.contains(&t.key(cx)));
         self.active_tab_ix = if self.tabs.is_empty() {
             None
-        } else if let Some(active) = self.active_tab_ix {
-            if active == ix {
-                Some(ix.min(self.tabs.len() - 1))
-            } else if active > ix {
-                Some(active - 1)
-            } else {
-                Some(active)
-            }
+        } else if let Some(ref ak) = active_key
+            && let Some(pos) = self.tabs.iter().position(|t| &t.key(cx) == ak)
+        {
+            Some(pos)
         } else {
-            None
+            Some(0)
         };
+        self.context_tab_ix = None;
         self.refresh_dirty_indicators(cx);
         cx.notify();
+    }
+
+    fn save_tabs_by_keys(&mut self, keys: &[String], cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if keys.contains(&tab.key(cx)) && tab.is_dirty(cx) {
+                match tab {
+                    WorkbenchTab::Request(view) => view.update(cx, |v, cx| v.save(cx)),
+                    WorkbenchTab::Container(view) => view.update(cx, |v, cx| v.save(cx)),
+                }
+            }
+        }
+    }
+
+    fn request_close_tabs(
+        &mut self,
+        keys: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        let dirty_titles: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| keys.contains(&t.key(cx)) && t.is_dirty(cx))
+            .map(|t| t.title(cx))
+            .collect();
+
+        if dirty_titles.is_empty() {
+            self.close_tabs_by_keys(&keys, cx);
+            return;
+        }
+
+        let count = dirty_titles.len();
+        let title = if count == 1 {
+            format!("Save changes to \"{}\"?", dirty_titles[0])
+        } else {
+            format!("Save changes to {count} unsaved tabs?")
+        };
+        let description = if count == 1 {
+            "This tab has unsaved changes. Do you want to save before closing?".to_string()
+        } else {
+            format!(
+                "Unsaved tabs: {}. Do you want to save before closing?",
+                dirty_titles.join(", ")
+            )
+        };
+
+        let app_entity = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app_discard = app_entity.clone();
+            let app_save = app_entity.clone();
+            let keys_discard = keys.clone();
+            let keys_save = keys.clone();
+            alert
+                .title(title.clone())
+                .description(description.clone())
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("tab-close-cancel-btn")
+                                    .label("Cancel")
+                                    .outline(),
+                            ),
+                        )
+                        .child(
+                            Button::new("tab-close-discard-btn")
+                                .danger()
+                                .label("Don't Save")
+                                .on_click(move |_, window, cx| {
+                                    app_discard.update(cx, |this, cx| {
+                                        this.close_tabs_by_keys(&keys_discard, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("tab-close-save-btn")
+                                .primary()
+                                .label("Save & Close")
+                                .on_click(move |_, window, cx| {
+                                    app_save.update(cx, |this, cx| {
+                                        this.save_tabs_by_keys(&keys_save, cx);
+                                        this.close_tabs_by_keys(&keys_save, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
     }
 
     fn prompt_import_openapi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1403,13 +1523,7 @@ impl TestrixApp {
                             window.push_notification(format!("Delete failed: {err}"), cx);
                             return;
                         }
-                        if let Some(ix) = this
-                            .tabs
-                            .iter()
-                            .position(|t| t.key(cx) == format!("req:{rid}"))
-                        {
-                            this.close_tab(ix, cx);
-                        }
+                        this.close_tabs_by_keys(&[format!("req:{rid}")], cx);
                         if let Some(proj) = this.workspace.find_project_mut(&pid) {
                             remove_request_from_project(proj, &rid);
                         }
@@ -1618,9 +1732,9 @@ impl Render for TestrixApp {
                 this.explorer
                     .update(cx, |panel, cx| panel.focus_search(window, cx));
             }))
-            .on_action(cx.listener(|this, _: &CloseActiveTab, _, cx| {
+            .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
                 if let Some(ix) = this.active_tab_ix {
-                    this.close_tab(ix, cx);
+                    this.close_tab(ix, window, cx);
                 }
             }))
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| {
@@ -1781,63 +1895,115 @@ impl Render for TestrixApp {
 impl TestrixApp {
     fn render_workbench_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_ix = self.active_tab_ix.unwrap_or(0);
+        let app_entity = cx.entity();
 
-        TabBar::new("workbench-tabs")
+        div()
+            .id("workbench-tabs-wrap")
             .w_full()
-            .folder()
-            .small()
-            .menu(true)
-            .max_width(px(220.))
-            .selected_index(selected_ix)
-            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                if *ix < this.tabs.len() {
-                    this.active_tab_ix = Some(*ix);
-                    let key = this.tabs[*ix].key(cx);
-                    this.explorer
-                        .update(cx, |panel, cx| panel.reveal_and_select(&key, cx));
-                    cx.notify();
+            .context_menu(move |menu, _, cx| {
+                let app_read = app_entity.read(cx);
+                if app_read.tabs.is_empty() {
+                    return menu;
                 }
-            }))
-            .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                let key = tab.key(cx);
-                let title = tab.title(cx);
-                let dirty = tab.is_dirty(cx);
-                let label = if dirty { format!("{title} •") } else { title };
+                let target_ix = app_read
+                    .context_tab_ix
+                    .or(app_read.active_tab_ix)
+                    .unwrap_or(0)
+                    .min(app_read.tabs.len() - 1);
+                let has_others = app_read.tabs.len() > 1;
 
-                let prefix = match tab {
-                    WorkbenchTab::Request(view) => {
-                        method_badge(view.read(cx).method(), true).into_any_element()
-                    }
-                    WorkbenchTab::Container(view) => {
-                        let icon = if view.read(cx).is_project() {
-                            LucideIcon::Boxes
-                        } else {
-                            LucideIcon::FolderKey
+                let app_close = app_entity.clone();
+                let app_others = app_entity.clone();
+                let app_all = app_entity.clone();
+
+                menu.item(PopupMenuItem::new("Close Current Tab").on_click(
+                    move |_, window, cx| {
+                        app_close.update(cx, |this, cx| {
+                            this.close_tab(target_ix, window, cx);
+                        });
+                    },
+                ))
+                .when(has_others, |m| {
+                    m.item(PopupMenuItem::new("Close Other Tabs").on_click(
+                        move |_, window, cx| {
+                            app_others.update(cx, |this, cx| {
+                                this.close_other_tabs(target_ix, window, cx);
+                            });
+                        },
+                    ))
+                })
+                .separator()
+                .item(PopupMenuItem::new("Close All Tabs").on_click(
+                    move |_, window, cx| {
+                        app_all.update(cx, |this, cx| {
+                            this.close_all_tabs(window, cx);
+                        });
+                    },
+                ))
+            })
+            .child(
+                TabBar::new("workbench-tabs")
+                    .w_full()
+                    .folder()
+                    .small()
+                    .menu(true)
+                    .max_width(px(220.))
+                    .selected_index(selected_ix)
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        if *ix < this.tabs.len() {
+                            this.active_tab_ix = Some(*ix);
+                            let key = this.tabs[*ix].key(cx);
+                            this.explorer
+                                .update(cx, |panel, cx| panel.reveal_and_select(&key, cx));
+                            cx.notify();
+                        }
+                    }))
+                    .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                        let key = tab.key(cx);
+                        let title = tab.title(cx);
+                        let dirty = tab.is_dirty(cx);
+                        let label = if dirty { format!("{title} •") } else { title };
+
+                        let prefix = match tab {
+                            WorkbenchTab::Request(view) => {
+                                method_badge(view.read(cx).method(), true).into_any_element()
+                            }
+                            WorkbenchTab::Container(view) => {
+                                let icon = if view.read(cx).is_project() {
+                                    LucideIcon::Boxes
+                                } else {
+                                    LucideIcon::FolderKey
+                                };
+                                Icon::new(icon)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .into_any_element()
+                            }
                         };
-                        Icon::new(icon)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground)
-                            .into_any_element()
-                    }
-                };
 
-                Tab::new()
-                    .px_2()
-                    .prefix(prefix)
-                    .label(label)
+                        Tab::new()
+                            .px_2()
+                            .prefix(prefix)
+                            .label(label)
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _, _, _| {
+                                    this.context_tab_ix = Some(ix);
+                                }),
+                            )
+                            .suffix(
+                                Button::new(SharedString::from(format!("close-tab-{key}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Close)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_tab(ix, window, cx);
+                                    })),
+                            )
+                            .selected(self.active_tab_ix == Some(ix))
+                    }))
                     .suffix(
-                        Button::new(SharedString::from(format!("close-tab-{key}")))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(ix, cx);
-                            })),
-                    )
-                    .selected(self.active_tab_ix == Some(ix))
-            }))
-            .suffix(
                 Button::new("workbench-new-request-tab")
                     .ghost()
                     .xsmall()
@@ -1851,7 +2017,8 @@ impl TestrixApp {
                             this.open_new_project_dialog(window, cx);
                         }
                     })),
-            )
+            ),
+        )
     }
 
     fn render_workbench_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
