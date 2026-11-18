@@ -25,9 +25,10 @@ use gpui_kit::{
     px,
 };
 use testrix_core::{
-    AuthNodeRef, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc, HttpResponseSnapshot,
-    KeyValueRow, ProjectNode, RawBodyFormat, RequestBody, RequestExecutionState, RequestNode,
-    RequestSettings, detect_body_language, extract_url_query_params, materialize_request_doc,
+    AuthNodeRef, CodegenTarget, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc,
+    HttpResponseSnapshot, KeyValueRow, ProjectNode, RawBodyFormat, RequestBody,
+    RequestExecutionState, RequestNode, RequestSettings, detect_body_language,
+    extract_url_query_params, generate_request_code, materialize_request_doc,
     rename_template_variables, resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
@@ -76,6 +77,7 @@ enum RequestSection {
     PostScript,
     YamlSpec,
     Settings,
+    Code,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +231,8 @@ pub(crate) struct RequestTabView {
     post_script_editor: Entity<EditorState>,
     post_script_status: Option<Result<String, String>>,
     yaml_editor: Entity<EditorState>,
+    code_target: CodegenTarget,
+    code_editor: Entity<EditorState>,
     timeout_input: Entity<InputState>,
     follow_redirects: bool,
     verify_tls: bool,
@@ -406,6 +410,12 @@ impl RequestTabView {
                 .folding(true)
                 .default_value(yaml_text)
         });
+        let code_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("text")
+                .folding(true)
+                .default_value("")
+        });
 
         let timeout_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -452,6 +462,8 @@ impl RequestTabView {
             post_script_editor,
             post_script_status: None,
             yaml_editor,
+            code_target: CodegenTarget::Curl,
+            code_editor,
             timeout_input,
             follow_redirects: doc.request.settings.follow_redirects,
             verify_tls: doc.request.settings.verify_tls,
@@ -468,6 +480,7 @@ impl RequestTabView {
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
+        view.refresh_code_preview(window, cx);
         view
     }
 
@@ -664,6 +677,7 @@ impl RequestTabView {
             editor.set_context(Some(resolved_auth), active_env, cx);
         });
         self.refresh_yaml_preview(window, cx);
+        self.refresh_code_preview(window, cx);
         cx.notify();
     }
 
@@ -765,6 +779,7 @@ impl RequestTabView {
             self.saved_doc = self.build_doc(cx);
         }
         self.refresh_yaml_preview(window, cx);
+        self.refresh_code_preview(window, cx);
         cx.notify();
         true
     }
@@ -941,6 +956,7 @@ impl RequestTabView {
             editor.set_context(Some(resolved_auth), active_env, cx);
         });
         self.refresh_yaml_preview(window, cx);
+        self.refresh_code_preview(window, cx);
         cx.emit(RequestTabEvent::DirtyChanged);
         cx.notify();
     }
@@ -949,6 +965,23 @@ impl RequestTabView {
         let yaml = to_yaml_pretty(&self.build_doc(cx)).unwrap_or_default();
         self.yaml_editor.update(cx, |editor, cx| {
             editor.set_value(yaml, window, cx);
+        });
+    }
+
+    fn refresh_code_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.build_doc(cx);
+        let ancestors = self.resolve_ancestors();
+        let code = match materialize_request_doc(
+            &self.project_snapshot,
+            &ancestors,
+            &doc,
+            self.active_env.as_ref(),
+        ) {
+            Ok(prepared) => generate_request_code(&prepared, self.code_target),
+            Err(err) => format!("// Unable to generate code: {err}"),
+        };
+        self.code_editor.update(cx, |editor, cx| {
+            editor.set_value(code, window, cx);
         });
     }
 
@@ -1202,6 +1235,7 @@ impl RequestTabView {
             RequestSection::PostScript,
             RequestSection::YamlSpec,
             RequestSection::Settings,
+            RequestSection::Code,
         ];
         let has_post_script = !self.post_script_editor.read(cx).value().trim().is_empty();
         let selected_ix = sections
@@ -1243,7 +1277,8 @@ impl RequestTabView {
                         "Post-Script"
                     }))
                     .child(Tab::new().label("YAML Spec"))
-                    .child(Tab::new().label("Settings")),
+                    .child(Tab::new().label("Settings"))
+                    .child(Tab::new().label("Code")),
             )
             .child(
                 div()
@@ -1303,6 +1338,9 @@ impl RequestTabView {
                     })
                     .when(self.active_request_section == RequestSection::Settings, |this| {
                         this.child(self.render_settings_pane(cx))
+                    })
+                    .when(self.active_request_section == RequestSection::Code, |this| {
+                        this.child(self.render_code_pane(cx))
                     }),
             )
     }
@@ -1622,6 +1660,61 @@ impl RequestTabView {
                         .child(Textarea::new(&self.description_input)),
                 ),
         )
+    }
+
+    fn render_code_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        h_flex().gap_1().children(CodegenTarget::ALL.iter().map(|target| {
+                            let target = *target;
+                            Button::new(SharedString::from(format!(
+                                "code-target-{id_base}-{}",
+                                target.label()
+                            )))
+                            .xsmall()
+                            .label(target.label())
+                            .when(self.code_target == target, |b| b.primary())
+                            .when(self.code_target != target, |b| b.outline())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.code_target = target;
+                                this.refresh_code_preview(window, cx);
+                                cx.notify();
+                            }))
+                        })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("copy-code-{id_base}")))
+                            .outline()
+                            .xsmall()
+                            .icon(IconName::Copy)
+                            .label("Copy Code")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let code = this.code_editor.read(cx).value().to_string();
+                                cx.write_to_clipboard(ClipboardItem::new_string(code));
+                                window.push_notification("Code snippet copied to clipboard.", cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
+                    .overflow_hidden()
+                    .child(Editor::new(&self.code_editor).size_full().readonly(true)),
+            )
     }
 
     fn render_response_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {

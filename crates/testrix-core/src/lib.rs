@@ -2,6 +2,7 @@
 //! request materialization, and explorer filtering for Testrix.
 
 mod auth;
+mod codegen;
 mod error;
 mod materialize;
 mod model;
@@ -14,6 +15,7 @@ pub use auth::{
     AuthChainStep, AuthNodeRef, ResolvedAuth, resolve_folder_auth, resolve_folder_chain_auth,
     resolve_project_auth, resolve_request_auth, resolve_request_doc_auth,
 };
+pub use codegen::{CodegenTarget, generate_request_code};
 pub use error::CoreError;
 pub use materialize::{
     PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,
