@@ -40,20 +40,35 @@ impl HttpResponseSnapshot {
 
     /// Returns the preferred syntax highlighter language for the response editor.
     pub fn editor_language(&self) -> &'static str {
-        let ct = self
-            .content_type
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ct.contains("json") || looks_like_json(&self.pretty_body) {
-            "json"
-        } else if ct.contains("html") || ct.contains("xml") {
-            "html"
-        } else if ct.contains("yaml") {
-            "yaml"
-        } else {
-            "text"
-        }
+        detect_body_language(&self.pretty_body, self.content_type.as_deref())
+    }
+}
+
+/// Detects the syntax highlighter language (`"json"`, `"html"`, `"yaml"`, `"javascript"`, or `"text"`)
+/// from an optional `Content-Type` header and the body text itself.
+pub fn detect_body_language(text: &str, content_type: Option<&str>) -> &'static str {
+    let ct = content_type.unwrap_or("").to_ascii_lowercase();
+    if ct.contains("json") {
+        return "json";
+    }
+    if ct.contains("html") || ct.contains("xml") {
+        return "html";
+    }
+    if ct.contains("yaml") {
+        return "yaml";
+    }
+    if ct.contains("javascript") || ct.contains("ecmascript") {
+        return "javascript";
+    }
+
+    if looks_like_json(text) {
+        "json"
+    } else if looks_like_markup(text) {
+        "html"
+    } else if looks_like_yaml(text) {
+        "yaml"
+    } else {
+        "text"
     }
 }
 
@@ -86,6 +101,47 @@ pub fn format_pretty_body(raw: &str, content_type: Option<&str>) -> String {
 
 fn looks_like_json(text: &str) -> bool {
     let trimmed = text.trim();
-    (trimmed.starts_with('{') && trimmed.ends_with('}'))
-        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+}
+
+fn looks_like_markup(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.contains('>')
+}
+
+fn looks_like_yaml(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with('<') {
+        return false;
+    }
+    if trimmed.starts_with("---") {
+        return true;
+    }
+    let kv_lines = trimmed
+        .lines()
+        .take(6)
+        .filter(|line| {
+            let l = line.trim();
+            !l.is_empty()
+                && !l.starts_with('#')
+                && l.split_once(':')
+                    .is_some_and(|(k, _)| !k.trim().is_empty() && !k.contains(' '))
+        })
+        .count();
+    kv_lines >= 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_json_xml_and_yaml_without_content_type() {
+        assert_eq!(detect_body_language(r#"{"ok":true}"#, None), "json");
+        assert_eq!(detect_body_language("<root><id>1</id></root>", None), "html");
+        assert_eq!(detect_body_language("name: test\nversion: 1\n", None), "yaml");
+        assert_eq!(detect_body_language("hello world", None), "text");
+    }
 }

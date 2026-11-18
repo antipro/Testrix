@@ -27,8 +27,8 @@ use gpui_kit::{
 use testrix_core::{
     AuthNodeRef, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc, HttpResponseSnapshot,
     KeyValueRow, ProjectNode, RawBodyFormat, RequestBody, RequestExecutionState, RequestNode,
-    RequestSettings, extract_url_query_params, materialize_request_doc, rename_template_variables,
-    resolve_request_doc_auth,
+    RequestSettings, detect_body_language, extract_url_query_params, materialize_request_doc,
+    rename_template_variables, resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -83,6 +83,48 @@ enum ResponseSection {
     Body,
     Headers,
     SentRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseBodyFormat {
+    Auto,
+    Json,
+    Xml,
+    Html,
+    Yaml,
+    Text,
+}
+
+impl ResponseBodyFormat {
+    const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Json,
+        Self::Xml,
+        Self::Html,
+        Self::Yaml,
+        Self::Text,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Json => "JSON",
+            Self::Xml => "XML",
+            Self::Html => "HTML",
+            Self::Yaml => "YAML",
+            Self::Text => "Text",
+        }
+    }
+
+    fn language(self, snapshot: &HttpResponseSnapshot) -> &'static str {
+        match self {
+            Self::Auto => snapshot.editor_language(),
+            Self::Json => "json",
+            Self::Xml | Self::Html => "html",
+            Self::Yaml => "yaml",
+            Self::Text => "text",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +232,7 @@ pub(crate) struct RequestTabView {
     // Response state
     active_request_section: RequestSection,
     active_response_section: ResponseSection,
+    response_body_format: ResponseBodyFormat,
     execution: RequestExecutionState,
     response_body_editor: Entity<EditorState>,
     show_secret_headers: bool,
@@ -410,6 +453,7 @@ impl RequestTabView {
             verify_tls: doc.request.settings.verify_tls,
             active_request_section: RequestSection::Params,
             active_response_section: ResponseSection::Body,
+            response_body_format: ResponseBodyFormat::Auto,
             execution: RequestExecutionState::Idle,
             response_body_editor,
             show_secret_headers: false,
@@ -765,7 +809,7 @@ impl RequestTabView {
                 this.active_cancel = None;
                 match outcome {
                     Ok(Ok(snapshot)) => {
-                        let lang = snapshot.editor_language();
+                        let lang = this.response_body_format.language(&snapshot);
                         let pretty = snapshot.pretty_body.clone();
                         this.response_body_editor.update(cx, |editor, cx| {
                             editor.set_highlighter(lang, cx);
@@ -1282,24 +1326,66 @@ impl RequestTabView {
                     })
                     .when(self.body_mode == BodyMode::Raw, |row| {
                         row.child(
-                            h_flex().gap_1().children(RawBodyFormat::ALL.iter().map(|fmt| {
-                                let fmt = *fmt;
-                                Button::new(SharedString::from(format!(
-                                    "raw-fmt-{id_base}-{}",
-                                    fmt.label()
-                                )))
-                                .xsmall()
-                                .label(fmt.label())
-                                .when(self.raw_format == fmt, |b| b.primary())
-                                .when(self.raw_format != fmt, |b| b.outline())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.raw_format = fmt;
-                                    this.raw_editor.update(cx, |ed, cx| {
-                                        ed.set_highlighter(fmt.editor_language(), cx);
-                                    });
-                                    this.on_edited(window, cx);
+                            h_flex()
+                                .gap_1()
+                                .children(RawBodyFormat::ALL.iter().map(|fmt| {
+                                    let fmt = *fmt;
+                                    Button::new(SharedString::from(format!(
+                                        "raw-fmt-{id_base}-{}",
+                                        fmt.label()
+                                    )))
+                                    .xsmall()
+                                    .label(fmt.label())
+                                    .when(self.raw_format == fmt, |b| b.primary())
+                                    .when(self.raw_format != fmt, |b| b.outline())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.raw_format = fmt;
+                                        this.raw_editor.update(cx, |ed, cx| {
+                                            ed.set_highlighter(fmt.editor_language(), cx);
+                                        });
+                                        this.on_edited(window, cx);
+                                    }))
                                 }))
-                            })),
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "raw-fmt-detect-{id_base}"
+                                    )))
+                                    .outline()
+                                    .xsmall()
+                                    .icon(Icon::new(LucideIcon::Sparkles))
+                                    .label("Detect")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let text = this.raw_editor.read(cx).value().to_string();
+                                        let detected = detect_body_language(&text, None);
+                                        if detected == "json" {
+                                            this.body_mode = BodyMode::Json;
+                                            this.json_editor.update(cx, |ed, cx| {
+                                                ed.set_value(text, window, cx);
+                                            });
+                                        } else {
+                                            let next_fmt = match detected {
+                                                "html" => {
+                                                    let lower = text.trim().to_ascii_lowercase();
+                                                    if lower.contains("<html")
+                                                        || lower.starts_with("<!doctype html")
+                                                    {
+                                                        RawBodyFormat::Html
+                                                    } else {
+                                                        RawBodyFormat::Xml
+                                                    }
+                                                }
+                                                "yaml" => RawBodyFormat::Yaml,
+                                                "javascript" => RawBodyFormat::Javascript,
+                                                _ => RawBodyFormat::Text,
+                                            };
+                                            this.raw_format = next_fmt;
+                                            this.raw_editor.update(cx, |ed, cx| {
+                                                ed.set_highlighter(next_fmt.editor_language(), cx);
+                                            });
+                                        }
+                                        this.on_edited(window, cx);
+                                    })),
+                                ),
                         )
                     }),
             )
@@ -1688,10 +1774,74 @@ impl RequestTabView {
                     .when(
                         self.active_response_section == ResponseSection::Body,
                         |this| {
+                            let snap_for_fmt = snapshot.clone();
                             this.child(
-                                Editor::new(&self.response_body_editor)
+                                v_flex()
                                     .size_full()
-                                    .readonly(true),
+                                    .min_h_0()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!(
+                                                        "Syntax: {}",
+                                                        self.response_body_format
+                                                            .language(snapshot)
+                                                    )),
+                                            )
+                                            .child(
+                                                h_flex().gap_1().children(
+                                                    ResponseBodyFormat::ALL.iter().map(|fmt| {
+                                                        let fmt = *fmt;
+                                                        let snap_click = snap_for_fmt.clone();
+                                                        Button::new(SharedString::from(format!(
+                                                            "resp-fmt-{id_base}-{}",
+                                                            fmt.label()
+                                                        )))
+                                                        .xsmall()
+                                                        .label(fmt.label())
+                                                        .when(
+                                                            self.response_body_format == fmt,
+                                                            |b| b.primary(),
+                                                        )
+                                                        .when(
+                                                            self.response_body_format != fmt,
+                                                            |b| b.outline(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.response_body_format = fmt;
+                                                                let lang =
+                                                                    fmt.language(&snap_click);
+                                                                this.response_body_editor.update(
+                                                                    cx,
+                                                                    |ed, cx| {
+                                                                        ed.set_highlighter(
+                                                                            lang, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    }),
+                                                ),
+                                            ),
+                                    )
+                                    .child(
+                                        div().flex_1().min_h_0().child(
+                                            Editor::new(&self.response_body_editor)
+                                                .size_full()
+                                                .readonly(true),
+                                        ),
+                                    ),
                             )
                         },
                     )

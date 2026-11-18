@@ -31,7 +31,7 @@ pub use openapi::{
 };
 pub use response::{
     HttpResponseSnapshot, RequestExecutionState, ResponseHeader, SentRequestSnapshot,
-    format_pretty_body,
+    detect_body_language, format_pretty_body,
 };
 pub use search::{FilteredFolder, FilteredProject, filter_workspace};
 pub use template::{

@@ -22,7 +22,7 @@ testrix-storage = { path = "crates/testrix-storage" }
 testrix-http = { path = "crates/testrix-http" }
 
 # UI framework
-gpui-kit = { version = "0.10.0", features = ["tree-sitter-yaml", "tree-sitter-html"] }
+gpui-kit = { version = "0.10.0", features = ["tree-sitter-yaml", "tree-sitter-html", "tree-sitter-javascript"] }
 gpui-shell = { version = "0.10.0", default-features = false, features = ["quickjs"] }
 
 # Serialization & data formats
