@@ -260,7 +260,7 @@ impl Render for ExplorerPanel {
                         h_flex()
                             .gap_1p5()
                             .child(Icon::new(LucideIcon::FolderTree).small())
-                            .child(div().text_sm().font_semibold().child("Explorer"))
+                            .child(div().text_sm().font_semibold().child(crate::i18n::t("explorer")))
                             .child(
                                 div()
                                     .text_xs()
@@ -276,7 +276,7 @@ impl Render for ExplorerPanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(LucideIcon::FilePlus)
-                                    .tooltip("New HTTP Request")
+                                    .tooltip(crate::i18n::t("new_request"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some((project_id, folder_id)) =
                                             this.selected_creation_target(cx)
@@ -293,7 +293,7 @@ impl Render for ExplorerPanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(LucideIcon::FolderPlus)
-                                    .tooltip("New Folder")
+                                    .tooltip(crate::i18n::t("new_folder"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some((project_id, folder_id)) =
                                             this.selected_creation_target(cx)
@@ -310,7 +310,7 @@ impl Render for ExplorerPanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Plus)
-                                    .tooltip("New Project…")
+                                    .tooltip(crate::i18n::t("new_project"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::NewProject);
                                     })),
@@ -320,7 +320,7 @@ impl Render for ExplorerPanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(LucideIcon::FileUp)
-                                    .tooltip("Import OpenAPI 3.0 JSON…")
+                                    .tooltip(crate::i18n::t("import_openapi"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::ImportOpenApi);
                                     })),
@@ -330,7 +330,7 @@ impl Render for ExplorerPanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::RefreshCw)
-                                    .tooltip("Reload YAML files from disk")
+                                    .tooltip(crate::i18n::t("reload_disk"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(ExplorerEvent::ReloadWorkspace);
                                     })),
@@ -687,7 +687,7 @@ fn build_context_menu(
             let p3 = project_id.clone();
             let p4 = project_id;
             menu.item(
-                PopupMenuItem::new("New HTTP Request")
+                PopupMenuItem::new(crate::i18n::t("new_request"))
                     .icon(LucideIcon::FilePlus)
                     .on_click(move |_, _, cx| {
                         v1.update(cx, |_, cx| {
@@ -699,7 +699,7 @@ fn build_context_menu(
                     }),
             )
             .item(
-                PopupMenuItem::new("New Folder")
+                PopupMenuItem::new(crate::i18n::t("new_folder"))
                     .icon(LucideIcon::FolderPlus)
                     .on_click(move |_, _, cx| {
                         v2.update(cx, |_, cx| {
@@ -712,7 +712,7 @@ fn build_context_menu(
             )
             .separator()
             .item(
-                PopupMenuItem::new("Project Settings & Auth")
+                PopupMenuItem::new(crate::i18n::t("project_settings_menu"))
                     .icon(LucideIcon::ShieldCheck)
                     .on_click(move |_, _, cx| {
                         v3.update(cx, |_, cx| {
@@ -733,7 +733,7 @@ fn build_context_menu(
             )
             .separator()
             .item(
-                PopupMenuItem::new("Delete Project…")
+                PopupMenuItem::new(crate::i18n::t("delete_project_menu"))
                     .icon(IconName::Delete)
                     .on_click(move |_, _, cx| {
                         v5.update(cx, |_, cx| {
@@ -760,7 +760,7 @@ fn build_context_menu(
             let p3 = project_id.clone();
             let f3 = folder_id.clone();
             menu.item(
-                PopupMenuItem::new("New HTTP Request")
+                PopupMenuItem::new(crate::i18n::t("new_request"))
                     .icon(LucideIcon::FilePlus)
                     .on_click(move |_, _, cx| {
                         v1.update(cx, |_, cx| {
@@ -772,7 +772,7 @@ fn build_context_menu(
                     }),
             )
             .item(
-                PopupMenuItem::new("New Subfolder")
+                PopupMenuItem::new(crate::i18n::t("new_subfolder_menu"))
                     .icon(LucideIcon::FolderPlus)
                     .on_click(move |_, _, cx| {
                         v2.update(cx, |_, cx| {
@@ -785,7 +785,7 @@ fn build_context_menu(
             )
             .separator()
             .item(
-                PopupMenuItem::new("Folder Settings & Auth")
+                PopupMenuItem::new(crate::i18n::t("folder_settings_menu"))
                     .icon(LucideIcon::FolderKey)
                     .on_click(move |_, _, cx| {
                         v3.update(cx, |_, cx| {
@@ -798,7 +798,7 @@ fn build_context_menu(
             )
             .separator()
             .item(
-                PopupMenuItem::new("Delete Folder…")
+                PopupMenuItem::new(crate::i18n::t("delete_folder_menu"))
                     .icon(IconName::Delete)
                     .on_click(move |_, _, cx| {
                         v4.update(cx, |_, cx| {
