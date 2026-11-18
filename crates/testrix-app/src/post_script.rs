@@ -16,36 +16,28 @@ struct BridgeState {
 
 static RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BRIDGE_STATE: OnceLock<Mutex<BridgeState>> = OnceLock::new();
-static MODULE_REGISTERED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-fn ensure_post_script_module() -> Result<()> {
-    let res = MODULE_REGISTERED.get_or_init(|| {
-        gpui_shell::export_module(
-            HostModule::new("testrix-post-script")
-                .function("__get_context", |_| {
-                    let state = BRIDGE_STATE
-                        .get_or_init(|| Mutex::new(BridgeState::default()))
-                        .lock()
-                        .map_err(|_| gpui_shell::HostError::new("post-script state poisoned"))?;
-                    Ok(HostValue::from(state.context_json.clone()))
-                })
-                .function("__commit_env", |args| {
-                    let json = args.string(0)?.to_owned();
-                    let mut state = BRIDGE_STATE
-                        .get_or_init(|| Mutex::new(BridgeState::default()))
-                        .lock()
-                        .map_err(|_| gpui_shell::HostError::new("post-script state poisoned"))?;
-                    state.committed_vars_json = Some(json);
-                    Ok(HostValue::Null)
-                }),
-        )
-        .map_err(|err| err.to_string())
-    });
-
-    match res {
-        Ok(()) => Ok(()),
-        Err(msg) => anyhow::bail!("failed to register testrix-post-script module: {msg}"),
-    }
+fn register_post_script_module_on_current_thread() -> Result<()> {
+    gpui_shell::export_module(
+        HostModule::new("testrix-post-script")
+            .function("__get_context", |_| {
+                let state = BRIDGE_STATE
+                    .get_or_init(|| Mutex::new(BridgeState::default()))
+                    .lock()
+                    .map_err(|_| gpui_shell::HostError::new("post-script state poisoned"))?;
+                Ok(HostValue::from(state.context_json.clone()))
+            })
+            .function("__commit_env", |args| {
+                let json = args.string(0)?.to_owned();
+                let mut state = BRIDGE_STATE
+                    .get_or_init(|| Mutex::new(BridgeState::default()))
+                    .lock()
+                    .map_err(|_| gpui_shell::HostError::new("post-script state poisoned"))?;
+                state.committed_vars_json = Some(json);
+                Ok(HostValue::Null)
+            }),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to register testrix-post-script module: {err}"))
 }
 
 #[derive(Serialize)]
@@ -101,7 +93,6 @@ pub(crate) fn run_post_script(
         return Ok(PostScriptResult::default());
     }
 
-    ensure_post_script_module()?;
     let _run_guard = RUN_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -176,10 +167,23 @@ export default class PostScriptRunner extends View {{
     std::fs::write(temp_dir.path().join("main.js"), wrapped_js)
         .context("write main.js for post-script")?;
 
-    let runtime = ShellRuntime::new_isolated().context("create gpui-shell runtime")?;
-    runtime
-        .load_application(temp_dir.path(), "main.js")
-        .context("execute post-script")?;
+    let temp_dir_path = temp_dir.path().to_path_buf();
+    let handle = std::thread::Builder::new()
+        .name("testrix-post-script".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || -> Result<()> {
+            register_post_script_module_on_current_thread()?;
+            let runtime = ShellRuntime::new_isolated().context("create gpui-shell runtime")?;
+            runtime
+                .load_application(&temp_dir_path, "main.js")
+                .context("execute post-script")?;
+            Ok(())
+        })
+        .context("spawn post-script thread")?;
+
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("post-script thread panicked"))??;
 
     let committed_json = {
         let mut state = BRIDGE_STATE
@@ -305,5 +309,70 @@ mod tests {
         assert_eq!(env.variables[0].value, "secret-jwt-123");
         assert_eq!(env.variables[1].key, "user-id");
         assert_eq!(env.variables[1].value, "7");
+    }
+
+    #[test]
+    fn post_script_handles_large_nested_json_payload() {
+        let env = EnvironmentDoc::new("env-dev", "Development");
+        let roles: Vec<serde_json::Value> = (0..20)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("8351787738999029{i:02}"),
+                    "roleCode": format!("ROLE_{i}"),
+                    "roleName": "科主任",
+                    "isInit": true
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "code": "SUCCESS",
+            "data": {
+                "dataInfo": {
+                    "userInfo": {
+                        "deptName": "信息科",
+                        "roles": roles,
+                    },
+                    "tokenRes": {
+                        "access_token": "jwt-access-token-xyz",
+                        "refresh_token": "jwt-refresh-token-abc",
+                        "token_type": "bearer"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let snapshot = HttpResponseSnapshot {
+            status_code: 200,
+            reason: "OK".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            duration_ms: 20,
+            size_bytes: body.len(),
+            headers: Vec::new(),
+            body_bytes: body.as_bytes().to_vec(),
+            body_text: body.clone(),
+            pretty_body: body,
+            content_type: Some("application/json".to_string()),
+            sent_request: SentRequestSnapshot {
+                method: HttpMethod::Post,
+                url: "https://api.example.com/auth".to_string(),
+                headers: Vec::new(),
+                body_preview: String::new(),
+            },
+        };
+
+        let script = r#"
+            if (response.status >= 200 && response.status < 300) {
+              const respBody = JSON.parse(response.body);
+              environment.var["api_token"] = respBody.data.dataInfo.tokenRes.access_token;
+            }
+        "#;
+
+        let result = run_post_script(script, "req-auth", "Auth", Some(&env), &snapshot)
+            .expect("post-script should succeed on large nested JSON");
+        assert_eq!(
+            result.next_vars.get("api_token").map(String::as_str),
+            Some("jwt-access-token-xyz")
+        );
     }
 }
