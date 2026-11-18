@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Testrix Private API Docs</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="brand">
+        <span class="brand-dot"></span>
+        <span>Testrix Private Docs</span>
+      </a>
+      <select id="projectSelect" class="select" aria-label="Select Project"></select>
+      <select id="envSelect" class="select" aria-label="Select Environment" style="display:none;"></select>
+    </div>
+    <div class="topbar-center">
+      <input id="searchInput" class="search-input" type="search" placeholder="Filter endpoints..." />
+    </div>
+    <div class="topbar-right">
+      <span class="pill private">Private R2 Viewer</span>
+    </div>
+  </header>
+
+  <main id="appRoot" class="layout"></main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

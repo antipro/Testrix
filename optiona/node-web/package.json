@@ -1,0 +1,14 @@
+{
+  "name": "testrix-node",
+  "version": "0.1.0",
+  "description": "Simple Express-based Testrix YAML API documentation & sharing server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "dev": "node --no-warnings --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "js-yaml": "^4.1.0"
+  }
+}

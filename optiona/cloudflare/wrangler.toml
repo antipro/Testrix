@@ -1,0 +1,7 @@
+name = "testrix-cloudflare"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "public"
+
+[[r2_buckets]]
+binding = "TESTRIX_BUCKET"
+bucket_name = "testrix-share"

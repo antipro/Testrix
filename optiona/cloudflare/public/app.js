@@ -1,0 +1,504 @@
+const state = {
+  projects: [],
+  currentProject: null,
+  selectedNode: null,
+  selectedEnvIndex: 0,
+  collapsedFolders: new Set(),
+  searchQuery: '',
+};
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function methodBadge(method) {
+  const m = String(method || 'GET').toUpperCase();
+  const cls = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(m) ? `method-${m}` : 'method-OTHER';
+  return `<span class="method-badge ${cls}">${esc(m)}</span>`;
+}
+
+async function api(url, opts = {}) {
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || `Request failed (${res.status})`);
+    err.status = res.status;
+    err.authRequired = Boolean(data.authRequired);
+    err.accessTokenRequired = Boolean(data.accessTokenRequired);
+    throw err;
+  }
+  return data;
+}
+
+function getEnvVarsMap() {
+  const proj = state.currentProject;
+  const map = new Map();
+  if (!proj) return map;
+  for (const v of proj.doc?.variables || []) {
+    if (v.enabled !== false && v.key) map.set(v.key, v.value ?? '');
+  }
+  const envs = proj.environments || [];
+  const env = envs[state.selectedEnvIndex];
+  if (env) {
+    for (const v of env.variables || []) {
+      if (v.enabled !== false && v.key) map.set(v.key, v.secret ? '••••••••' : (v.value ?? ''));
+    }
+  }
+  return map;
+}
+
+function resolveVars(str) {
+  if (!str) return '';
+  const vars = getEnvVarsMap();
+  return String(str).replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+    const k = key.trim();
+    return vars.has(k) ? vars.get(k) : match;
+  });
+}
+
+function renderKvTable(rows, emptyText = 'None') {
+  if (!rows || rows.length === 0) {
+    return `<div style="color:var(--muted);font-size:13px;">${esc(emptyText)}</div>`;
+  }
+  return `
+    <table class="kv-table">
+      <thead><tr><th>Key</th><th>Value</th><th>Description</th></tr></thead>
+      <tbody>
+        ${rows
+          .map(
+            (r) => `
+          <tr class="${r.enabled === false ? 'kv-disabled' : ''}">
+            <td><code>${esc(r.key)}</code></td>
+            <td><code>${esc(resolveVars(r.value ?? ''))}</code></td>
+            <td style="color:var(--muted)">${esc(r.description || '')}</td>
+          </tr>`
+          )
+          .join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderAuthSummary(auth) {
+  if (!auth || auth.type === 'none') return '<span class="pill">None</span>';
+  if (auth.type === 'inherit') return '<span class="pill">Inherit from parent</span>';
+  return `<pre class="code-block">${esc(JSON.stringify(auth, null, 2))}</pre>`;
+}
+
+function renderBodySection(body) {
+  if (!body || body.type === 'none') return '';
+  if (body.type === 'raw') {
+    let text = body.content || '';
+    if (body.format === 'json') {
+      try {
+        text = JSON.stringify(JSON.parse(text), null, 2);
+      } catch {}
+    }
+    return `
+      <div class="section">
+        <div class="section-title">Body (${esc(body.format || 'raw')})</div>
+        <pre class="code-block">${esc(text)}</pre>
+      </div>
+    `;
+  }
+  if (body.type === 'urlencoded') {
+    return `
+      <div class="section">
+        <div class="section-title">Body (x-www-form-urlencoded)</div>
+        ${renderKvTable(body.fields)}
+      </div>
+    `;
+  }
+  if (body.type === 'multipart') {
+    return `
+      <div class="section">
+        <div class="section-title">Body (multipart/form-data)</div>
+        ${renderKvTable((body.fields || []).map((f) => ({ key: f.key, value: f.value || f.filePath || '', description: f.fieldType, enabled: f.enabled })))}
+      </div>
+    `;
+  }
+  return `<div class="section"><div class="section-title">Body</div><pre class="code-block">${esc(JSON.stringify(body, null, 2))}</pre></div>`;
+}
+
+function buildUrl(reqDoc) {
+  const base = state.currentProject?.doc?.baseUrl || '';
+  const rawUrl = reqDoc?.request?.url || '';
+  let combined = rawUrl;
+  if (rawUrl && !/^https?:\/\//i.test(rawUrl) && !rawUrl.startsWith('{{') && base) {
+    combined = `${base.replace(/\/+$/, '')}/${rawUrl.replace(/^\/+/, '')}`;
+  }
+  return resolveVars(combined);
+}
+
+function matchesSearch(req) {
+  const q = state.searchQuery.trim().toLowerCase();
+  if (!q) return true;
+  const name = (req.doc?.name || '').toLowerCase();
+  const url = (req.doc?.request?.url || '').toLowerCase();
+  const method = (req.doc?.request?.method || '').toLowerCase();
+  return name.includes(q) || url.includes(q) || method.includes(q);
+}
+
+function folderHasMatch(folder) {
+  if ((folder.requests || []).some(matchesSearch)) return true;
+  return (folder.folders || []).some(folderHasMatch);
+}
+
+function renderSidebarTree() {
+  const proj = state.currentProject;
+  if (!proj) return '';
+  const isProjActive = state.selectedNode?.type === 'project';
+  let html = `
+    <div class="tree-item ${isProjActive ? 'active' : ''}" data-select-project="1">
+      <span class="tree-caret">◆</span>
+      <span class="tree-label"><strong>${esc(proj.doc?.name || proj.slug)}</strong></span>
+    </div>
+  `;
+
+  function renderFolder(folder) {
+    if (state.searchQuery && !folderHasMatch(folder)) return '';
+    const key = folder.relPath;
+    const collapsed = state.collapsedFolders.has(key) && !state.searchQuery;
+    const isActive = state.selectedNode?.type === 'folder' && state.selectedNode.data.relPath === key;
+    let inner = '';
+    if (!collapsed) {
+      for (const sub of folder.folders || []) inner += renderFolder(sub);
+      for (const req of folder.requests || []) inner += renderRequest(req);
+    }
+    return `
+      <div>
+        <div class="tree-item ${isActive ? 'active' : ''}" data-select-folder="${esc(key)}">
+          <span class="tree-caret" data-toggle-folder="${esc(key)}">${collapsed ? '▸' : '▾'}</span>
+          <span class="tree-label">${esc(folder.doc?.name || key)}</span>
+        </div>
+        <div class="tree-folder-children">${inner}</div>
+      </div>
+    `;
+  }
+
+  function renderRequest(req) {
+    if (!matchesSearch(req)) return '';
+    const isActive = state.selectedNode?.type === 'request' && state.selectedNode.data.relPath === req.relPath;
+    const method = req.doc?.request?.method || 'GET';
+    return `
+      <div class="tree-item ${isActive ? 'active' : ''}" data-select-request="${esc(req.relPath)}">
+        ${methodBadge(method)}
+        <span class="tree-label">${esc(req.doc?.name || req.relPath)}</span>
+      </div>
+    `;
+  }
+
+  for (const f of proj.folders || []) html += renderFolder(f);
+  for (const r of proj.requests || []) html += renderRequest(r);
+  return html;
+}
+
+function renderRightContent() {
+  const proj = state.currentProject;
+  const sel = state.selectedNode;
+  if (!proj || !sel) {
+    return `<div class="empty-state">Select a project or API endpoint from the left tree.</div>`;
+  }
+
+  if (sel.type === 'project') {
+    const d = proj.doc || {};
+    return `
+      <div class="doc-header">
+        <div>
+          <h1 class="doc-title">${esc(d.name || proj.slug)}</h1>
+          <div style="margin-top:6px;"><span class="pill">${esc(d.apiVersion || 'testrix.io/v1')}</span></div>
+        </div>
+      </div>
+      ${d.description ? `<p class="doc-desc">${esc(d.description)}</p>` : ''}
+      ${d.baseUrl ? `<div class="section"><div class="section-title">Base URL</div><div class="url-bar"><span class="url-text">${esc(resolveVars(d.baseUrl))}</span></div></div>` : ''}
+      <div class="section"><div class="section-title">Authentication</div>${renderAuthSummary(d.auth)}</div>
+      <div class="section"><div class="section-title">Default Headers</div>${renderKvTable(d.defaultHeaders)}</div>
+      <div class="section"><div class="section-title">Project Variables</div>${renderKvTable(d.variables)}</div>
+    `;
+  }
+
+  if (sel.type === 'folder') {
+    const f = sel.data;
+    const d = f.doc || {};
+    return `
+      <div class="doc-header"><h1 class="doc-title">${esc(d.name || f.relPath)}</h1></div>
+      ${d.description ? `<p class="doc-desc">${esc(d.description)}</p>` : ''}
+      <div class="section"><div class="section-title">Authentication</div>${renderAuthSummary(d.auth)}</div>
+      <div class="section"><div class="section-title">Default Headers</div>${renderKvTable(d.defaultHeaders)}</div>
+      <div class="section">
+        <div class="section-title">Endpoints (${(f.requests || []).length})</div>
+        ${(f.requests || []).length === 0 ? '<div style="color:var(--muted)">No requests in this folder.</div>' : `
+          <table class="kv-table">
+            <thead><tr><th>Method</th><th>Name</th><th>URL</th></tr></thead>
+            <tbody>
+              ${(f.requests || []).map((r) => `
+                <tr style="cursor:pointer" data-select-request="${esc(r.relPath)}">
+                  <td>${methodBadge(r.doc?.request?.method)}</td>
+                  <td>${esc(r.doc?.name)}</td>
+                  <td><code>${esc(r.doc?.request?.url)}</code></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `}
+      </div>
+    `;
+  }
+
+  const req = sel.data;
+  const d = req.doc || {};
+  const r = d.request || {};
+  const resolvedUrl = buildUrl(d);
+
+  return `
+    <div class="doc-header">
+      <h1 class="doc-title">${esc(d.name || req.relPath)}</h1>
+      <button class="btn btn-sm" id="copyCurlBtn">Copy cURL</button>
+    </div>
+    ${d.description ? `<p class="doc-desc">${esc(d.description)}</p>` : ''}
+    <div class="url-bar">${methodBadge(r.method)}<span class="url-text">${esc(resolvedUrl)}</span></div>
+    <div class="section"><div class="section-title">Query Parameters</div>${renderKvTable(r.params)}</div>
+    <div class="section"><div class="section-title">Headers</div>${renderKvTable(r.headers)}</div>
+    <div class="section"><div class="section-title">Authentication</div>${renderAuthSummary(r.auth)}</div>
+    ${renderBodySection(r.body)}
+  `;
+}
+
+function findFolderByPath(folders, relPath) {
+  for (const f of folders || []) {
+    if (f.relPath === relPath) return f;
+    const sub = findFolderByPath(f.folders, relPath);
+    if (sub) return sub;
+  }
+  return null;
+}
+
+function findRequestByPath(proj, relPath) {
+  for (const r of proj.requests || []) {
+    if (r.relPath === relPath) return r;
+  }
+  function walk(folders) {
+    for (const f of folders || []) {
+      for (const r of f.requests || []) {
+        if (r.relPath === relPath) return r;
+      }
+      const sub = walk(f.folders);
+      if (sub) return sub;
+    }
+    return null;
+  }
+  return walk(proj.folders);
+}
+
+function renderViewerLayout() {
+  const root = document.getElementById('appRoot');
+  if (!state.currentProject) {
+    root.innerHTML = `<div class="empty-state" style="width:100%">No YAML projects found in the configured R2 bucket.</div>`;
+    return;
+  }
+  root.innerHTML = `
+    <aside class="sidebar">${renderSidebarTree()}</aside>
+    <section class="content">${renderRightContent()}</section>
+  `;
+
+  root.querySelectorAll('[data-toggle-folder]').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const key = el.getAttribute('data-toggle-folder');
+      if (state.collapsedFolders.has(key)) state.collapsedFolders.delete(key);
+      else state.collapsedFolders.add(key);
+      renderViewerLayout();
+    };
+  });
+
+  root.querySelectorAll('[data-select-project]').forEach((el) => {
+    el.onclick = () => {
+      state.selectedNode = { type: 'project', data: state.currentProject };
+      renderViewerLayout();
+    };
+  });
+
+  root.querySelectorAll('[data-select-folder]').forEach((el) => {
+    el.onclick = () => {
+      const f = findFolderByPath(state.currentProject.folders, el.getAttribute('data-select-folder'));
+      if (f) {
+        state.selectedNode = { type: 'folder', data: f };
+        renderViewerLayout();
+      }
+    };
+  });
+
+  root.querySelectorAll('[data-select-request]').forEach((el) => {
+    el.onclick = () => {
+      const r = findRequestByPath(state.currentProject, el.getAttribute('data-select-request'));
+      if (r) {
+        state.selectedNode = { type: 'request', data: r };
+        renderViewerLayout();
+      }
+    };
+  });
+
+  const copyCurlBtn = document.getElementById('copyCurlBtn');
+  if (copyCurlBtn && state.selectedNode?.type === 'request') {
+    copyCurlBtn.onclick = () => {
+      const d = state.selectedNode.data.doc;
+      const r = d.request || {};
+      const method = (r.method || 'GET').toUpperCase();
+      const url = buildUrl(d);
+      const headers = (r.headers || [])
+        .filter((h) => h.enabled !== false && h.key)
+        .map((h) => `-H "${h.key}: ${resolveVars(h.value || '')}"`)
+        .join(' ');
+      const curl = `curl -X ${method} "${url}" ${headers}`.trim();
+      navigator.clipboard?.writeText(curl);
+      copyCurlBtn.textContent = 'Copied!';
+      setTimeout(() => (copyCurlBtn.textContent = 'Copy cURL'), 1500);
+    };
+  }
+}
+
+function renderPasscodePrompt() {
+  const root = document.getElementById('appRoot');
+  root.innerHTML = `
+    <div class="card-container">
+      <div class="card auth-card">
+        <h2 style="margin-top:0">Private Access</h2>
+        <p style="color:var(--muted);font-size:13px;">Enter the access passcode to view API documentation.</p>
+        <div id="passError" class="error-banner" style="display:none"></div>
+        <form id="passForm">
+          <div class="form-group">
+            <label>Passcode</label>
+            <input class="input" type="password" name="passcode" required />
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Unlock</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('passForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('passError');
+    errEl.style.display = 'none';
+    const form = new FormData(e.target);
+    try {
+      await api('/api/auth', {
+        method: 'POST',
+        body: JSON.stringify({ passcode: form.get('passcode') }),
+      });
+      await init();
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.style.display = 'block';
+    }
+  };
+}
+
+function renderAccessTokenPrompt(slug) {
+  const root = document.getElementById('appRoot');
+  root.innerHTML = `
+    <div class="card-container">
+      <div class="card auth-card">
+        <h2 style="margin-top:0">Access Token Required</h2>
+        <p style="color:var(--muted);font-size:13px;">Enter the access token for this project to view its API documentation.</p>
+        <div id="tokenError" class="error-banner" style="display:none"></div>
+        <form id="tokenForm">
+          <div class="form-group">
+            <label>Access Token</label>
+            <input class="input" type="password" name="accessToken" required placeholder="Enter access token" />
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">Unlock</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('tokenForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById('tokenError');
+    errEl.style.display = 'none';
+    const form = new FormData(e.target);
+    try {
+      await api(`/api/projects/${encodeURIComponent(slug)}/unlock`, {
+        method: 'POST',
+        body: JSON.stringify({ accessToken: form.get('accessToken') }),
+      });
+      await loadProject(slug);
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.style.display = 'block';
+    }
+  };
+}
+
+async function loadProject(slug) {
+  let data;
+  try {
+    data = await api(`/api/projects/${encodeURIComponent(slug)}`);
+  } catch (err) {
+    if (err.accessTokenRequired) {
+      renderAccessTokenPrompt(slug);
+      return;
+    }
+    throw err;
+  }
+  state.currentProject = data.project;
+  state.selectedNode = { type: 'project', data: data.project };
+  state.selectedEnvIndex = 0;
+
+  const envSel = document.getElementById('envSelect');
+  const envs = data.project.environments || [];
+  if (envs.length > 0) {
+    envSel.style.display = 'inline-block';
+    envSel.innerHTML = envs.map((e, idx) => `<option value="${idx}">${esc(e.name || e.fileName)}</option>`).join('');
+    envSel.onchange = () => {
+      state.selectedEnvIndex = Number(envSel.value);
+      renderViewerLayout();
+    };
+  } else {
+    envSel.style.display = 'none';
+  }
+  renderViewerLayout();
+}
+
+async function init() {
+  try {
+    const data = await api('/api/projects');
+    state.projects = data.projects || [];
+    const projSel = document.getElementById('projectSelect');
+    projSel.innerHTML = state.projects.length
+      ? state.projects.map((p) => `<option value="${esc(p.slug)}">${esc(p.name)}</option>`).join('')
+      : '<option value="">No projects</option>';
+
+    const urlSlug = new URLSearchParams(location.search).get('project');
+    const targetSlug = urlSlug || state.projects[0]?.slug;
+    if (targetSlug) {
+      projSel.value = targetSlug;
+      await loadProject(targetSlug);
+    } else {
+      state.currentProject = null;
+      renderViewerLayout();
+    }
+    projSel.onchange = () => {
+      if (projSel.value) loadProject(projSel.value);
+    };
+  } catch (err) {
+    if (err.authRequired) {
+      renderPasscodePrompt();
+    } else {
+      document.getElementById('appRoot').innerHTML = `<div class="empty-state" style="width:100%">${esc(err.message)}</div>`;
+    }
+  }
+}
+
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  state.searchQuery = e.target.value;
+  renderViewerLayout();
+});
+
+init();

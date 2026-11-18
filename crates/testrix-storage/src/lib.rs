@@ -9,15 +9,16 @@ pub use error::StorageError;
 pub use seed::seed_starter_workspace;
 pub use slug::slugify;
 pub use workspace::{
-    TestrixConfig, WorkspaceTabState, clear_saved_responses, config_file_path, create_environment,
-    create_folder, create_project, create_request, default_workspace_dir, delete_environment,
-    delete_folder, delete_project, delete_request, duplicate_request, ensure_seeded_workspace,
-    import_bundle_into_project, import_project_bundle, init_or_load_config,
-    init_or_load_config_at, load_project, load_request_response, load_workspace,
-    load_workspace_tabs, save_config_preferences, save_config_preferences_at,
-    save_config_workspace_dir, save_config_workspace_dir_at, save_environment, save_folder,
-    save_project, save_request, save_request_response, save_workspace_state, save_workspace_tabs,
-    to_yaml_pretty, write_yaml_atomic,
+    ShareSettings, TestrixConfig, WorkspaceTabState, clear_saved_responses, config_file_path,
+    create_environment, create_folder, create_project, create_request, default_workspace_dir,
+    delete_environment, delete_folder, delete_project, delete_request, duplicate_request,
+    ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
+    init_or_load_config, init_or_load_config_at, load_project, load_request_response,
+    load_workspace, load_workspace_tabs, save_config_preferences, save_config_preferences_at,
+    save_config_share_settings, save_config_share_settings_at, save_config_workspace_dir,
+    save_config_workspace_dir_at, save_environment, save_folder, save_project, save_request,
+    save_request_response, save_workspace_state, save_workspace_tabs, to_yaml_pretty,
+    validate_yaml_file, write_yaml_atomic,
 };
 
 #[cfg(test)]
@@ -201,5 +202,27 @@ mod tests {
         // Merging the same folder name reuses the existing folder instead of duplicating it.
         assert_eq!(target_proj.folders.len(), 1);
         assert_eq!(target_proj.folders[0].requests.len(), 1);
+    }
+
+    #[test]
+    fn persists_share_and_cloudflare_settings_in_config_yaml() {
+        let dir = TempDir::new().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        let _ = init_or_load_config_at(&cfg_path).unwrap();
+
+        let settings = ShareSettings {
+            share_server_url: "https://share.example.com".to_string(),
+            share_email: "dev@example.com".to_string(),
+            share_token: "tok-abc".to_string(),
+            cloudflare_account_id: "cf-acc-1".to_string(),
+            cloudflare_r2_bucket: "my-bucket".to_string(),
+            cloudflare_api_token: "cf-tok-xyz".to_string(),
+            cloudflare_pages_url: "https://docs.pages.dev".to_string(),
+            share_access_token: "viewer-secret-123".to_string(),
+        };
+        save_config_share_settings_at(&cfg_path, &settings).unwrap();
+
+        let reloaded = init_or_load_config_at(&cfg_path).unwrap();
+        assert_eq!(ShareSettings::from(&reloaded), settings);
     }
 }

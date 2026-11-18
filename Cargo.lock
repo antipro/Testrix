@@ -8592,6 +8592,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "reqwest",
+ "serde",
+ "serde_json",
  "testrix-core",
  "thiserror 2.0.21",
  "tokio",

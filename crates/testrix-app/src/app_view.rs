@@ -6,6 +6,7 @@ use std::{
 };
 
 use gpui_kit::{
+    component::scroll::ScrollableElement as _,
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
     ImageSource, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -42,14 +43,14 @@ use testrix_core::{
     merge_environments_into_bundle, parse_apifox, parse_openapi_3_0, parse_postman_collection,
     parse_postman_zip, rename_template_variables, resolve_request_auth,
 };
-use testrix_http::HttpRunner;
+use testrix_http::{HttpRunner, dispatch_share_future, login_testrix_server};
 use testrix_storage::{
-    clear_saved_responses, create_environment, create_folder, create_project, create_request,
-    delete_environment, delete_folder, delete_project, delete_request, duplicate_request,
-    ensure_seeded_workspace, import_project_bundle, init_or_load_config, load_request_response,
-    load_workspace, load_workspace_tabs, save_config_preferences, save_config_workspace_dir,
-    save_environment, save_folder, save_project, save_request, save_request_response,
-    save_workspace_state, save_workspace_tabs,
+    ShareSettings, clear_saved_responses, create_environment, create_folder, create_project,
+    create_request, delete_environment, delete_folder, delete_project, delete_request,
+    duplicate_request, ensure_seeded_workspace, import_project_bundle, init_or_load_config,
+    load_request_response, load_workspace, load_workspace_tabs, save_config_preferences,
+    save_config_share_settings, save_config_workspace_dir, save_environment, save_folder,
+    save_project, save_request, save_request_response, save_workspace_state, save_workspace_tabs,
 };
 use tracing::{error, info};
 
@@ -154,6 +155,7 @@ pub struct TestrixApp {
     context_tab_ix: Option<usize>,
     remember_open_tabs: bool,
     remember_responses: bool,
+    share_settings: ShareSettings,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -218,6 +220,7 @@ impl TestrixApp {
             context_tab_ix: None,
             remember_open_tabs: cfg.remember_open_tabs,
             remember_responses: cfg.remember_responses,
+            share_settings: ShareSettings::from(&cfg),
             _subscriptions: Vec::new(),
         };
 
@@ -655,8 +658,10 @@ impl TestrixApp {
                 let Some(project) = self.workspace.find_project(&project_id) else {
                     return;
                 };
-                let view =
-                    cx.new(|cx| ContainerTabView::new_project(project, active_env, window, cx));
+                let share_settings = self.share_settings.clone();
+                let view = cx.new(|cx| {
+                    ContainerTabView::new_project(project, active_env, share_settings, window, cx)
+                });
                 let sub = cx.subscribe_in(
                     &view,
                     window,
@@ -1480,22 +1485,96 @@ impl TestrixApp {
         });
     }
 
+    fn sync_share_settings_to_tabs(&self, cx: &mut Context<Self>) {
+        let settings = self.share_settings.clone();
+        for tab in &self.tabs {
+            if let WorkbenchTab::Container(view) = tab {
+                view.update(cx, |v, cx| v.set_share_settings(settings.clone(), cx));
+            }
+        }
+    }
+
     fn open_preferences_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app_entity = cx.entity();
+        let current_share = self.share_settings.clone();
+
+        let server_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("http://localhost:3456")
+                .default_value(current_share.share_server_url.clone())
+        });
+        let email_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("you@example.com")
+                .default_value(current_share.share_email.clone())
+        });
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+
+        let cf_account_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Cloudflare Account ID")
+                .default_value(current_share.cloudflare_account_id.clone())
+        });
+        let cf_bucket_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("testrix-share")
+                .default_value(current_share.cloudflare_r2_bucket.clone())
+        });
+        let cf_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Cloudflare API Token (R2 Write)")
+                .masked(true)
+                .default_value(current_share.cloudflare_api_token.clone())
+        });
+        let cf_pages_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://your-site.pages.dev (optional)")
+                .default_value(current_share.cloudflare_pages_url.clone())
+        });
+        let access_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Access Token (optional, limits access to shared site / Cloudflare page)")
+                .masked(true)
+                .default_value(current_share.share_access_token.clone())
+        });
 
         window.open_dialog(cx, move |dialog, _, cx| {
             let remember_tabs = app_entity.read(cx).remember_open_tabs;
             let remember_responses = app_entity.read(cx).remember_responses;
             let language_select = app_entity.read(cx).language_select.clone();
+            let share_state = app_entity.read(cx).share_settings.clone();
+            let is_logged_in = !share_state.share_token.trim().is_empty();
+
             let app_tabs = app_entity.clone();
             let app_resps = app_entity.clone();
+            let app_login = app_entity.clone();
+            let app_logout = app_entity.clone();
+            let app_cf = app_entity.clone();
+            let app_access = app_entity.clone();
+
+            let srv_for_login = server_url_input.clone();
+            let email_for_login = email_input.clone();
+            let pwd_for_login = password_input.clone();
+
+            let cf_acc_save = cf_account_input.clone();
+            let cf_bkt_save = cf_bucket_input.clone();
+            let cf_tok_save = cf_token_input.clone();
+            let cf_url_save = cf_pages_input.clone();
+            let access_tok_for_cf = access_token_input.clone();
+            let access_tok_for_save = access_token_input.clone();
 
             dialog
                 .title(crate::i18n::t("preferences"))
-                .width(px(480.))
+                .width(px(540.))
                 .child(
                     v_flex()
                         .gap_3()
+                        .max_h(px(540.))
+                        .overflow_y_scrollbar()
                         .child(
                             h_flex()
                                 .w_full()
@@ -1616,6 +1695,204 @@ impl TestrixApp {
                                             });
                                             window.refresh();
                                         }),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .child("Testrix Share Server Account"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(if is_logged_in {
+                                                    format!("Signed in as {}", share_state.share_email)
+                                                } else {
+                                                    "Not signed in".to_string()
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1p5()
+                                        .child(Input::new(&server_url_input).small())
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(div().flex_1().child(Input::new(&email_input).small()))
+                                                .child(div().flex_1().child(Input::new(&password_input).small())),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("pref-share-login-btn")
+                                                .small()
+                                                .primary()
+                                                .label(if is_logged_in { "Re-login" } else { "Login" })
+                                                .on_click(move |_, window, cx| {
+                                                    let server_url = srv_for_login.read(cx).value().trim().to_string();
+                                                    let email = email_for_login.read(cx).value().trim().to_string();
+                                                    let password = pwd_for_login.read(cx).value().to_string();
+                                                    let app_handle = app_login.clone();
+                                                    let rx = dispatch_share_future(login_testrix_server(
+                                                        server_url.clone(),
+                                                        email,
+                                                        password,
+                                                    ));
+                                                    window.spawn(cx, async move |window| {
+                                                        let outcome = rx.await;
+                                                        _ = window.update(|window, cx| {
+                                                            match outcome {
+                                                                Ok(Ok(login)) => {
+                                                                    app_handle.update(cx, |this, cx| {
+                                                                        this.share_settings.share_server_url = server_url;
+                                                                        this.share_settings.share_email = login.email.clone();
+                                                                        this.share_settings.share_token = login.token;
+                                                                        let _ = save_config_share_settings(&this.share_settings);
+                                                                        this.sync_share_settings_to_tabs(cx);
+                                                                        cx.notify();
+                                                                    });
+                                                                    window.push_notification(
+                                                                        format!("Signed in to Share Server as {}", login.email),
+                                                                        cx,
+                                                                    );
+                                                                    window.refresh();
+                                                                }
+                                                                Ok(Err(err)) => {
+                                                                    window.push_notification(format!("Login failed: {err}"), cx);
+                                                                }
+                                                                Err(_) => {
+                                                                    window.push_notification("Login task cancelled", cx);
+                                                                }
+                                                            }
+                                                        });
+                                                    })
+                                                    .detach();
+                                                }),
+                                        )
+                                        .when(is_logged_in, |row| {
+                                            row.child(
+                                                Button::new("pref-share-logout-btn")
+                                                    .small()
+                                                    .outline()
+                                                    .label("Logout")
+                                                    .on_click(move |_, window, cx| {
+                                                        app_logout.update(cx, |this, cx| {
+                                                            this.share_settings.share_token.clear();
+                                                            let _ = save_config_share_settings(&this.share_settings);
+                                                            this.sync_share_settings_to_tabs(cx);
+                                                            cx.notify();
+                                                        });
+                                                        window.push_notification("Signed out of Share Server", cx);
+                                                        window.refresh();
+                                                    }),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child("Cloudflare R2 Storage"),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1p5()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .child(div().flex_1().child(Input::new(&cf_account_input).small()))
+                                                .child(div().flex_1().child(Input::new(&cf_bucket_input).small())),
+                                        )
+                                        .child(Input::new(&cf_token_input).small())
+                                        .child(Input::new(&cf_pages_input).small()),
+                                )
+                                .child(
+                                    h_flex().child(
+                                        Button::new("pref-cf-save-btn")
+                                            .small()
+                                            .outline()
+                                            .label("Save Cloudflare Settings")
+                                            .on_click(move |_, window, cx| {
+                                                let acc = cf_acc_save.read(cx).value().trim().to_string();
+                                                let bkt = cf_bkt_save.read(cx).value().trim().to_string();
+                                                let tok = cf_tok_save.read(cx).value().trim().to_string();
+                                                let url = cf_url_save.read(cx).value().trim().to_string();
+                                                let access_tok = access_tok_for_cf.read(cx).value().trim().to_string();
+                                                app_cf.update(cx, |this, cx| {
+                                                    this.share_settings.cloudflare_account_id = acc;
+                                                    this.share_settings.cloudflare_r2_bucket = bkt;
+                                                    this.share_settings.cloudflare_api_token = tok;
+                                                    this.share_settings.cloudflare_pages_url = url;
+                                                    this.share_settings.share_access_token = access_tok;
+                                                    let _ = save_config_share_settings(&this.share_settings);
+                                                    this.sync_share_settings_to_tabs(cx);
+                                                    cx.notify();
+                                                });
+                                                window.push_notification("Saved Cloudflare R2 settings", cx);
+                                                window.refresh();
+                                            }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .child("Share Access Control"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Optional access token required to view your shared project on Testrix Server or Cloudflare Pages."),
+                                )
+                                .child(Input::new(&access_token_input).small())
+                                .child(
+                                    h_flex().child(
+                                        Button::new("pref-access-save-btn")
+                                            .small()
+                                            .outline()
+                                            .label("Save Access Token")
+                                            .on_click(move |_, window, cx| {
+                                                let access_tok = access_tok_for_save.read(cx).value().trim().to_string();
+                                                app_access.update(cx, |this, cx| {
+                                                    this.share_settings.share_access_token = access_tok;
+                                                    let _ = save_config_share_settings(&this.share_settings);
+                                                    this.sync_share_settings_to_tabs(cx);
+                                                    cx.notify();
+                                                });
+                                                window.push_notification("Saved Share Access Token", cx);
+                                                window.refresh();
+                                            }),
+                                    ),
                                 ),
                         ),
                 )

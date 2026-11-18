@@ -5,9 +5,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use testrix_core::{
-    EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod, HttpRequestDoc,
-    HttpResponseSnapshot, ImportedProjectBundle, ProjectDoc, ProjectNode, RequestNode,
-    WorkspaceTree, generate_id,
+    DocumentKind, EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod,
+    HttpRequestDoc, HttpResponseSnapshot, ImportedProjectBundle, ProjectDoc, ProjectNode,
+    RequestNode, WorkspaceTree, generate_id,
 };
 use tracing::{debug, warn};
 
@@ -420,6 +420,47 @@ fn load_request(path: &Path) -> Result<RequestNode, StorageError> {
         doc,
         file_path: path.to_path_buf(),
     })
+}
+
+/// Validates a single Testrix YAML document on disk according to its filename role.
+pub fn validate_yaml_file(path: &Path) -> Result<DocumentKind, StorageError> {
+    if !path.is_file() {
+        return Err(StorageError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path does not exist or is not a file".to_string(),
+        });
+    }
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(StorageError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "invalid UTF-8 filename".to_string(),
+        });
+    };
+
+    if file_name == PROJECT_MANIFEST_FILE {
+        let doc: ProjectDoc = read_yaml_file(path)?;
+        doc.validate()?;
+        Ok(DocumentKind::Project)
+    } else if file_name == FOLDER_MANIFEST_FILE {
+        let doc: FolderDoc = read_yaml_file(path)?;
+        doc.validate()?;
+        Ok(DocumentKind::Folder)
+    } else if file_name.ends_with(REQUEST_EXTENSION) {
+        let doc: HttpRequestDoc = read_yaml_file(path)?;
+        doc.validate()?;
+        Ok(DocumentKind::HttpRequest)
+    } else if file_name.ends_with(ENV_EXTENSION) {
+        let doc: EnvironmentDoc = read_yaml_file(path)?;
+        doc.validate()?;
+        Ok(DocumentKind::Environment)
+    } else {
+        Err(StorageError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: format!(
+                "unsupported filename `{file_name}`; expected `{PROJECT_MANIFEST_FILE}`, `{FOLDER_MANIFEST_FILE}`, `*{REQUEST_EXTENSION}`, or `*{ENV_EXTENSION}`"
+            ),
+        })
+    }
 }
 
 /// Saves a project manifest (`testrix.project.yaml`).
@@ -848,6 +889,22 @@ pub struct TestrixConfig {
     pub remember_responses: bool,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_share_server_url")]
+    pub share_server_url: String,
+    #[serde(default)]
+    pub share_email: String,
+    #[serde(default)]
+    pub share_token: String,
+    #[serde(default)]
+    pub cloudflare_account_id: String,
+    #[serde(default)]
+    pub cloudflare_r2_bucket: String,
+    #[serde(default)]
+    pub cloudflare_api_token: String,
+    #[serde(default)]
+    pub cloudflare_pages_url: String,
+    #[serde(default)]
+    pub share_access_token: String,
 }
 
 fn default_config_api_version() -> String {
@@ -856,6 +913,10 @@ fn default_config_api_version() -> String {
 
 fn default_language() -> String {
     "en".to_string()
+}
+
+fn default_share_server_url() -> String {
+    "http://localhost:3456".to_string()
 }
 
 const fn default_true() -> bool {
@@ -870,6 +931,14 @@ impl Default for TestrixConfig {
             remember_open_tabs: true,
             remember_responses: true,
             language: default_language(),
+            share_server_url: default_share_server_url(),
+            share_email: String::new(),
+            share_token: String::new(),
+            cloudflare_account_id: String::new(),
+            cloudflare_r2_bucket: String::new(),
+            cloudflare_api_token: String::new(),
+            cloudflare_pages_url: String::new(),
+            share_access_token: String::new(),
         }
     }
 }
@@ -944,5 +1013,61 @@ pub fn save_config_preferences_at(
     if !language.trim().is_empty() {
         cfg.language = language.trim().to_string();
     }
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Share server login & Cloudflare R2 credentials persisted in `~/.testrix/config.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShareSettings {
+    pub share_server_url: String,
+    pub share_email: String,
+    pub share_token: String,
+    pub cloudflare_account_id: String,
+    pub cloudflare_r2_bucket: String,
+    pub cloudflare_api_token: String,
+    pub cloudflare_pages_url: String,
+    pub share_access_token: String,
+}
+
+impl From<&TestrixConfig> for ShareSettings {
+    fn from(cfg: &TestrixConfig) -> Self {
+        Self {
+            share_server_url: cfg.share_server_url.clone(),
+            share_email: cfg.share_email.clone(),
+            share_token: cfg.share_token.clone(),
+            cloudflare_account_id: cfg.cloudflare_account_id.clone(),
+            cloudflare_r2_bucket: cfg.cloudflare_r2_bucket.clone(),
+            cloudflare_api_token: cfg.cloudflare_api_token.clone(),
+            cloudflare_pages_url: cfg.cloudflare_pages_url.clone(),
+            share_access_token: cfg.share_access_token.clone(),
+        }
+    }
+}
+
+/// Persists share server & Cloudflare R2 settings into `~/.testrix/config.yaml`.
+pub fn save_config_share_settings(settings: &ShareSettings) -> Result<(), StorageError> {
+    save_config_share_settings_at(&config_file_path(), settings)
+}
+
+/// Persists share server & Cloudflare R2 settings into `config_path`.
+pub fn save_config_share_settings_at(
+    config_path: &Path,
+    settings: &ShareSettings,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    if !settings.share_server_url.trim().is_empty() {
+        cfg.share_server_url = settings.share_server_url.trim().to_string();
+    }
+    cfg.share_email = settings.share_email.trim().to_string();
+    cfg.share_token = settings.share_token.trim().to_string();
+    cfg.cloudflare_account_id = settings.cloudflare_account_id.trim().to_string();
+    cfg.cloudflare_r2_bucket = settings.cloudflare_r2_bucket.trim().to_string();
+    cfg.cloudflare_api_token = settings.cloudflare_api_token.trim().to_string();
+    cfg.cloudflare_pages_url = settings.cloudflare_pages_url.trim().to_string();
+    cfg.share_access_token = settings.share_access_token.trim().to_string();
     write_yaml_atomic(config_path, &cfg)
 }

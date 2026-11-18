@@ -2,9 +2,15 @@
 
 mod error;
 mod runner;
+mod share;
 
 pub use error::HttpError;
 pub use runner::HttpRunner;
+pub use share::{
+    ShareChannel, ShareFile, ShareLoginResult, ShareUploadResult, collect_project_yaml_files,
+    dispatch_share_future, login_testrix_server, upload_to_cloudflare_r2,
+    upload_to_testrix_server,
+};
 pub use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]

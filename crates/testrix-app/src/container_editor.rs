@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Window,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
     assets::IconName as LucideIcon,
     component::{
-        ActiveTheme as _, Icon, Sizable as _, StyledExt as _,
+        ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, WindowExt as _,
         button::{Button, ButtonVariants as _},
         form::{Field, Form},
         h_flex,
@@ -23,7 +23,11 @@ use testrix_core::{
     AuthNodeRef, EnvironmentDoc, FolderDoc, FolderNode, ProjectDoc, ProjectNode,
     rename_template_variables, resolve_folder_chain_auth, resolve_project_auth,
 };
-use testrix_storage::to_yaml_pretty;
+use testrix_http::{
+    ShareChannel, ShareUploadResult, collect_project_yaml_files, dispatch_share_future,
+    upload_to_cloudflare_r2, upload_to_testrix_server,
+};
+use testrix_storage::{ShareSettings, slugify, to_yaml_pretty};
 
 use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
@@ -37,6 +41,7 @@ enum ContainerSection {
     General,
     DefaultHeaders,
     YamlSpec,
+    Share,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +64,7 @@ enum ContainerKind {
     Project {
         saved: ProjectDoc,
         manifest_path: PathBuf,
+        project_root: PathBuf,
     },
     Folder {
         folder_id: String,
@@ -83,6 +89,10 @@ pub(crate) struct ContainerTabView {
     active_env: Option<EnvironmentDoc>,
     breadcrumb: SharedString,
     dirty: bool,
+    share_settings: ShareSettings,
+    share_channel: ShareChannel,
+    share_in_flight: bool,
+    share_status: Option<Result<ShareUploadResult, String>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -92,6 +102,7 @@ impl ContainerTabView {
     pub(crate) fn new_project(
         project: &ProjectNode,
         active_env: Option<EnvironmentDoc>,
+        share_settings: ShareSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -149,6 +160,7 @@ impl ContainerTabView {
             kind: ContainerKind::Project {
                 saved: project.doc.clone(),
                 manifest_path: project.manifest_path.clone(),
+                project_root: project.root_dir.clone(),
             },
             active_section: ContainerSection::Auth,
             name_input,
@@ -161,6 +173,10 @@ impl ContainerTabView {
             active_env,
             breadcrumb: project.doc.name.clone().into(),
             dirty: false,
+            share_settings,
+            share_channel: ShareChannel::TestrixServer,
+            share_in_flight: false,
+            share_status: None,
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
@@ -236,10 +252,91 @@ impl ContainerTabView {
             active_env,
             breadcrumb,
             dirty: false,
+            share_settings: ShareSettings::default(),
+            share_channel: ShareChannel::TestrixServer,
+            share_in_flight: false,
+            share_status: None,
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
         view
+    }
+
+    pub(crate) fn set_share_settings(
+        &mut self,
+        settings: ShareSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.share_settings = settings;
+        cx.notify();
+    }
+
+    fn trigger_share_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ContainerKind::Project { project_root, .. } = &self.kind else {
+            return;
+        };
+        if self.share_in_flight {
+            return;
+        }
+        let files = match collect_project_yaml_files(project_root) {
+            Ok(f) => f,
+            Err(err) => {
+                self.share_status = Some(Err(err));
+                cx.notify();
+                return;
+            }
+        };
+
+        self.share_in_flight = true;
+        self.share_status = None;
+        cx.notify();
+
+        let channel = self.share_channel;
+        let project_name = self.name_input.read(cx).value().trim().to_string();
+        let project_name = if project_name.is_empty() {
+            self.project_name.clone()
+        } else {
+            project_name
+        };
+        let project_slug = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(slugify)
+            .unwrap_or_else(|| slugify(&project_name));
+        let settings = self.share_settings.clone();
+
+        let rx = match channel {
+            ShareChannel::TestrixServer => dispatch_share_future(upload_to_testrix_server(
+                settings.share_server_url,
+                settings.share_token,
+                project_slug,
+                project_name,
+                settings.share_access_token,
+                files,
+            )),
+            ShareChannel::CloudflareR2 => dispatch_share_future(upload_to_cloudflare_r2(
+                settings.cloudflare_account_id,
+                settings.cloudflare_r2_bucket,
+                settings.cloudflare_api_token,
+                settings.cloudflare_pages_url,
+                project_slug,
+                settings.share_access_token,
+                files,
+            )),
+        };
+
+        cx.spawn_in(window, async move |weak_self, cx| {
+            let outcome = rx.await;
+            _ = weak_self.update_in(cx, |this, _, cx| {
+                this.share_in_flight = false;
+                this.share_status = Some(match outcome {
+                    Ok(res) => res,
+                    Err(_) => Err("Share upload task cancelled unexpectedly".to_string()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn wire_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -580,6 +677,7 @@ impl Render for ContainerTabView {
                 (ContainerSection::General, "Project Settings"),
                 (ContainerSection::DefaultHeaders, "Default Headers"),
                 (ContainerSection::YamlSpec, "YAML Document"),
+                (ContainerSection::Share, "Share"),
             ]
         } else {
             vec![
@@ -746,6 +844,182 @@ impl Render for ContainerTabView {
                                 .size_full()
                                 .min_h(px(320.))
                                 .child(Editor::new(&self.yaml_editor).h(px(360.)).readonly(true)),
+                        )
+                    })
+                    .when(is_project && self.active_section == ContainerSection::Share, |this| {
+                        let channels = [ShareChannel::TestrixServer, ShareChannel::CloudflareR2];
+                        let settings = &self.share_settings;
+                        let is_ready = match self.share_channel {
+                            ShareChannel::TestrixServer => {
+                                !settings.share_server_url.trim().is_empty()
+                                    && !settings.share_token.trim().is_empty()
+                            }
+                            ShareChannel::CloudflareR2 => {
+                                !settings.cloudflare_account_id.trim().is_empty()
+                                    && !settings.cloudflare_r2_bucket.trim().is_empty()
+                                    && !settings.cloudflare_api_token.trim().is_empty()
+                            }
+                        };
+
+                        let status_text = match self.share_channel {
+                            ShareChannel::TestrixServer => {
+                                if settings.share_token.trim().is_empty() {
+                                    format!(
+                                        "Not logged in (Server: {}). Open Preferences to sign in.",
+                                        settings.share_server_url
+                                    )
+                                } else {
+                                    format!(
+                                        "Logged in as {} on {}",
+                                        settings.share_email, settings.share_server_url
+                                    )
+                                }
+                            }
+                            ShareChannel::CloudflareR2 => {
+                                if settings.cloudflare_api_token.trim().is_empty()
+                                    || settings.cloudflare_account_id.trim().is_empty()
+                                    || settings.cloudflare_r2_bucket.trim().is_empty()
+                                {
+                                    "Cloudflare R2 credentials not configured. Open Preferences to add your Account ID, Bucket, and API Token.".to_string()
+                                } else {
+                                    format!(
+                                        "Ready: R2 bucket \"{}\" (Account {})",
+                                        settings.cloudflare_r2_bucket,
+                                        settings.cloudflare_account_id
+                                    )
+                                }
+                            }
+                        };
+
+                        this.child(
+                            v_flex()
+                                .gap_4()
+                                .max_w(px(640.))
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .child("Share Channel"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Upload all YAML files in this project (manifest, folders, requests, and environments) to a share destination."),
+                                        )
+                                        .child(
+                                            h_flex().gap_2().pt_1().children(channels.into_iter().map(|ch| {
+                                                let active = self.share_channel == ch;
+                                                let btn = Button::new(format!("share-ch-{}", ch.label()))
+                                                    .small()
+                                                    .label(ch.label())
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.share_channel = ch;
+                                                        this.share_status = None;
+                                                        cx.notify();
+                                                    }));
+                                                if active { btn.primary() } else { btn.outline() }
+                                            })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .p_3()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .bg(cx.theme().secondary)
+                                        .text_xs()
+                                        .text_color(if is_ready {
+                                            cx.theme().foreground
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .child(status_text),
+                                )
+                                .child(
+                                    h_flex().gap_2().child(
+                                        Button::new("share-upload-btn")
+                                            .primary()
+                                            .disabled(self.share_in_flight || !is_ready)
+                                            .label(if self.share_in_flight {
+                                                "Uploading YAML…"
+                                            } else {
+                                                "Upload Project YAML"
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.trigger_share_upload(window, cx);
+                                            })),
+                                    ),
+                                )
+                                .when_some(self.share_status.as_ref(), |parent, result| {
+                                    match result {
+                                        Ok(ok) => {
+                                            let url = ok.share_url.clone();
+                                            let url_for_copy = url.clone();
+                                            parent.child(
+                                                v_flex()
+                                                    .gap_2()
+                                                    .p_3()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(cx.theme().border)
+                                                    .bg(cx.theme().secondary)
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_semibold()
+                                                            .child(format!(
+                                                                "Uploaded {} YAML file(s) via {}",
+                                                                ok.files_uploaded,
+                                                                ok.channel.label()
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_2()
+                                                            .items_center()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .flex_1()
+                                                                    .child(url),
+                                                            )
+                                                            .child(
+                                                                Button::new("copy-share-url-btn")
+                                                                    .small()
+                                                                    .outline()
+                                                                    .label("Copy URL")
+                                                                    .on_click(move |_, window, cx| {
+                                                                        cx.write_to_clipboard(
+                                                                            ClipboardItem::new_string(
+                                                                                url_for_copy.clone(),
+                                                                            ),
+                                                                        );
+                                                                        window.push_notification(
+                                                                            "Share URL copied to clipboard",
+                                                                            cx,
+                                                                        );
+                                                                    }),
+                                                            ),
+                                                    ),
+                                            )
+                                        }
+                                        Err(err) => parent.child(
+                                            div()
+                                                .p_3()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(cx.theme().danger)
+                                                .text_xs()
+                                                .text_color(cx.theme().danger)
+                                                .child(err.clone()),
+                                        ),
+                                    }
+                                }),
                         )
                     }),
             )
