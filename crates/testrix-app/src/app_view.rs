@@ -1,9 +1,15 @@
-use std::{cell::Cell, collections::HashSet, path::PathBuf};
+use std::{
+    cell::Cell,
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowOptions,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, Image, ImageFormat,
+    ImageSource, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, WindowOptions, img,
     assets::IconName as LucideIcon,
     base::TestSupportExt as _,
     component::{
@@ -57,6 +63,17 @@ use crate::{
     request_editor::{RequestTabEvent, RequestTabView},
     theme_helpers::method_badge,
 };
+
+fn app_titlebar_icon() -> Arc<Image> {
+    static ICON: OnceLock<Arc<Image>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../assets/icon.png").to_vec(),
+        ))
+    })
+    .clone()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileOption {
@@ -2130,9 +2147,9 @@ impl Render for TestrixApp {
                                         .gap_1p5()
                                         .items_center()
                                         .child(
-                                            Icon::new(LucideIcon::Zap)
-                                                .small()
-                                                .text_color(cx.theme().primary),
+                                            img(ImageSource::Image(app_titlebar_icon()))
+                                                .size(px(18.))
+                                                .rounded(px(4.)),
                                         )
                                         .child(div().text_sm().font_bold().child("Testrix")),
                                 )
