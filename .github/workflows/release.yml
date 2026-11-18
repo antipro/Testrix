@@ -2,7 +2,7 @@
 # Testrix Release & Cross-Platform Packaging Workflow
 # =============================================================================
 # Compiles Testrix in release mode across macOS, Windows, and Linux, packages:
-#   - macOS:   .dmg (Apple Silicon .app bundle)
+#   - macOS:   .dmg (Universal arm64 + x86_64 .app bundle)
 #   - Windows: .msi (WiX installer) + standalone .exe
 #   - Linux:   .deb (Debian/Ubuntu dpkg) + .rpm (Fedora/RHEL/openSUSE)
 # and publishes a GitHub Release with auto-generated release notes & checksums.
@@ -75,39 +75,45 @@ jobs:
           echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 2. macOS Build (.dmg)
+  # 2. macOS Build (Universal .dmg: Apple Silicon arm64 + Intel x86_64)
   # ---------------------------------------------------------------------------
   build-macos:
-    name: Build macOS (.dmg)
+    name: Build macOS (Universal .dmg)
     needs: prepare
     runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Automatically reads rust-toolchain.toml (1.100.0)
+      # Install pinned Rust toolchain with both Apple Silicon and Intel macOS targets
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.100.0"
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release -p testrix-app
+      - name: Build release binaries (arm64 + x86_64)
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p testrix-app
+          cargo build --release --target x86_64-apple-darwin -p testrix-app
 
-      - name: Assemble Testrix.app bundle and create .dmg
+      - name: Assemble Universal Testrix.app bundle and create .dmg
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           APP_DIR="Testrix.app"
           DMG_STAGING="dmg-staging"
-          DMG_NAME="Testrix-${VERSION}-macos-arm64.dmg"
+          DMG_NAME="Testrix-${VERSION}-macos-universal.dmg"
 
-          # Create standard macOS .app directory layout
+          # Create standard macOS .app directory layout with a Universal (arm64 + x86_64) binary
           mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
-          cp target/release/testrix "${APP_DIR}/Contents/MacOS/testrix"
+          lipo -create \
+            target/aarch64-apple-darwin/release/testrix \
+            target/x86_64-apple-darwin/release/testrix \
+            -output "${APP_DIR}/Contents/MacOS/testrix"
           strip -x "${APP_DIR}/Contents/MacOS/testrix"
           cp crates/testrix-app/assets/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
           cp crates/testrix-app/assets/Info.plist "${APP_DIR}/Contents/Info.plist"
@@ -297,7 +303,7 @@ jobs:
 
             | Platform | Package |
             |---|---|
-            | **macOS (Apple Silicon)** | `Testrix-${{ needs.prepare.outputs.version }}-macos-arm64.dmg` |
+            | **macOS (Universal: Apple Silicon & Intel)** | `Testrix-${{ needs.prepare.outputs.version }}-macos-universal.dmg` |
             | **Windows (x86_64 Installer)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.msi` |
             | **Windows (x86_64 Standalone)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.exe` |
             | **Linux (Debian / Ubuntu)** | `Testrix-${{ needs.prepare.outputs.version }}-linux-amd64.deb` |
