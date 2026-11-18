@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset v4/v5 installer definition for Testrix (Windows x86_64).
+  Built in CI via: wix build packaging/wix/main.wxs -d Version=<ver> -d ExePath=<path> -o <out.msi>
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Testrix"
+    Manufacturer="Testrix Contributors"
+    Version="$(var.Version)"
+    UpgradeCode="8E3A7B4C-9F2D-4C1A-8B5E-3D6F9A1C2E4B"
+    Scope="perMachine">
+
+    <!-- Allow seamless upgrades and prevent downgrades -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <!-- Embed all files inside the .msi so it is self-contained -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Application icon shown in Add/Remove Programs and Start Menu -->
+    <Icon Id="AppIcon.ico" SourceFile="crates/testrix-app/assets/icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+
+    <!-- Resolve %USERPROFILE% for installing the agent skill into ~/.agents/skills/testrix-yaml/ -->
+    <SetDirectory Id="USERPROFILE_DIR" Value="[%USERPROFILE]" />
+
+    <Feature Id="MainFeature" Title="Testrix" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="AgentSkillFile" />
+    </Feature>
+
+    <!-- Install to Program Files\Testrix -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Testrix" />
+    </StandardDirectory>
+
+    <!-- Start Menu folder -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Testrix" />
+    </StandardDirectory>
+
+    <!-- User profile ~/.agents/skills/testrix-yaml/ directory -->
+    <Directory Id="USERPROFILE_DIR" Name="UserProfile">
+      <Directory Id="AgentsDir" Name=".agents">
+        <Directory Id="AgentsSkillsDir" Name="skills">
+          <Directory Id="TestrixYamlSkillDir" Name="testrix-yaml" />
+        </Directory>
+      </Directory>
+    </Directory>
+  </Package>
+
+  <Fragment>
+    <!-- Main executable and bundled SKILL.md -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="TestrixExe" Source="$(var.ExePath)" Name="testrix.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="BundledSkill" Guid="*">
+        <File Id="SkillMdBundled" Source="docs/SKILL.md" Name="SKILL.md" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Start Menu shortcut -->
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcut" Guid="A4C1E9B2-7D3F-4A8C-9E1B-5F2D8C4A6E3D">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="Testrix"
+          Description="Testrix — YAML API Workbench"
+          Target="[INSTALLFOLDER]testrix.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon.ico" />
+        <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Testrix"
+          Name="installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Install SKILL.md into ~/.agents/skills/testrix-yaml/SKILL.md -->
+    <DirectoryRef Id="TestrixYamlSkillDir">
+      <Component Id="AgentSkillFile" Guid="C7B2E4A1-3F8D-4C9A-B1E2-6D5A9C3F7E1B">
+        <File Id="SkillMdUser" Source="docs/SKILL.md" Name="SKILL.md" />
+        <RemoveFolder Id="CleanUpSkillDir" Directory="TestrixYamlSkillDir" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Testrix"
+          Name="skill_installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

@@ -1,0 +1,35 @@
+#!/bin/sh
+set -e
+
+SKILL_SRC="/usr/share/testrix/SKILL.md"
+
+if [ -f "$SKILL_SRC" ]; then
+    TARGET_USER=""
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        TARGET_USER="$SUDO_USER"
+    elif [ -n "${PKEXEC_UID:-}" ]; then
+        TARGET_USER=$(getent passwd "$PKEXEC_UID" | cut -d: -f1 || true)
+    fi
+
+    if [ -n "$TARGET_USER" ]; then
+        USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)
+        USER_GROUP=$(id -gn "$TARGET_USER" 2>/dev/null || true)
+    else
+        USER_HOME="${HOME:-}"
+        USER_GROUP=""
+    fi
+
+    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+        SKILL_DIR="$USER_HOME/.agents/skills/testrix-yaml"
+        mkdir -p "$SKILL_DIR"
+        cp "$SKILL_SRC" "$SKILL_DIR/SKILL.md"
+        chmod 644 "$SKILL_DIR/SKILL.md"
+        if [ -n "$TARGET_USER" ] && [ -n "$USER_GROUP" ]; then
+            chown "$TARGET_USER:$USER_GROUP" \
+                "$USER_HOME/.agents" \
+                "$USER_HOME/.agents/skills" \
+                "$SKILL_DIR" \
+                "$SKILL_DIR/SKILL.md" 2>/dev/null || true
+        fi
+    fi
+fi

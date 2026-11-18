@@ -37,3 +37,57 @@ name = "Testrix"
 identifier = "io.testrix.app"
 icon = ["assets/AppIcon.icns", "assets/icon-1024.png", "assets/icon.png"]
 short_description = "Testrix — YAML API Workbench"
+
+[package.metadata.deb]
+name = "testrix"
+maintainer = "Testrix Contributors"
+section = "devel"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "../../packaging/linux/deb"
+extended-description = "Testrix — A native desktop API client and YAML-backed request workbench."
+assets = [
+    ["target/release/testrix", "usr/bin/", "755"],
+    ["assets/testrix.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/testrix.png", "644"],
+    ["../../docs/SKILL.md", "usr/share/testrix/SKILL.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "../../target/release/testrix", dest = "/usr/bin/testrix", mode = "755" },
+    { source = "assets/testrix.desktop", dest = "/usr/share/applications/testrix.desktop", mode = "644" },
+    { source = "assets/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/testrix.png", mode = "644" },
+    { source = "../../docs/SKILL.md", dest = "/usr/share/testrix/SKILL.md", mode = "644" },
+]
+post_install_script = """
+SKILL_SRC="/usr/share/testrix/SKILL.md"
+if [ -f "$SKILL_SRC" ]; then
+    TARGET_USER=""
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        TARGET_USER="$SUDO_USER"
+    elif [ -n "${PKEXEC_UID:-}" ]; then
+        TARGET_USER=$(getent passwd "$PKEXEC_UID" | cut -d: -f1 || true)
+    fi
+    if [ -n "$TARGET_USER" ]; then
+        USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)
+        USER_GROUP=$(id -gn "$TARGET_USER" 2>/dev/null || true)
+    else
+        USER_HOME="${HOME:-}"
+        USER_GROUP=""
+    fi
+    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+        SKILL_DIR="$USER_HOME/.agents/skills/testrix-yaml"
+        mkdir -p "$SKILL_DIR"
+        cp "$SKILL_SRC" "$SKILL_DIR/SKILL.md"
+        chmod 644 "$SKILL_DIR/SKILL.md"
+        if [ -n "$TARGET_USER" ] && [ -n "$USER_GROUP" ]; then
+            chown "$TARGET_USER:$USER_GROUP" \
+                "$USER_HOME/.agents" \
+                "$USER_HOME/.agents/skills" \
+                "$SKILL_DIR" \
+                "$SKILL_DIR/SKILL.md" 2>/dev/null || true
+        fi
+    fi
+fi
+"""

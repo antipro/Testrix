@@ -1,0 +1,296 @@
+# =============================================================================
+# Testrix Release & Cross-Platform Packaging Workflow
+# =============================================================================
+# Compiles Testrix in release mode across macOS, Windows, and Linux, packages:
+#   - macOS:   .dmg (Apple Silicon .app bundle)
+#   - Windows: .msi (WiX installer) + standalone .exe
+#   - Linux:   .deb (Debian/Ubuntu dpkg) + .rpm (Fedora/RHEL/openSUSE)
+# and publishes a GitHub Release with auto-generated release notes & checksums.
+#
+# Triggered automatically when pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
+# or manually via `workflow_dispatch` from the GitHub Actions UI.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional release tag (e.g. v0.1.0). Leave empty to build artifacts without publishing a GitHub Release."
+        required: false
+        default: ""
+
+# Required for creating GitHub Releases and uploading release assets
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve version metadata and whether a GitHub Release should be created
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      msi_version: ${{ steps.meta.outputs.msi_version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute version and release flags
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            RELEASE_TAG="${{ github.ref_name }}"
+            SHOULD_RELEASE="true"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            RELEASE_TAG="${{ inputs.tag }}"
+            SHOULD_RELEASE="true"
+          else
+            # Fallback to workspace version in Cargo.toml for manual test builds
+            CARGO_VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+            RELEASE_TAG="v${CARGO_VER}"
+            SHOULD_RELEASE="false"
+          fi
+
+          # Strip leading 'v' for package versions (e.g. v0.1.0 -> 0.1.0)
+          VERSION="${RELEASE_TAG#v}"
+          # Windows MSI requires strictly numeric major.minor.patch (strip any -prerelease suffix)
+          MSI_VERSION="${VERSION%%-*}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "msi_version=${MSI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. macOS Build (.dmg)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build macOS (.dmg)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Automatically reads rust-toolchain.toml (1.100.0)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p testrix-app
+
+      - name: Assemble Testrix.app bundle and create .dmg
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          APP_DIR="Testrix.app"
+          DMG_STAGING="dmg-staging"
+          DMG_NAME="Testrix-${VERSION}-macos-arm64.dmg"
+
+          # Create standard macOS .app directory layout
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp target/release/testrix "${APP_DIR}/Contents/MacOS/testrix"
+          cp crates/testrix-app/assets/AppIcon.icns "${APP_DIR}/Contents/Resources/AppIcon.icns"
+          cp crates/testrix-app/assets/Info.plist "${APP_DIR}/Contents/Info.plist"
+          cp docs/SKILL.md "${APP_DIR}/Contents/Resources/SKILL.md"
+
+          # Update bundle version strings in Info.plist to match the release version
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${APP_DIR}/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "${APP_DIR}/Contents/Info.plist"
+
+          # Ad-hoc codesign so Apple Silicon macOS accepts the local bundle signature
+          codesign --force --deep --sign - "${APP_DIR}"
+
+          # Stage .app alongside an /Applications symlink for drag-and-drop install
+          mkdir -p "${DMG_STAGING}" dist
+          cp -R "${APP_DIR}" "${DMG_STAGING}/"
+          ln -s /Applications "${DMG_STAGING}/Applications"
+
+          # Create compressed UDZO disk image
+          hdiutil create \
+            -volname "Testrix" \
+            -srcfolder "${DMG_STAGING}" \
+            -ov \
+            -format UDZO \
+            "dist/${DMG_NAME}"
+
+      - name: Upload macOS .dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: testrix-macos-dmg
+          path: dist/*.dmg
+
+  # ---------------------------------------------------------------------------
+  # 3. Windows Build (.msi installer + standalone .exe)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build Windows (.msi & .exe)
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Automatically reads rust-toolchain.toml (1.100.0)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # build.rs embeds assets/icon.ico and sets the 8 MB main-thread stack size
+      - name: Build release binary
+        run: cargo build --release -p testrix-app
+
+      - name: Package standalone .exe
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/testrix.exe "dist/Testrix-$env:VERSION-windows-x86_64.exe"
+
+      # Install WiX Toolset CLI via .NET to build the .msi from packaging/wix/main.wxs
+      - name: Install WiX Toolset
+        run: dotnet tool install --global wix
+
+      - name: Build .msi installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MSI_VERSION: ${{ needs.prepare.outputs.msi_version }}
+        run: |
+          wix build packaging/wix/main.wxs `
+            -d Version="$env:MSI_VERSION" `
+            -d ExePath="target/release/testrix.exe" `
+            -o "dist/Testrix-$env:VERSION-windows-x86_64.msi"
+
+      - name: Upload Windows .exe and .msi artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: testrix-windows
+          path: |
+            dist/*.exe
+            dist/*.msi
+
+  # ---------------------------------------------------------------------------
+  # 4. Linux Build (.deb dpkg package + .rpm package)
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Build Linux (.deb & .rpm)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # System libraries required by GPUI (X11, Wayland, Vulkan, Fontconfig, FreeType) and C/C++ deps
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            cmake \
+            clang \
+            libclang-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libvulkan-dev
+
+      # Automatically reads rust-toolchain.toml (1.100.0)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Install prebuilt cargo-deb and cargo-generate-rpm binaries
+      - name: Install cargo-deb and cargo-generate-rpm
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release -p testrix-app
+
+      # Package .deb (Debian/Ubuntu) and .rpm (Fedora/RHEL) using metadata in crates/testrix-app/Cargo.toml
+      - name: Create .deb and .rpm packages
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          cargo deb -p testrix-app --no-build --deb-version "${VERSION}" -o "dist/Testrix-${VERSION}-linux-amd64.deb"
+          cargo generate-rpm -p crates/testrix-app -o "dist/Testrix-${VERSION}-linux-x86_64.rpm"
+
+      - name: Upload Linux .deb and .rpm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: testrix-linux
+          path: |
+            dist/*.deb
+            dist/*.rpm
+
+  # ---------------------------------------------------------------------------
+  # 5. Publish GitHub Release with release notes & SHA-256 checksums
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build-macos, build-windows, build-linux]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: Testrix ${{ needs.prepare.outputs.release_tag }}
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Platform | Package |
+            |---|---|
+            | **macOS (Apple Silicon)** | `Testrix-${{ needs.prepare.outputs.version }}-macos-arm64.dmg` |
+            | **Windows (x86_64 Installer)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.msi` |
+            | **Windows (x86_64 Standalone)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.exe` |
+            | **Linux (Debian / Ubuntu)** | `Testrix-${{ needs.prepare.outputs.version }}-linux-amd64.deb` |
+            | **Linux (Fedora / RHEL)** | `Testrix-${{ needs.prepare.outputs.version }}-linux-x86_64.rpm` |
+
+            Verify downloads with `SHA256SUMS.txt`.
+          files: release-assets/*
