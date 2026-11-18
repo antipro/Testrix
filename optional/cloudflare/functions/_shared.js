@@ -184,10 +184,15 @@ function parseYaml(text) {
 
   function assignKeyValue(obj, rawKey, valPart, keyIndent) {
     const key = String(unquoteScalar(rawKey) ?? rawKey);
-    if (valPart === '|' || valPart === '|-' || valPart === '>' || valPart === '>-') {
+    if (/^[|>][+-]?\d*$/.test(valPart)) {
       obj[key] = parseBlockScalar(keyIndent, valPart);
     } else if (valPart === '') {
-      if (idx < lines.length && lines[idx].indent > keyIndent) {
+      if (
+        idx < lines.length &&
+        (lines[idx].indent > keyIndent ||
+          (lines[idx].indent === keyIndent &&
+            (lines[idx].text.startsWith('- ') || lines[idx].text === '-')))
+      ) {
         obj[key] = parseNode(lines[idx].indent);
       } else {
         obj[key] = null;

@@ -93,22 +93,37 @@ function renderAuthSummary(auth) {
 }
 
 function renderBodySection(body) {
-  if (!body || body.type === 'none') return '';
-  if (body.type === 'raw') {
+  if (!body || body.type === 'none') {
+    return `<div class="section"><div class="section-title">Body</div><div style="color:var(--muted);font-size:13px;">None</div></div>`;
+  }
+  if (body.type === 'json') {
     let text = body.content || '';
-    if (body.format === 'json') {
+    try {
+      text = JSON.stringify(JSON.parse(text), null, 2);
+    } catch {}
+    return `
+      <div class="section">
+        <div class="section-title">Body (JSON)</div>
+        <pre class="code-block">${esc(text)}</pre>
+      </div>
+    `;
+  }
+  if (body.type === 'raw') {
+    const fmt = body.rawFormat || body.format || 'raw';
+    let text = body.content || '';
+    if (fmt === 'json') {
       try {
         text = JSON.stringify(JSON.parse(text), null, 2);
       } catch {}
     }
     return `
       <div class="section">
-        <div class="section-title">Body (${esc(body.format || 'raw')})</div>
+        <div class="section-title">Body (${esc(fmt)})</div>
         <pre class="code-block">${esc(text)}</pre>
       </div>
     `;
   }
-  if (body.type === 'urlencoded') {
+  if (body.type === 'formUrlEncoded' || body.type === 'urlencoded') {
     return `
       <div class="section">
         <div class="section-title">Body (x-www-form-urlencoded)</div>
@@ -120,7 +135,15 @@ function renderBodySection(body) {
     return `
       <div class="section">
         <div class="section-title">Body (multipart/form-data)</div>
-        ${renderKvTable((body.fields || []).map((f) => ({ key: f.key, value: f.value || f.filePath || '', description: f.fieldType, enabled: f.enabled })))}
+        ${renderKvTable((body.fields || []).map((f) => ({ key: f.key, value: f.value || f.filePath || '', description: f.fieldType || f.description || '', enabled: f.enabled })))}
+      </div>
+    `;
+  }
+  if (body.type === 'binary') {
+    return `
+      <div class="section">
+        <div class="section-title">Body (Binary)</div>
+        <div style="font-size:13px;"><code>${esc(body.filePath || '')}</code> ${body.contentType ? `<span class="pill">${esc(body.contentType)}</span>` : ''}</div>
       </div>
     `;
   }
