@@ -11,6 +11,8 @@ use crate::{
         generate_id,
     },
     openapi::{ImportedFolder, ImportedProjectBundle},
+    response::ResponseHeader,
+    response_meta::{ResponseExample, ResponseMetaField, extract_and_merge_response_meta},
 };
 
 /// Parses a Postman Collection v2.0 / v2.1 JSON string into an [`ImportedProjectBundle`].
@@ -308,7 +310,91 @@ fn parse_postman_request_item(item: &Value) -> Option<HttpRequestDoc> {
     req.request.body = parse_postman_body(body_val);
     req.request.auth = parse_postman_auth(auth_val, AuthConfig::Inherit);
     req.request.post_script = extract_postman_test_script(item.get("event"));
+    let (examples, meta) = parse_postman_responses(item.get("response"));
+    req.request.response_examples = examples;
+    req.request.response_meta = meta;
     Some(req)
+}
+
+fn parse_postman_responses(val: Option<&Value>) -> (Vec<ResponseExample>, Vec<ResponseMetaField>) {
+    let mut examples = Vec::new();
+    let mut meta = Vec::new();
+    let Some(arr) = val.and_then(Value::as_array) else {
+        return (examples, meta);
+    };
+
+    for (ix, resp) in arr.iter().enumerate() {
+        let name = resp
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Example {}", ix + 1));
+        let status_code = resp
+            .get("code")
+            .and_then(Value::as_u64)
+            .and_then(|c| u16::try_from(c).ok())
+            .unwrap_or(200);
+        let reason = resp
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let headers: Vec<ResponseHeader> = resp
+            .get("header")
+            .and_then(Value::as_array)
+            .map(|hdrs| {
+                hdrs.iter()
+                    .filter_map(|h| {
+                        let key = h.get("key").and_then(Value::as_str)?.trim();
+                        if key.is_empty() {
+                            return None;
+                        }
+                        Some(ResponseHeader {
+                            name: key.to_string(),
+                            value: value_to_string(h.get("value")),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let content_type = headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+            .map(|h| h.value.clone())
+            .or_else(|| {
+                resp.get("_postman_previewlanguage")
+                    .and_then(Value::as_str)
+                    .map(|lang| match lang.to_ascii_lowercase().as_str() {
+                        "json" => "application/json".to_string(),
+                        "xml" => "application/xml".to_string(),
+                        "html" => "text/html".to_string(),
+                        _ => "text/plain".to_string(),
+                    })
+            });
+
+        let body = resp
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        extract_and_merge_response_meta(&mut meta, &body, content_type.as_deref());
+        examples.push(ResponseExample::new(
+            generate_id("ex"),
+            name,
+            status_code,
+            reason,
+            content_type,
+            headers,
+            body,
+        ));
+    }
+
+    (examples, meta)
 }
 
 fn parse_http_method(raw: &str) -> HttpMethod {
@@ -700,7 +786,16 @@ mod tests {
                           "raw": "{{baseUrl}}/users?role=admin",
                           "query": [{"key": "role", "value": "admin"}]
                         }
-                      }
+                      },
+                      "response": [
+                        {
+                          "name": "Created",
+                          "code": 201,
+                          "status": "Created",
+                          "header": [{"key": "Content-Type", "value": "application/json"}],
+                          "body": "{\"id\":101,\"name\":\"Ada\"}"
+                        }
+                      ]
                     }
                   ]
                 }
@@ -749,6 +844,10 @@ mod tests {
         assert_eq!(req.request.params.len(), 1);
         assert_eq!(req.request.headers.len(), 1);
         assert!(matches!(req.request.body, RequestBody::Json { .. }));
+        assert_eq!(req.request.response_examples.len(), 1);
+        assert_eq!(req.request.response_examples[0].status_code, 201);
+        assert_eq!(req.request.response_examples[0].name, "Created");
+        assert_eq!(req.request.response_meta.len(), 2);
     }
 
     use zip::ZipWriter as ZipArchiveWriter;

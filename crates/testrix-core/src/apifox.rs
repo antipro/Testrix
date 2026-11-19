@@ -8,6 +8,11 @@ use crate::{
         generate_id,
     },
     openapi::{ImportedFolder, ImportedProjectBundle, parse_openapi_3_0},
+    response::ResponseHeader,
+    response_meta::{
+        ResponseExample, ResponseMetaField, extract_and_merge_response_meta,
+        json_schema_to_meta_fields, merge_response_meta,
+    },
 };
 
 /// Parses an Apifox native JSON export (`apifoxProject` / `apiCollection`) or an Apifox OpenAPI 3.0
@@ -271,8 +276,183 @@ fn parse_apifox_api(node: &Value, api: &Value, has_base_url: bool) -> Option<Htt
     req.request.body = parse_apifox_body(api.get("requestBody"));
     req.request.auth = parse_apifox_auth(api.get("auth"), AuthConfig::Inherit);
     req.request.post_script = extract_apifox_post_script(api.get("postProcessors"));
+    let (examples, meta) =
+        parse_apifox_responses(api.get("responses"), api.get("responseExamples"));
+    req.request.response_examples = examples;
+    req.request.response_meta = meta;
 
     Some(req)
+}
+
+fn parse_apifox_responses(
+    responses_val: Option<&Value>,
+    examples_val: Option<&Value>,
+) -> (Vec<ResponseExample>, Vec<ResponseMetaField>) {
+    let mut examples = Vec::new();
+    let mut meta = Vec::new();
+
+    struct RespDef {
+        id: Option<String>,
+        name: String,
+        code: u16,
+        content_type: Option<String>,
+        headers: Vec<ResponseHeader>,
+        body_fallback: Option<String>,
+    }
+
+    let mut defs = Vec::new();
+    if let Some(arr) = responses_val.and_then(Value::as_array) {
+        for (ix, resp) in arr.iter().enumerate() {
+            let id = resp
+                .get("id")
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                });
+            let name = resp
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Response {}", ix + 1));
+            let code = resp
+                .get("code")
+                .and_then(Value::as_u64)
+                .and_then(|c| u16::try_from(c).ok())
+                .unwrap_or(200);
+            let content_type = resp
+                .get("contentType")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|ct| match ct.to_ascii_lowercase().as_str() {
+                    "json" => "application/json".to_string(),
+                    "xml" => "application/xml".to_string(),
+                    "html" => "text/html".to_string(),
+                    _ => ct.to_string(),
+                });
+            let headers = resp
+                .get("headers")
+                .and_then(Value::as_array)
+                .map(|hdrs| {
+                    hdrs.iter()
+                        .filter_map(|h| {
+                            let h_name = h.get("name").and_then(Value::as_str)?.trim();
+                            if h_name.is_empty() {
+                                return None;
+                            }
+                            let val = value_to_string(
+                                h.get("example")
+                                    .or_else(|| h.get("value"))
+                                    .or_else(|| h.get("defaultValue")),
+                            );
+                            Some(ResponseHeader {
+                                name: h_name.to_string(),
+                                value: val,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(schema) = resp.get("jsonSchema") {
+                let schema_meta = json_schema_to_meta_fields(schema, None, 0);
+                if !schema_meta.is_empty() {
+                    merge_response_meta(&mut meta, schema_meta);
+                }
+            }
+
+            let body_fallback = resp
+                .get("example")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    resp.get("jsonSchema")
+                        .map(synthesize_json_example)
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                });
+
+            defs.push(RespDef {
+                id,
+                name,
+                code,
+                content_type,
+                headers,
+                body_fallback,
+            });
+        }
+    }
+
+    if let Some(ex_arr) = examples_val.and_then(Value::as_array) {
+        for (ix, ex) in ex_arr.iter().enumerate() {
+            let resp_id = ex.get("responseId").and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            });
+            let matched_def = resp_id
+                .as_deref()
+                .and_then(|id| defs.iter().find(|d| d.id.as_deref() == Some(id)));
+            let name = ex
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| matched_def.map(|d| d.name.clone()))
+                .unwrap_or_else(|| format!("Example {}", ix + 1));
+            let code = ex
+                .get("code")
+                .and_then(Value::as_u64)
+                .and_then(|c| u16::try_from(c).ok())
+                .or_else(|| matched_def.map(|d| d.code))
+                .unwrap_or(200);
+            let content_type = matched_def
+                .and_then(|d| d.content_type.clone())
+                .or_else(|| Some("application/json".to_string()));
+            let headers = matched_def.map(|d| d.headers.clone()).unwrap_or_default();
+            let body = match ex.get("data") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => {
+                    serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())
+                }
+                None => String::new(),
+            };
+            extract_and_merge_response_meta(&mut meta, &body, content_type.as_deref());
+            examples.push(ResponseExample::new(
+                generate_id("ex"),
+                name,
+                code,
+                String::new(),
+                content_type,
+                headers,
+                body,
+            ));
+        }
+    }
+
+    if examples.is_empty() {
+        for def in defs {
+            if let Some(body) = def.body_fallback {
+                extract_and_merge_response_meta(&mut meta, &body, def.content_type.as_deref());
+                examples.push(ResponseExample::new(
+                    generate_id("ex"),
+                    def.name,
+                    def.code,
+                    String::new(),
+                    def.content_type,
+                    def.headers,
+                    body,
+                ));
+            }
+        }
+    }
+
+    (examples, meta)
 }
 
 fn parse_http_method(raw: &str) -> HttpMethod {
@@ -602,7 +782,28 @@ mod tests {
                     "auth": {
                       "type": "bearer",
                       "bearer": {"token": "{{token}}"}
-                    }
+                    },
+                    "responses": [
+                      {
+                        "id": "resp-200",
+                        "name": "Success",
+                        "code": 200,
+                        "contentType": "json",
+                        "jsonSchema": {
+                          "type": "object",
+                          "properties": {
+                            "orderId": {"type": "string", "description": "Created order ID"}
+                          }
+                        }
+                      }
+                    ],
+                    "responseExamples": [
+                      {
+                        "name": "OK Example",
+                        "responseId": "resp-200",
+                        "data": "{\"orderId\":\"ord_123\"}"
+                      }
+                    ]
                   }
                 }
               ]
@@ -626,5 +827,11 @@ mod tests {
         assert_eq!(req.request.headers.len(), 1);
         assert!(matches!(req.request.body, RequestBody::Json { .. }));
         assert!(matches!(req.request.auth, AuthConfig::Bearer { .. }));
+        assert_eq!(req.request.response_examples.len(), 1);
+        assert_eq!(req.request.response_examples[0].name, "OK Example");
+        assert_eq!(req.request.response_examples[0].status_code, 200);
+        assert_eq!(req.request.response_meta.len(), 1);
+        assert_eq!(req.request.response_meta[0].name, "orderId");
+        assert_eq!(req.request.response_meta[0].description, "Created order ID");
     }
 }

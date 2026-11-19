@@ -933,7 +933,7 @@ fn default_language() -> String {
 }
 
 fn default_share_server_url() -> String {
-    "http://localhost:3456".to_string()
+    "https://testrix.bitifyware.com".to_string()
 }
 
 const fn default_true() -> bool {

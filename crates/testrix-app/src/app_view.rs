@@ -2043,7 +2043,7 @@ impl TestrixApp {
 
         let server_url_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("http://localhost:3456")
+                .placeholder("https://testrix.bitifyware.com")
                 .default_value(current_share.share_server_url.clone())
         });
         let email_input = cx.new(|cx| {

@@ -9,6 +9,11 @@ use crate::{
         HttpRequestDoc, KeyValueRow, MultipartField, ProjectDoc, RawBodyFormat, RequestBody,
         generate_id,
     },
+    response::ResponseHeader,
+    response_meta::{
+        ResponseExample, ResponseMetaField, extract_and_merge_response_meta,
+        json_schema_to_meta_fields, merge_response_meta,
+    },
 };
 
 /// A folder and its contained HTTP requests produced by importing an external specification.
@@ -74,6 +79,9 @@ pub fn parse_openapi_3_0(json_str: &str) -> Result<ImportedProjectBundle, CoreEr
         .and_then(Value::as_object);
     let component_bodies = components
         .and_then(|c| c.get("requestBodies"))
+        .and_then(Value::as_object);
+    let component_responses = components
+        .and_then(|c| c.get("responses"))
         .and_then(Value::as_object);
 
     // Servers -> Project baseUrl + Environment profiles
@@ -266,6 +274,14 @@ pub fn parse_openapi_3_0(json_str: &str) -> Result<ImportedProjectBundle, CoreEr
                 if let Some(body_val) = op.get("requestBody") {
                     req_doc.request.body =
                         parse_request_body(body_val, component_bodies, schemas);
+                }
+
+                // Response examples & meta-info
+                if let Some(responses_val) = op.get("responses") {
+                    let (examples, meta) =
+                        parse_openapi_responses(responses_val, component_responses, schemas);
+                    req_doc.request.response_examples = examples;
+                    req_doc.request.response_meta = meta;
                 }
 
                 // Place in first tag folder or root
@@ -663,6 +679,124 @@ fn resolve_ref<'a>(
     val
 }
 
+fn parse_openapi_responses(
+    responses_val: &Value,
+    component_responses: Option<&serde_json::Map<String, Value>>,
+    schemas: Option<&serde_json::Map<String, Value>>,
+) -> (Vec<ResponseExample>, Vec<ResponseMetaField>) {
+    let mut examples = Vec::new();
+    let mut meta = Vec::new();
+
+    let Some(map) = responses_val.as_object() else {
+        return (examples, meta);
+    };
+
+    for (status_key, raw_resp) in map {
+        let resp = resolve_ref(raw_resp, "#/components/responses/", component_responses);
+        let status_code = status_key.trim().parse::<u16>().unwrap_or(200);
+        let reason = resp
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        let headers: Vec<ResponseHeader> = resp
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|hdrs| {
+                hdrs.iter()
+                    .map(|(k, v)| {
+                        let value = v
+                            .get("example")
+                            .or_else(|| v.get("schema").and_then(|s| s.get("example")))
+                            .and_then(scalar_to_string)
+                            .unwrap_or_default();
+                        ResponseHeader {
+                            name: k.clone(),
+                            value,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let Some(content) = resp.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (media_type, media_obj) in content {
+            if let Some(schema) = media_obj.get("schema") {
+                let schema_meta = json_schema_to_meta_fields(schema, schemas, 0);
+                if !schema_meta.is_empty() {
+                    merge_response_meta(&mut meta, schema_meta);
+                }
+            }
+
+            if let Some(named_examples) = media_obj.get("examples").and_then(Value::as_object) {
+                for (ex_key, ex_obj) in named_examples {
+                    let Some(val) = ex_obj.get("value") else {
+                        continue;
+                    };
+                    let body = format_openapi_example_body(val);
+                    let ex_name = ex_obj
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(ex_key);
+                    extract_and_merge_response_meta(&mut meta, &body, Some(media_type.as_str()));
+                    examples.push(ResponseExample::new(
+                        generate_id("ex"),
+                        format!("{status_key} · {ex_name}"),
+                        status_code,
+                        reason.clone(),
+                        Some(media_type.clone()),
+                        headers.clone(),
+                        body,
+                    ));
+                }
+            } else if let Some(ex_val) = media_obj.get("example") {
+                let body = format_openapi_example_body(ex_val);
+                extract_and_merge_response_meta(&mut meta, &body, Some(media_type.as_str()));
+                examples.push(ResponseExample::new(
+                    generate_id("ex"),
+                    status_key.clone(),
+                    status_code,
+                    reason.clone(),
+                    Some(media_type.clone()),
+                    headers.clone(),
+                    body,
+                ));
+            } else if let Some(schema) = media_obj.get("schema") {
+                let synthesized = synthesize_value_from_schema(schema, schemas, 0);
+                let body = format_openapi_example_body(&synthesized);
+                if !body.trim().is_empty() {
+                    extract_and_merge_response_meta(&mut meta, &body, Some(media_type.as_str()));
+                    examples.push(ResponseExample::new(
+                        generate_id("ex"),
+                        status_key.clone(),
+                        status_code,
+                        reason.clone(),
+                        Some(media_type.clone()),
+                        headers.clone(),
+                        body,
+                    ));
+                }
+            }
+        }
+    }
+
+    (examples, meta)
+}
+
+fn format_openapi_example_body(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,5 +929,51 @@ mod tests {
             bundle.environments[0].variables[1].value,
             "keep-secret-token"
         );
+    }
+
+    #[test]
+    fn imports_openapi_response_examples_and_schema_meta() {
+        let json = r#"{
+          "openapi": "3.0.1",
+          "info": { "title": "MetaDemo", "version": "1.0.0" },
+          "paths": {
+            "/users": {
+              "get": {
+                "summary": "List Users",
+                "responses": {
+                  "200": {
+                    "description": "OK",
+                    "content": {
+                      "application/json": {
+                        "schema": {
+                          "type": "object",
+                          "properties": {
+                            "id": { "type": "integer", "description": "User ID", "example": 42 },
+                            "name": { "type": "string", "description": "Full name" }
+                          }
+                        },
+                        "example": { "id": 42, "name": "Ada" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }"#;
+        let bundle = parse_openapi_3_0(json).unwrap();
+        let req = &bundle.root_requests[0];
+        assert_eq!(req.request.response_examples.len(), 1);
+        assert_eq!(req.request.response_examples[0].status_code, 200);
+        assert!(req.request.response_examples[0].body.contains("Ada"));
+        assert_eq!(req.request.response_meta.len(), 2);
+        let id_field = req
+            .request
+            .response_meta
+            .iter()
+            .find(|f| f.name == "id")
+            .unwrap();
+        assert_eq!(id_field.description, "User ID");
+        assert_eq!(id_field.example, "42");
     }
 }

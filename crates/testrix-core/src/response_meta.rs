@@ -173,6 +173,111 @@ pub fn merge_response_meta(
     }
 }
 
+/// Converts a JSON Schema object (with optional `#/components/schemas/` lookup) into a tree of
+/// [`ResponseMetaField`] nodes, preserving field types, examples, and descriptions.
+pub(crate) fn json_schema_to_meta_fields(
+    raw_schema: &serde_json::Value,
+    components: Option<&serde_json::Map<String, serde_json::Value>>,
+    depth: usize,
+) -> Vec<ResponseMetaField> {
+    if depth > 6 {
+        return Vec::new();
+    }
+    let schema = resolve_schema_ref(raw_schema, components);
+    let ty = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if ty == "array"
+        && let Some(items) = schema.get("items")
+    {
+        let children = json_schema_to_meta_fields(items, components, depth + 1);
+        let desc = schema
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim();
+        let mut root = ResponseMetaField::new("[]", "array").with_children(children);
+        if !desc.is_empty() {
+            root = root.with_description(desc);
+        }
+        return vec![root];
+    }
+
+    let Some(props) = schema.get("properties").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    props
+        .iter()
+        .map(|(name, raw_prop)| {
+            let prop = resolve_schema_ref(raw_prop, components);
+            let prop_ty = prop.get("type").and_then(|v| v.as_str()).unwrap_or_else(|| {
+                if prop.get("properties").is_some() {
+                    "object"
+                } else if prop.get("items").is_some() {
+                    "array"
+                } else {
+                    "string"
+                }
+            });
+            let desc = prop
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            let example = prop
+                .get("example")
+                .or_else(|| prop.get("default"))
+                .map(schema_example_preview)
+                .unwrap_or_default();
+            let children = if prop_ty == "array" {
+                prop.get("items")
+                    .map(|items| json_schema_to_meta_fields(items, components, depth + 1))
+                    .unwrap_or_default()
+            } else if prop_ty == "object" || prop.get("properties").is_some() {
+                json_schema_to_meta_fields(prop, components, depth + 1)
+            } else {
+                Vec::new()
+            };
+
+            let mut field = ResponseMetaField::new(name, prop_ty).with_children(children);
+            if !example.is_empty() {
+                field = field.with_example(example);
+            }
+            if !desc.is_empty() {
+                field = field.with_description(desc);
+            }
+            field
+        })
+        .collect()
+}
+
+fn resolve_schema_ref<'a>(
+    val: &'a serde_json::Value,
+    components: Option<&'a serde_json::Map<String, serde_json::Value>>,
+) -> &'a serde_json::Value {
+    if let Some(ref_str) = val.get("$ref").and_then(|v| v.as_str()) {
+        let name = ref_str
+            .strip_prefix("#/components/schemas/")
+            .or_else(|| ref_str.strip_prefix("#/definitions/"));
+        if let Some(name) = name
+            && let Some(target) = components.and_then(|c| c.get(name))
+        {
+            return target;
+        }
+    }
+    val
+}
+
+fn schema_example_preview(val: &serde_json::Value) -> String {
+    let raw = match val {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        other => other.to_string(),
+    };
+    truncate_example(&raw)
+}
+
 fn merge_field_types(existing: &str, incoming: &str) -> String {
     if existing.is_empty() {
         return incoming.to_string();
