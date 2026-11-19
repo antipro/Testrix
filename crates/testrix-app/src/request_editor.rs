@@ -660,6 +660,11 @@ impl RequestTabView {
         &self.project_id
     }
 
+    pub(crate) fn set_location(&mut self, project_id: String, file_path: PathBuf) {
+        self.project_id = project_id;
+        self.file_path = file_path;
+    }
+
     pub(crate) fn method(&self) -> HttpMethod {
         self.method
     }

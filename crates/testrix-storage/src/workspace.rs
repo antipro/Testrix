@@ -871,6 +871,33 @@ pub fn duplicate_request(source: &RequestNode) -> Result<RequestNode, StorageErr
     Ok(RequestNode { doc, file_path })
 }
 
+/// Moves an HTTP request YAML file to `target_dir`, removing the source file.
+pub fn move_request(
+    source_file: &Path,
+    target_dir: &Path,
+    doc: &HttpRequestDoc,
+) -> Result<RequestNode, StorageError> {
+    doc.validate()?;
+    if source_file.parent() == Some(target_dir) {
+        return Ok(RequestNode {
+            doc: doc.clone(),
+            file_path: source_file.to_path_buf(),
+        });
+    }
+    let dest_path = unique_file_path(target_dir, &doc.name, REQUEST_EXTENSION);
+    write_yaml_atomic(&dest_path, doc)?;
+    if source_file.exists() && source_file != dest_path {
+        std::fs::remove_file(source_file).map_err(|source| StorageError::Io {
+            path: source_file.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(RequestNode {
+        doc: doc.clone(),
+        file_path: dest_path,
+    })
+}
+
 /// Removes an HTTP request YAML file from disk.
 pub fn delete_request(file_path: &Path) -> Result<(), StorageError> {
     if file_path.exists() {

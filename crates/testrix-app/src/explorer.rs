@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, TestSupportExt as _,
-    Window,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TestSupportExt as _, Window,
     assets::IconName as LucideIcon,
     component::{
         ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -59,8 +59,40 @@ pub(crate) enum ExplorerEvent {
     ExportOpenApi {
         project_id: String,
     },
+    MoveRequest {
+        source_project_id: String,
+        request_id: String,
+        target_project_id: String,
+        target_folder_id: Option<String>,
+    },
     ExpandedStateChanged(Vec<String>),
     ReloadWorkspace,
+}
+
+#[derive(Clone)]
+struct DraggedRequest {
+    project_id: String,
+    request_id: String,
+    name: String,
+}
+
+struct DragPreview(String);
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2p5()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().primary)
+            .text_xs()
+            .font_medium()
+            .text_color(cx.theme().popover_foreground)
+            .shadow_md()
+            .child(self.0.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +514,7 @@ fn render_tree_row(
 ) -> ListItem {
     let indent = px(12.) * depth as f32 + px(6.);
     let row_id = SharedString::from(format!("tree-row-{tree_id}"));
+    let drag_meta = meta.clone();
 
     let (a11y_label, content, click_action) = match meta {
         Some(NodeMeta::Project {
@@ -690,7 +723,8 @@ fn render_tree_row(
     };
 
     let view_click = view.clone();
-    ListItem::new(row_id)
+    let view_drop = view.clone();
+    let item = ListItem::new(row_id)
         .w_full()
         .rounded(cx.theme().radius)
         .px_1p5()
@@ -706,7 +740,79 @@ fn render_tree_row(
                     cx.emit(ExplorerEvent::OpenNode(node.clone()));
                 });
             })
-        })
+        });
+
+    match drag_meta {
+        Some(NodeMeta::Request {
+            project_id,
+            request_id,
+            name,
+            ..
+        }) => item.on_drag(
+            DraggedRequest {
+                project_id,
+                request_id,
+                name,
+            },
+            |drag, _, _, cx| cx.new(|_| DragPreview(drag.name.clone())),
+        ),
+        Some(NodeMeta::Project { project_id, .. }) => {
+            let target_tree_id = format!("proj:{project_id}");
+            item.drag_over::<DraggedRequest>(|style, _, _, cx| {
+                style
+                    .bg(cx.theme().accent)
+                    .border_1()
+                    .border_color(cx.theme().primary)
+            })
+            .on_drop(move |drag: &DraggedRequest, _, cx| {
+                let target_tid = target_tree_id.clone();
+                let target_pid = project_id.clone();
+                view_drop.update(cx, |panel, cx| {
+                    panel.expanded_ids.insert(target_tid);
+                    cx.emit(ExplorerEvent::ExpandedStateChanged(
+                        panel.sorted_expanded_ids(),
+                    ));
+                    cx.emit(ExplorerEvent::MoveRequest {
+                        source_project_id: drag.project_id.clone(),
+                        request_id: drag.request_id.clone(),
+                        target_project_id: target_pid,
+                        target_folder_id: None,
+                    });
+                });
+            })
+        }
+        Some(NodeMeta::Folder {
+            project_id,
+            folder_id,
+            ..
+        }) => {
+            let target_tree_id = format!("fld:{folder_id}");
+            item.drag_over::<DraggedRequest>(|style, _, _, cx| {
+                style
+                    .bg(cx.theme().accent)
+                    .border_1()
+                    .border_color(cx.theme().primary)
+            })
+            .on_drop(move |drag: &DraggedRequest, _, cx| {
+                let target_tid = target_tree_id.clone();
+                let target_pid = project_id.clone();
+                let target_fid = folder_id.clone();
+                view_drop.update(cx, |panel, cx| {
+                    panel.expanded_ids.insert(target_tid);
+                    cx.emit(ExplorerEvent::ExpandedStateChanged(
+                        panel.sorted_expanded_ids(),
+                    ));
+                    cx.emit(ExplorerEvent::MoveRequest {
+                        source_project_id: drag.project_id.clone(),
+                        request_id: drag.request_id.clone(),
+                        target_project_id: target_pid,
+                        target_folder_id: Some(target_fid),
+                    });
+                });
+            })
+        }
+        None => item,
+    }
 }
 
 fn build_context_menu(

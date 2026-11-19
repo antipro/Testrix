@@ -15,7 +15,7 @@ pub use workspace::{
     duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
     init_or_load_config, init_or_load_config_at, load_project, load_request_response,
     load_workspace, load_workspace_environments, load_workspace_explorer_state,
-    load_workspace_tabs, merge_environments_into_dir, save_config_preferences,
+    load_workspace_tabs, merge_environments_into_dir, move_request, save_config_preferences,
     save_config_preferences_at, save_config_share_settings, save_config_share_settings_at,
     save_config_shared_projects, save_config_shared_projects_at, save_config_workspace_dir,
     save_config_workspace_dir_at, save_environment, save_folder, save_project, save_request,
@@ -228,5 +228,37 @@ mod tests {
 
         let reloaded = init_or_load_config_at(&cfg_path).unwrap();
         assert_eq!(ShareSettings::from(&reloaded), settings);
+    }
+
+    #[test]
+    fn moves_request_across_folders_and_reloads_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let proj = create_project(dir.path(), "Demo Project", "https://api.example.com").unwrap();
+        let folder_a = create_folder(&proj.root_dir, "Folder A", 0).unwrap();
+        let folder_b = create_folder(&proj.root_dir, "Folder B", 1).unwrap();
+
+        let req =
+            create_request(&folder_a.dir_path, "Login", HttpMethod::Post, "/login").unwrap();
+        assert!(req.file_path.exists());
+
+        let moved = move_request(&req.file_path, &folder_b.dir_path, &req.doc).unwrap();
+        assert!(!req.file_path.exists());
+        assert!(moved.file_path.exists());
+        assert_eq!(moved.file_path.parent(), Some(folder_b.dir_path.as_path()));
+
+        let reloaded = load_project(&proj.root_dir).unwrap();
+        let reloaded_a = reloaded
+            .folders
+            .iter()
+            .find(|f| f.doc.id == folder_a.doc.id)
+            .unwrap();
+        let reloaded_b = reloaded
+            .folders
+            .iter()
+            .find(|f| f.doc.id == folder_b.doc.id)
+            .unwrap();
+        assert!(reloaded_a.requests.is_empty());
+        assert_eq!(reloaded_b.requests.len(), 1);
+        assert_eq!(reloaded_b.requests[0].doc.id, req.doc.id);
     }
 }

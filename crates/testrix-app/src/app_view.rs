@@ -56,7 +56,7 @@ use testrix_storage::{
     create_project, create_request, delete_environment, delete_folder, delete_project,
     delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
     init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
-    load_workspace_explorer_state, load_workspace_tabs, save_config_preferences,
+    load_workspace_explorer_state, load_workspace_tabs, move_request, save_config_preferences,
     save_config_share_settings, save_config_shared_projects, save_config_workspace_dir,
     save_environment, save_folder, save_project, save_request, save_request_response,
     save_workspace_explorer_state, save_workspace_state, save_workspace_tabs,
@@ -670,6 +670,19 @@ impl TestrixApp {
             ExplorerEvent::ExportOpenApi { project_id } => {
                 self.prompt_export_openapi(project_id, window, cx)
             }
+            ExplorerEvent::MoveRequest {
+                source_project_id,
+                request_id,
+                target_project_id,
+                target_folder_id,
+            } => self.move_request_node(
+                &source_project_id,
+                &request_id,
+                &target_project_id,
+                target_folder_id.as_deref(),
+                window,
+                cx,
+            ),
             ExplorerEvent::ExpandedStateChanged(expanded) => {
                 let _ = save_workspace_explorer_state(&self.workspace.root_dir, &expanded);
             }
@@ -1991,6 +2004,69 @@ impl TestrixApp {
                 .ok()
         })
         .detach();
+    }
+
+    fn move_request_node(
+        &mut self,
+        source_project_id: &str,
+        request_id: &str,
+        target_project_id: &str,
+        target_folder_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target_dir) = self.workspace.find_project(target_project_id).and_then(|p| {
+            match target_folder_id {
+                Some(fid) => find_folder_dir_in_folders(&p.folders, fid),
+                None => Some(p.root_dir.clone()),
+            }
+        }) else {
+            return;
+        };
+
+        let Some(source_proj) = self.workspace.find_project_mut(source_project_id) else {
+            return;
+        };
+        let Some(removed) = take_request_from_project(source_proj, request_id) else {
+            return;
+        };
+        if removed.file_path.parent() == Some(target_dir.as_path()) {
+            insert_request_into_project(source_proj, None, removed);
+            return;
+        }
+
+        match move_request(&removed.file_path, &target_dir, &removed.doc) {
+            Ok(moved) => {
+                let moved_name = moved.doc.name.clone();
+                let new_file_path = moved.file_path.clone();
+                if let Some(target_proj) = self.workspace.find_project_mut(target_project_id) {
+                    insert_request_into_project(target_proj, target_folder_id, moved);
+                }
+                for tab in &self.tabs {
+                    if let WorkbenchTab::Request(view) = tab
+                        && view.read(cx).request_id() == request_id
+                    {
+                        let pid = target_project_id.to_string();
+                        let fp = new_file_path.clone();
+                        view.update(cx, |v, _| v.set_location(pid, fp));
+                    }
+                }
+                self.explorer.update(cx, |panel, cx| {
+                    panel.set_workspace(self.workspace.clone(), cx);
+                    panel.reveal_and_select(&format!("req:{request_id}"), cx);
+                });
+                self.sync_all_tabs(window, cx);
+                window.push_notification(format!("Moved \"{moved_name}\"."), cx);
+                cx.notify();
+            }
+            Err(err) => {
+                // Restore into original project on failure.
+                if let Some(source_proj) = self.workspace.find_project_mut(source_project_id) {
+                    insert_request_into_project(source_proj, None, removed);
+                }
+                window.push_notification(format!("Failed moving request: {err}"), cx);
+            }
+        }
     }
 
     fn reload_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4164,6 +4240,86 @@ fn first_request_in_folder(
         }
     }
     None
+}
+
+fn find_folder_dir_in_folders(folders: &[FolderNode], folder_id: &str) -> Option<PathBuf> {
+    for f in folders {
+        if f.doc.id == folder_id {
+            return Some(f.dir_path.clone());
+        }
+        if let Some(found) = find_folder_dir_in_folders(&f.folders, folder_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn take_request_from_folders(
+    folders: &mut [FolderNode],
+    request_id: &str,
+) -> Option<testrix_core::RequestNode> {
+    for f in folders {
+        if let Some(pos) = f.requests.iter().position(|r| r.doc.id == request_id) {
+            return Some(f.requests.remove(pos));
+        }
+        if let Some(found) = take_request_from_folders(&mut f.folders, request_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn take_request_from_project(
+    proj: &mut ProjectNode,
+    request_id: &str,
+) -> Option<testrix_core::RequestNode> {
+    if let Some(pos) = proj.requests.iter().position(|r| r.doc.id == request_id) {
+        return Some(proj.requests.remove(pos));
+    }
+    take_request_from_folders(&mut proj.folders, request_id)
+}
+
+fn insert_request_into_folders(
+    folders: &mut [FolderNode],
+    folder_id: &str,
+    mut req: testrix_core::RequestNode,
+) -> Result<(), testrix_core::RequestNode> {
+    for f in folders {
+        if f.doc.id == folder_id {
+            f.requests.push(req);
+            f.requests.sort_by(|a, b| {
+                a.doc
+                    .order
+                    .cmp(&b.doc.order)
+                    .then_with(|| a.doc.name.to_lowercase().cmp(&b.doc.name.to_lowercase()))
+            });
+            return Ok(());
+        }
+        match insert_request_into_folders(&mut f.folders, folder_id, req) {
+            Ok(()) => return Ok(()),
+            Err(returned) => req = returned,
+        }
+    }
+    Err(req)
+}
+
+fn insert_request_into_project(
+    proj: &mut ProjectNode,
+    folder_id: Option<&str>,
+    req: testrix_core::RequestNode,
+) {
+    if let Some(fid) = folder_id
+        && insert_request_into_folders(&mut proj.folders, fid, req.clone()).is_ok()
+    {
+        return;
+    }
+    proj.requests.push(req);
+    proj.requests.sort_by(|a, b| {
+        a.doc
+            .order
+            .cmp(&b.doc.order)
+            .then_with(|| a.doc.name.to_lowercase().cmp(&b.doc.name.to_lowercase()))
+    });
 }
 
 fn remove_request_from_project(project: &mut testrix_core::ProjectNode, request_id: &str) {
