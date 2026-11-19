@@ -7,6 +7,7 @@ const state = {
   selectedEnvIndex: 0,
   collapsedFolders: new Set(),
   searchQuery: '',
+  codeTarget: 'curl',
 };
 
 function esc(str) {
@@ -381,6 +382,305 @@ function renderRightContent() {
       ${renderAuthSummary(r.auth)}
     </div>
     ${renderBodySection(r.body)}
+    ${renderCodeSection(d)}
+    ${renderResponseMetaSection(r.responseMeta)}
+    ${renderResponseExamplesSection(r.responseExamples)}
+  `;
+}
+
+const CODEGEN_TARGETS = [
+  { id: 'curl', label: 'cURL' },
+  { id: 'curl-win', label: 'cURL (Win)' },
+  { id: 'wget', label: 'wget' },
+  { id: 'powershell', label: 'PowerShell' },
+];
+
+function escapePosixSingle(s) {
+  return String(s).replace(/'/g, "'\\''");
+}
+
+function escapeCmdDouble(s) {
+  return String(s).replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n');
+}
+
+function escapePsSingle(s) {
+  return String(s).replace(/'/g, "''");
+}
+
+function escapePsDouble(s) {
+  return String(s).replace(/`/g, '``').replace(/"/g, '`"').replace(/\$/g, '`$');
+}
+
+function prepareRequestForCodegen(reqDoc) {
+  const r = reqDoc?.request || {};
+  const method = (r.method || 'GET').toUpperCase();
+  let url = buildUrl(reqDoc);
+
+  const enabledParams = (r.params || []).filter((p) => p.enabled !== false && p.key);
+  if (enabledParams.length > 0) {
+    const qs = enabledParams
+      .map((p) => `${encodeURIComponent(resolveVars(p.key))}=${encodeURIComponent(resolveVars(p.value || ''))}`)
+      .join('&');
+    url += (url.includes('?') ? '&' : '?') + qs;
+  }
+
+  const headers = (r.headers || [])
+    .filter((h) => h.enabled !== false && h.key)
+    .map((h) => ({ name: resolveVars(h.key), value: resolveVars(h.value || '') }));
+
+  const hasContentType = headers.some((h) => h.name.toLowerCase() === 'content-type');
+  const body = r.body || { type: 'none' };
+  if (!hasContentType) {
+    if (body.type === 'json') {
+      headers.push({ name: 'Content-Type', value: 'application/json' });
+    } else if (body.type === 'raw') {
+      const fmt = body.rawFormat || body.format || 'text';
+      if (fmt === 'json') headers.push({ name: 'Content-Type', value: 'application/json' });
+      else if (fmt === 'xml') headers.push({ name: 'Content-Type', value: 'application/xml' });
+      else if (fmt === 'html') headers.push({ name: 'Content-Type', value: 'text/html' });
+      else headers.push({ name: 'Content-Type', value: 'text/plain' });
+    } else if (body.type === 'formUrlEncoded') {
+      headers.push({ name: 'Content-Type', value: 'application/x-www-form-urlencoded' });
+    } else if (body.type === 'binary' && body.contentType) {
+      headers.push({ name: 'Content-Type', value: resolveVars(body.contentType) });
+    }
+  }
+
+  return { method, url, headers, body };
+}
+
+function generateRequestCode(reqDoc, target) {
+  const req = prepareRequestForCodegen(reqDoc);
+  const { method, url, headers, body } = req;
+
+  if (target === 'curl-win') {
+    const lines = [`curl.exe -X ${method} "${escapeCmdDouble(url)}"`];
+    for (const h of headers) {
+      lines.push(`  -H "${escapeCmdDouble(h.name)}: ${escapeCmdDouble(h.value)}"`);
+    }
+    if (body.type === 'json' || body.type === 'raw') {
+      lines.push(`  --data-raw "${escapeCmdDouble(resolveVars(body.content || ''))}"`);
+    } else if (body.type === 'formUrlEncoded') {
+      for (const f of body.fields || []) {
+        if (f.enabled === false || !f.key) continue;
+        lines.push(`  --data-urlencode "${escapeCmdDouble(resolveVars(f.key))}=${escapeCmdDouble(resolveVars(f.value || ''))}"`);
+      }
+    } else if (body.type === 'multipart') {
+      for (const f of body.fields || []) {
+        if (f.enabled === false || !f.key) continue;
+        const k = escapeCmdDouble(resolveVars(f.key));
+        const v = escapeCmdDouble(resolveVars(f.value || ''));
+        lines.push(f.fieldType === 'file' ? `  -F "${k}=@${v}"` : `  -F "${k}=${v}"`);
+      }
+    } else if (body.type === 'binary' && body.filePath) {
+      lines.push(`  --data-binary "@${escapeCmdDouble(resolveVars(body.filePath))}"`);
+    }
+    return lines.join(' ^\n');
+  }
+
+  if (target === 'wget') {
+    const lines = [`wget --method=${method}`];
+    for (const h of headers) {
+      lines.push(`  --header='${escapePosixSingle(h.name)}: ${escapePosixSingle(h.value)}'`);
+    }
+    if (body.type === 'json' || body.type === 'raw') {
+      lines.push(`  --body-data='${escapePosixSingle(resolveVars(body.content || ''))}'`);
+    } else if (body.type === 'formUrlEncoded') {
+      const encoded = (body.fields || [])
+        .filter((f) => f.enabled !== false && f.key)
+        .map((f) => `${encodeURIComponent(resolveVars(f.key))}=${encodeURIComponent(resolveVars(f.value || ''))}`)
+        .join('&');
+      lines.push(`  --body-data='${escapePosixSingle(encoded)}'`);
+    } else if (body.type === 'multipart') {
+      lines.push('  # Note: wget does not natively build multipart/form-data; use cURL');
+    } else if (body.type === 'binary' && body.filePath) {
+      lines.push(`  --body-file='${escapePosixSingle(resolveVars(body.filePath))}'`);
+    }
+    lines.push(`  -qO- '${escapePosixSingle(url)}'`);
+    return lines.join(' \\\n');
+  }
+
+  if (target === 'powershell') {
+    const out = [];
+    let contentType = null;
+    const headerLines = [];
+    for (const h of headers) {
+      if (h.name.toLowerCase() === 'content-type') {
+        contentType = h.value;
+      } else {
+        headerLines.push(`    "${escapePsDouble(h.name)}" = "${escapePsDouble(h.value)}"`);
+      }
+    }
+    const hasHeaders = headerLines.length > 0;
+    if (hasHeaders) {
+      out.push('$headers = @{', ...headerLines, '}');
+    }
+
+    let hasBody = false;
+    if (body.type === 'json' || body.type === 'raw') {
+      hasBody = true;
+      const content = resolveVars(body.content || '');
+      if (content.includes('\n')) {
+        out.push(`$body = @'\n${content}\n'@`);
+      } else {
+        out.push(`$body = '${escapePsSingle(content)}'`);
+      }
+    } else if (body.type === 'formUrlEncoded') {
+      hasBody = true;
+      out.push('$body = @{');
+      for (const f of body.fields || []) {
+        if (f.enabled === false || !f.key) continue;
+        out.push(`    "${escapePsDouble(resolveVars(f.key))}" = "${escapePsDouble(resolveVars(f.value || ''))}"`);
+      }
+      out.push('}');
+    } else if (body.type === 'multipart') {
+      hasBody = true;
+      out.push('$body = @{');
+      for (const f of body.fields || []) {
+        if (f.enabled === false || !f.key) continue;
+        const k = escapePsDouble(resolveVars(f.key));
+        const v = resolveVars(f.value || '');
+        if (f.fieldType === 'file') {
+          out.push(`    "${k}" = Get-Item -Path '${escapePsSingle(v)}'`);
+        } else {
+          out.push(`    "${k}" = "${escapePsDouble(v)}"`);
+        }
+      }
+      out.push('}');
+    } else if (body.type === 'binary' && body.filePath) {
+      hasBody = true;
+      out.push(`$body = [System.IO.File]::ReadAllBytes('${escapePsSingle(resolveVars(body.filePath))}')`);
+    }
+
+    let invoke = `$response = Invoke-WebRequest -Uri '${escapePsSingle(url)}' -Method ${method} -UseBasicParsing`;
+    if (hasHeaders) invoke += ' -Headers $headers';
+    if (contentType) invoke += ` -ContentType '${escapePsSingle(contentType)}'`;
+    if (hasBody) invoke += ' -Body $body';
+    out.push(invoke);
+    return out.join('\n');
+  }
+
+  // Default: POSIX cURL
+  const lines = [`curl -X ${method} '${escapePosixSingle(url)}'`];
+  for (const h of headers) {
+    lines.push(`  -H '${escapePosixSingle(h.name)}: ${escapePosixSingle(h.value)}'`);
+  }
+  if (body.type === 'json' || body.type === 'raw') {
+    lines.push(`  --data-raw '${escapePosixSingle(resolveVars(body.content || ''))}'`);
+  } else if (body.type === 'formUrlEncoded') {
+    for (const f of body.fields || []) {
+      if (f.enabled === false || !f.key) continue;
+      lines.push(`  --data-urlencode '${escapePosixSingle(resolveVars(f.key))}=${escapePosixSingle(resolveVars(f.value || ''))}'`);
+    }
+  } else if (body.type === 'multipart') {
+    for (const f of body.fields || []) {
+      if (f.enabled === false || !f.key) continue;
+      const k = escapePosixSingle(resolveVars(f.key));
+      const v = escapePosixSingle(resolveVars(f.value || ''));
+      lines.push(f.fieldType === 'file' ? `  -F '${k}=@${v}'` : `  -F '${k}=${v}'`);
+    }
+  } else if (body.type === 'binary' && body.filePath) {
+    lines.push(`  --data-binary '@${escapePosixSingle(resolveVars(body.filePath))}'`);
+  }
+  return lines.join(' \\\n');
+}
+
+function renderCodeSection(reqDoc) {
+  const snippet = generateRequestCode(reqDoc, state.codeTarget);
+  return `
+    <div class="section">
+      <div class="code-section-header">
+        <div class="section-title" style="margin:0">Code Snippet</div>
+        <div class="code-tabs">
+          ${CODEGEN_TARGETS.map(
+            (t) => `<button class="btn btn-sm code-tab-btn ${state.codeTarget === t.id ? 'active' : ''}" data-code-target="${t.id}">${esc(t.label)}</button>`
+          ).join('')}
+          <button class="btn btn-sm" id="copyCodeBtn">Copy</button>
+        </div>
+      </div>
+      <pre class="code-block" id="codeSnippetBlock">${esc(snippet)}</pre>
+    </div>
+  `;
+}
+
+function renderResponseMetaSection(meta) {
+  if (!Array.isArray(meta) || meta.length === 0) return '';
+  const rows = [];
+  function walk(fields, depth) {
+    for (const f of fields || []) {
+      const indentPx = depth * 18;
+      const prefix = depth > 0 ? '<span class="meta-branch">└─</span> ' : '';
+      rows.push(`
+        <tr>
+          <td>
+            <div class="meta-field-cell" style="padding-left:${indentPx}px">
+              ${prefix}<code>${esc(f.name)}</code>
+            </div>
+          </td>
+          <td><span class="pill">${esc(f.type || 'any')}</span></td>
+          <td><code class="meta-example">${esc(f.example || '—')}</code></td>
+          <td style="color:var(--muted)">${esc(f.description || '')}</td>
+        </tr>
+      `);
+      if (Array.isArray(f.children) && f.children.length > 0) {
+        walk(f.children, depth + 1);
+      }
+    }
+  }
+  walk(meta, 0);
+  return `
+    <div class="section">
+      <div class="section-title">Response Meta Info</div>
+      <table class="kv-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
+        <tbody>${rows.join('')}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function statusBadgeHtml(code, reason) {
+  const n = Number(code || 0);
+  let cls = 'status-other';
+  if (n >= 200 && n < 300) cls = 'status-2xx';
+  else if (n >= 300 && n < 400) cls = 'status-3xx';
+  else if (n >= 400) cls = 'status-err';
+  const label = reason ? `${n} ${reason}` : `${n}`;
+  return `<span class="status-badge ${cls}">${esc(label)}</span>`;
+}
+
+function formatExampleBody(body, contentType) {
+  const raw = String(body ?? '');
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('json') || raw.trim().startsWith('{') || raw.trim().startsWith('[')) {
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {}
+  }
+  return raw;
+}
+
+function renderResponseExamplesSection(examples) {
+  if (!Array.isArray(examples) || examples.length === 0) return '';
+  return `
+    <div class="section">
+      <div class="section-title">Response Examples (${examples.length})</div>
+      <div class="examples-list">
+        ${examples
+          .map(
+            (ex) => `
+          <div class="example-card">
+            <div class="example-header">
+              ${statusBadgeHtml(ex.statusCode, ex.reason)}
+              <span class="example-name">${esc(ex.name || 'Example')}</span>
+              ${ex.contentType ? `<span class="pill">${esc(ex.contentType)}</span>` : ''}
+            </div>
+            <pre class="code-block">${esc(formatExampleBody(ex.body, ex.contentType))}</pre>
+          </div>`
+          )
+          .join('')}
+      </div>
+    </div>
   `;
 }
 
@@ -472,18 +772,35 @@ function renderViewerLayout() {
   const copyCurlBtn = document.getElementById('copyCurlBtn');
   if (copyCurlBtn && state.selectedNode?.type === 'request') {
     copyCurlBtn.onclick = () => {
-      const d = state.selectedNode.data.doc;
-      const r = d.request || {};
-      const method = (r.method || 'GET').toUpperCase();
-      const url = buildUrl(d);
-      const headers = (r.headers || [])
-        .filter((h) => h.enabled !== false && h.key)
-        .map((h) => `-H "${h.key}: ${resolveVars(h.value || '')}"`)
-        .join(' ');
-      const curl = `curl -X ${method} "${url}" ${headers}`.trim();
-      navigator.clipboard?.writeText(curl);
+      const code = generateRequestCode(state.selectedNode.data.doc, 'curl');
+      navigator.clipboard?.writeText(code);
       copyCurlBtn.textContent = 'Copied!';
       setTimeout(() => (copyCurlBtn.textContent = 'Copy cURL'), 1500);
+    };
+  }
+
+  document.querySelectorAll('.code-tab-btn[data-code-target]').forEach((btn) => {
+    btn.onclick = () => {
+      state.codeTarget = btn.getAttribute('data-code-target') || 'curl';
+      if (state.selectedNode?.type === 'request') {
+        const block = document.getElementById('codeSnippetBlock');
+        if (block) {
+          block.textContent = generateRequestCode(state.selectedNode.data.doc, state.codeTarget);
+        }
+        document.querySelectorAll('.code-tab-btn[data-code-target]').forEach((b) => {
+          b.classList.toggle('active', b.getAttribute('data-code-target') === state.codeTarget);
+        });
+      }
+    };
+  });
+
+  const copyCodeBtn = document.getElementById('copyCodeBtn');
+  if (copyCodeBtn && state.selectedNode?.type === 'request') {
+    copyCodeBtn.onclick = () => {
+      const code = generateRequestCode(state.selectedNode.data.doc, state.codeTarget);
+      navigator.clipboard?.writeText(code);
+      copyCodeBtn.textContent = 'Copied!';
+      setTimeout(() => (copyCodeBtn.textContent = 'Copy'), 1500);
     };
   }
 }

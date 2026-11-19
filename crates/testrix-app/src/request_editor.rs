@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
@@ -27,9 +30,10 @@ use gpui_kit::{
 use testrix_core::{
     AuthNodeRef, CodegenTarget, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc,
     HttpResponseSnapshot, KeyValueRow, ProjectNode, RawBodyFormat, RequestBody,
-    RequestExecutionState, RequestNode, RequestSettings, detect_body_language,
-    extract_url_query_params, generate_request_code, materialize_request_doc,
-    rename_template_variables, resolve_request_doc_auth,
+    RequestExecutionState, RequestNode, RequestSettings, ResponseExample, ResponseMetaField,
+    detect_body_language, extract_and_merge_response_meta, extract_url_query_params,
+    generate_id, generate_request_code, materialize_request_doc, rename_template_variables,
+    resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -85,6 +89,8 @@ enum ResponseSection {
     Body,
     Headers,
     SentRequest,
+    Examples,
+    MetaInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +252,17 @@ pub(crate) struct RequestTabView {
     show_secret_headers: bool,
     active_cancel: Option<CancellationToken>,
     request_revision: u64,
+
+    // Saved response examples & extracted meta tree
+    response_examples: Vec<ResponseExample>,
+    selected_example_id: Option<String>,
+    example_name_input: Entity<InputState>,
+    example_body_editor: Entity<EditorState>,
+    syncing_example_ui: bool,
+    response_meta: Vec<ResponseMetaField>,
+    collapsed_meta_paths: HashSet<String>,
+    meta_desc_inputs: BTreeMap<String, Entity<InputState>>,
+    meta_desc_subscriptions: Vec<Subscription>,
 
     breadcrumb: SharedString,
     dirty: bool,
@@ -430,6 +447,21 @@ impl RequestTabView {
                 .default_value("")
         });
 
+        let response_examples = doc.request.response_examples.clone();
+        let selected_example_id = response_examples.first().map(|ex| ex.id.clone());
+        let example_name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Example name")
+                .default_value("")
+        });
+        let example_body_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("json")
+                .folding(true)
+                .default_value("")
+        });
+        let response_meta = doc.request.response_meta.clone();
+
         let breadcrumb = build_breadcrumb(project, parent_folders, &doc.name);
         let parent_folder_ids = parent_folders.iter().map(|f| f.doc.id.clone()).collect();
 
@@ -475,11 +507,22 @@ impl RequestTabView {
             show_secret_headers: false,
             active_cancel: None,
             request_revision: 0,
+            response_examples,
+            selected_example_id,
+            example_name_input,
+            example_body_editor,
+            syncing_example_ui: false,
+            response_meta,
+            collapsed_meta_paths: HashSet::new(),
+            meta_desc_inputs: BTreeMap::new(),
+            meta_desc_subscriptions: Vec::new(),
             breadcrumb,
             dirty: false,
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
+        view.sync_selected_example_ui(window, cx);
+        view.sync_meta_desc_inputs(window, cx);
         view.refresh_code_preview(window, cx);
         view
     }
@@ -597,6 +640,16 @@ impl RequestTabView {
                 }
             },
         ));
+        subs.push(cx.subscribe_in(
+            &self.example_name_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) && !this.syncing_example_ui {
+                    this.on_example_name_changed(window, cx);
+                }
+            },
+        ));
+
         self._subscriptions = subs;
     }
 
@@ -1037,6 +1090,8 @@ impl RequestTabView {
 
         doc.request.settings =
             RequestSettings::new(timeout_ms, self.follow_redirects, self.verify_tls);
+        doc.request.response_examples = self.response_examples.clone();
+        doc.request.response_meta = self.response_meta.clone();
         doc
     }
 
@@ -1729,150 +1784,337 @@ impl RequestTabView {
             )
     }
 
-    fn render_response_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let id_base = self.request_id.clone();
-        v_flex()
-            .size_full()
-            .min_h_0()
-            .bg(cx.theme().background)
-            .child(match &self.execution {
-                RequestExecutionState::Idle => v_flex()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .p_4()
-                    .child(
-                        Icon::new(LucideIcon::SendHorizontal)
-                            .large()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(div().text_sm().font_medium().child(crate::i18n::t("ready_to_send")))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(crate::i18n::t("ready_to_send_hint")),
-                    )
-                    .into_any_element(),
-                RequestExecutionState::Loading { .. } => v_flex()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .p_4()
-                    .child(Spinner::new().large())
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(crate::i18n::t("executing_request")),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("cancel-req-{id_base}")))
-                            .outline()
-                            .small()
-                            .label(crate::i18n::t("cancel_req"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.cancel_request(cx);
-                            })),
-                    )
-                    .into_any_element(),
-                RequestExecutionState::Cancelled => div()
-                    .p_4()
-                    .child(
-                        Alert::warning(
-                            SharedString::from(format!("resp-cancelled-{id_base}")),
-                            "The in-flight request was cancelled.",
-                        )
-                        .title("Request Cancelled"),
-                    )
-                    .into_any_element(),
-                RequestExecutionState::Failed { message } => div()
-                    .p_4()
-                    .child(
-                        Alert::error(
-                            SharedString::from(format!("resp-error-{id_base}")),
-                            message.clone(),
-                        )
-                        .title("Request Failed"),
-                    )
-                    .into_any_element(),
-                RequestExecutionState::Completed(snapshot) => self
-                    .render_completed_response(snapshot, cx)
-                    .into_any_element(),
-            })
+    fn save_current_response_as_example(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let RequestExecutionState::Completed(snapshot) = &self.execution else {
+            return;
+        };
+        let base_name = if snapshot.reason.trim().is_empty() {
+            format!("Example {}", snapshot.status_code)
+        } else {
+            format!("{} {}", snapshot.status_code, snapshot.reason)
+        };
+        let name = if self.response_examples.iter().any(|e| e.name == base_name) {
+            let mut idx = 2usize;
+            loop {
+                let candidate = format!("{base_name} ({idx})");
+                if !self.response_examples.iter().any(|e| e.name == candidate) {
+                    break candidate;
+                }
+                idx += 1;
+            }
+        } else {
+            base_name
+        };
+
+        let body = if snapshot.pretty_body.is_empty() {
+            snapshot.body_text.clone()
+        } else {
+            snapshot.pretty_body.clone()
+        };
+        let ex = ResponseExample::new(
+            generate_id("ex"),
+            name,
+            snapshot.status_code,
+            snapshot.reason.clone(),
+            snapshot.content_type.clone(),
+            snapshot.headers.clone(),
+            body.clone(),
+        );
+        let ex_id = ex.id.clone();
+        self.response_examples.push(ex);
+        self.selected_example_id = Some(ex_id);
+
+        let extracted = extract_and_merge_response_meta(
+            &mut self.response_meta,
+            &body,
+            snapshot.content_type.as_deref(),
+        );
+        self.sync_selected_example_ui(window, cx);
+        self.sync_meta_desc_inputs(window, cx);
+        self.on_edited(window, cx);
+
+        if extracted {
+            window.push_notification("Saved response example and updated meta info.", cx);
+        } else {
+            window.push_notification(
+                "Saved response example (skipped meta extraction: not JSON/XML).",
+                cx,
+            );
+        }
     }
 
-    fn render_completed_response(
-        &self,
-        snapshot: &HttpResponseSnapshot,
+    fn extract_meta_from_example(
+        &mut self,
+        example_id: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) {
+        let Some(ex) = self.response_examples.iter().find(|e| e.id == example_id) else {
+            return;
+        };
+        let body = ex.body.clone();
+        let ct = ex.content_type.clone();
+        if extract_and_merge_response_meta(&mut self.response_meta, &body, ct.as_deref()) {
+            self.sync_meta_desc_inputs(window, cx);
+            self.on_edited(window, cx);
+            window.push_notification("Extracted and merged meta info from example.", cx);
+        } else {
+            window.push_notification(
+                "Skipped meta extraction: response is not JSON or XML.",
+                cx,
+            );
+        }
+    }
+
+    fn merge_all_examples_into_meta(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut extracted_count = 0usize;
+        let examples = self.response_examples.clone();
+        for ex in &examples {
+            if extract_and_merge_response_meta(
+                &mut self.response_meta,
+                &ex.body,
+                ex.content_type.as_deref(),
+            ) {
+                extracted_count += 1;
+            }
+        }
+        if extracted_count > 0 {
+            self.sync_meta_desc_inputs(window, cx);
+            self.on_edited(window, cx);
+            window.push_notification(
+                format!("Merged meta info from {extracted_count} JSON/XML example(s)."),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                "No JSON or XML examples found to extract meta info.",
+                cx,
+            );
+        }
+    }
+
+    fn delete_example(
+        &mut self,
+        example_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.response_examples.retain(|e| e.id != example_id);
+        if self.selected_example_id.as_deref() == Some(example_id) {
+            self.selected_example_id = self.response_examples.first().map(|e| e.id.clone());
+        }
+        self.sync_selected_example_ui(window, cx);
+        self.on_edited(window, cx);
+    }
+
+    fn sync_selected_example_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self
+            .selected_example_id
+            .as_ref()
+            .and_then(|id| self.response_examples.iter().find(|e| &e.id == id))
+            .or_else(|| self.response_examples.first());
+
+        self.syncing_example_ui = true;
+        if let Some(ex) = selected {
+            let ex_id = ex.id.clone();
+            let ex_name = ex.name.clone();
+            let ex_body = ex.body.clone();
+            let lang = detect_body_language(&ex_body, ex.content_type.as_deref());
+            self.selected_example_id = Some(ex_id);
+            self.example_name_input.update(cx, |input, cx| {
+                input.set_value(ex_name, window, cx);
+            });
+            self.example_body_editor.update(cx, |editor, cx| {
+                editor.set_highlighter(lang, cx);
+                editor.set_value(ex_body, window, cx);
+            });
+        } else {
+            self.selected_example_id = None;
+            self.example_name_input.update(cx, |input, cx| {
+                input.set_value(String::new(), window, cx);
+            });
+            self.example_body_editor.update(cx, |editor, cx| {
+                editor.set_value(String::new(), window, cx);
+            });
+        }
+        self.syncing_example_ui = false;
+    }
+
+    fn on_example_name_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected_id) = self.selected_example_id.clone() else {
+            return;
+        };
+        let next_name = self.example_name_input.read(cx).value().to_string();
+        if let Some(ex) = self
+            .response_examples
+            .iter_mut()
+            .find(|e| e.id == selected_id)
+        {
+            ex.name = next_name;
+            self.on_edited(window, cx);
+        }
+    }
+
+    fn sync_meta_desc_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut flat = Vec::new();
+        collect_meta_paths(&self.response_meta, "", &mut flat);
+
+        let valid_paths: HashSet<String> = flat.iter().map(|(p, _)| p.clone()).collect();
+        self.meta_desc_inputs.retain(|k, _| valid_paths.contains(k));
+
+        for (path, desc) in flat {
+            if !self.meta_desc_inputs.contains_key(&path) {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Add description…")
+                        .default_value(desc)
+                });
+                let path_clone = path.clone();
+                let sub = cx.subscribe_in(
+                    &input,
+                    window,
+                    move |this, _, event: &InputEvent, window, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            this.on_meta_description_changed(&path_clone, window, cx);
+                        }
+                    },
+                );
+                self.meta_desc_subscriptions.push(sub);
+                self.meta_desc_inputs.insert(path, input);
+            }
+        }
+    }
+
+    fn on_meta_description_changed(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.meta_desc_inputs.get(path) else {
+            return;
+        };
+        let next_desc = input.read(cx).value().to_string();
+        if set_meta_description_by_path(&mut self.response_meta, path, "", &next_desc) {
+            self.on_edited(window, cx);
+        }
+    }
+
+    fn render_response_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let id_base = self.request_id.clone();
         let sections = [
             ResponseSection::Body,
             ResponseSection::Headers,
             ResponseSection::SentRequest,
+            ResponseSection::Examples,
+            ResponseSection::MetaInfo,
         ];
         let selected_ix = sections
             .iter()
             .position(|s| *s == self.active_response_section)
             .unwrap_or(0);
 
+        let headers_label = match &self.execution {
+            RequestExecutionState::Completed(snapshot) => format!(
+                "{} ({})",
+                crate::i18n::t("headers"),
+                snapshot.headers.len()
+            ),
+            _ => crate::i18n::t("headers").to_string(),
+        };
+        let examples_label = format!("Examples ({})", self.response_examples.len());
+        let meta_count = count_meta_fields(&self.response_meta);
+        let meta_label = if meta_count > 0 {
+            format!("Meta Info ({meta_count})")
+        } else {
+            "Meta Info".to_string()
+        };
+
         v_flex()
             .size_full()
             .min_h_0()
-            // Response metadata strip
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_4()
-                    .py_2()
-                    .justify_between()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
+            .bg(cx.theme().background)
+            .when_some(
+                match &self.execution {
+                    RequestExecutionState::Completed(snapshot) => Some(snapshot),
+                    _ => None,
+                },
+                |this, snapshot| {
+                    this.child(
                         h_flex()
-                            .gap_3()
-                            .child(status_badge(snapshot.status_code, &snapshot.reason))
+                            .w_full()
+                            .px_4()
+                            .py_2()
+                            .justify_between()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{} ms", snapshot.duration_ms)),
+                                h_flex()
+                                    .gap_3()
+                                    .child(status_badge(snapshot.status_code, &snapshot.reason))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("{} ms", snapshot.duration_ms)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format_bytes(snapshot.size_bytes)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(snapshot.http_version.clone()),
+                                    ),
                             )
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format_bytes(snapshot.size_bytes)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(snapshot.http_version.clone()),
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "save-ex-{id_base}"
+                                        )))
+                                        .outline()
+                                        .xsmall()
+                                        .icon(Icon::new(LucideIcon::Save))
+                                        .label("Save as Example")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_current_response_as_example(window, cx);
+                                        })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "copy-resp-{id_base}"
+                                        )))
+                                        .outline()
+                                        .xsmall()
+                                        .icon(IconName::Copy)
+                                        .label(crate::i18n::t("copy_body"))
+                                        .on_click(cx.listener({
+                                            let body = snapshot.pretty_body.clone();
+                                            move |_, _, window, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    body.clone(),
+                                                ));
+                                                window.push_notification(
+                                                    "Response body copied to clipboard.",
+                                                    cx,
+                                                );
+                                            }
+                                        })),
+                                    ),
                             ),
                     )
-                    .child(
-                        Button::new(SharedString::from(format!("copy-resp-{id_base}")))
-                            .outline()
-                            .xsmall()
-                            .icon(IconName::Copy)
-                            .label(crate::i18n::t("copy_body"))
-                            .on_click(cx.listener({
-                                let body = snapshot.pretty_body.clone();
-                                move |_, _, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(body.clone()));
-                                    window.push_notification(
-                                        "Response body copied to clipboard.",
-                                        cx,
-                                    );
-                                }
-                            })),
-                    ),
+                },
             )
             // Response tabs
             .child(
@@ -1889,19 +2131,120 @@ impl RequestTabView {
                         }
                     }))
                     .child(Tab::new().label(crate::i18n::t("body")))
-                    .child(Tab::new().label(format!(
-                        "{} ({})",
-                        crate::i18n::t("headers"),
-                        snapshot.headers.len()
-                    )))
-                    .child(Tab::new().label("Effective Request")),
+                    .child(Tab::new().label(headers_label))
+                    .child(Tab::new().label("Effective Request"))
+                    .child(Tab::new().label(examples_label))
+                    .child(Tab::new().label(meta_label)),
             )
-            // Response content
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
-                    .p_3()
+                    .when(
+                        self.active_response_section == ResponseSection::Examples,
+                        |this| this.child(self.render_examples_tab(cx)),
+                    )
+                    .when(
+                        self.active_response_section == ResponseSection::MetaInfo,
+                        |this| this.child(self.render_meta_info_tab(cx)),
+                    )
+                    .when(
+                        !matches!(
+                            self.active_response_section,
+                            ResponseSection::Examples | ResponseSection::MetaInfo
+                        ),
+                        |this| {
+                            this.child(match &self.execution {
+                                RequestExecutionState::Idle => v_flex()
+                                    .size_full()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_2()
+                                    .p_4()
+                                    .child(
+                                        Icon::new(LucideIcon::SendHorizontal)
+                                            .large()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_medium()
+                                            .child(crate::i18n::t("ready_to_send")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(crate::i18n::t("ready_to_send_hint")),
+                                    )
+                                    .into_any_element(),
+                                RequestExecutionState::Loading { .. } => v_flex()
+                                    .size_full()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .p_4()
+                                    .child(Spinner::new().large())
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(crate::i18n::t("executing_request")),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "cancel-req-{id_base}"
+                                        )))
+                                        .outline()
+                                        .small()
+                                        .label(crate::i18n::t("cancel_req"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_request(cx);
+                                        })),
+                                    )
+                                    .into_any_element(),
+                                RequestExecutionState::Cancelled => div()
+                                    .p_4()
+                                    .child(
+                                        Alert::warning(
+                                            SharedString::from(format!(
+                                                "resp-cancelled-{id_base}"
+                                            )),
+                                            "The in-flight request was cancelled.",
+                                        )
+                                        .title("Request Cancelled"),
+                                    )
+                                    .into_any_element(),
+                                RequestExecutionState::Failed { message } => div()
+                                    .p_4()
+                                    .child(
+                                        Alert::error(
+                                            SharedString::from(format!("resp-error-{id_base}")),
+                                            message.clone(),
+                                        )
+                                        .title("Request Failed"),
+                                    )
+                                    .into_any_element(),
+                                RequestExecutionState::Completed(snapshot) => self
+                                    .render_completed_response_body(snapshot, cx)
+                                    .into_any_element(),
+                            })
+                        },
+                    ),
+            )
+    }
+
+    fn render_completed_response_body(
+        &self,
+        snapshot: &HttpResponseSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        div()
+            .size_full()
+            .min_h_0()
+            .p_3()
                     .when(
                         self.active_response_section == ResponseSection::Body,
                         |this| {
@@ -2116,9 +2459,442 @@ impl RequestTabView {
                                     ),
                             )
                         },
+                    )
+    }
+
+    fn render_examples_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        if self.response_examples.is_empty() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .child("No Saved Response Examples"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Send a request and click \"Save as Example\" to store different response examples."),
+                )
+                .into_any_element();
+        }
+
+        let selected = self
+            .selected_example_id
+            .as_ref()
+            .and_then(|id| self.response_examples.iter().find(|e| &e.id == id))
+            .or_else(|| self.response_examples.first());
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(self.response_examples.iter().map(|ex| {
+                        let is_selected = selected.is_some_and(|s| s.id == ex.id);
+                        let ex_id = ex.id.clone();
+                        Button::new(SharedString::from(format!("ex-pill-{id_base}-{ex_id}")))
+                            .xsmall()
+                            .when(is_selected, |b| b.primary())
+                            .when(!is_selected, |b| b.outline())
+                            .label(format!("{} · {}", ex.status_code, ex.name))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.selected_example_id = Some(ex_id.clone());
+                                this.sync_selected_example_ui(window, cx);
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .when_some(selected, |this, ex| {
+                let ex_id_extract = ex.id.clone();
+                let ex_id_delete = ex.id.clone();
+                let ct_label = ex
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(status_badge(ex.status_code, &ex.reason))
+                        .child(
+                            div()
+                                .w(px(220.))
+                                .child(Input::new(&self.example_name_input).xsmall()),
+                        )
+                        .child(Tag::secondary().small().child(ct_label))
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "ex-extract-{id_base}-{ex_id_extract}"
+                            )))
+                            .outline()
+                            .xsmall()
+                            .icon(Icon::new(LucideIcon::Sparkles))
+                            .label("Extract Meta")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.extract_meta_from_example(&ex_id_extract, window, cx);
+                            })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "ex-del-{id_base}-{ex_id_delete}"
+                            )))
+                            .outline()
+                            .xsmall()
+                            .icon(IconName::Delete)
+                            .label("Delete")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_example(&ex_id_delete, window, cx);
+                            })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .overflow_hidden()
+                        .child(
+                            Editor::new(&self.example_body_editor)
+                                .size_full()
+                                .readonly(true),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_meta_info_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        let has_completed = matches!(self.execution, RequestExecutionState::Completed(_));
+        let has_examples = !self.response_examples.is_empty();
+        let has_meta = !self.response_meta.is_empty();
+
+        let mut rows = Vec::new();
+        self.collect_meta_tree_rows(&self.response_meta, "", 0, &mut rows, cx);
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Extracted response schema tree (JSON / XML) with editable descriptions"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(has_completed, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "meta-extract-cur-{id_base}"
+                                    )))
+                                    .outline()
+                                    .xsmall()
+                                    .icon(Icon::new(LucideIcon::Sparkles))
+                                    .label("Extract Current")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let RequestExecutionState::Completed(snapshot) =
+                                            &this.execution
+                                        {
+                                            let body = if snapshot.pretty_body.is_empty() {
+                                                snapshot.body_text.clone()
+                                            } else {
+                                                snapshot.pretty_body.clone()
+                                            };
+                                            let ct = snapshot.content_type.clone();
+                                            if extract_and_merge_response_meta(
+                                                &mut this.response_meta,
+                                                &body,
+                                                ct.as_deref(),
+                                            ) {
+                                                this.sync_meta_desc_inputs(window, cx);
+                                                this.on_edited(window, cx);
+                                                window.push_notification(
+                                                    "Extracted and merged response meta info.",
+                                                    cx,
+                                                );
+                                            } else {
+                                                window.push_notification(
+                                                    "Skipped meta extraction: response is not JSON or XML.",
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    })),
+                                )
+                            })
+                            .when(has_examples, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "meta-merge-ex-{id_base}"
+                                    )))
+                                    .outline()
+                                    .xsmall()
+                                    .icon(IconName::RefreshCw)
+                                    .label("Merge Examples")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.merge_all_examples_into_meta(window, cx);
+                                    })),
+                                )
+                            })
+                            .when(has_meta, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "meta-clear-{id_base}"
+                                    )))
+                                    .outline()
+                                    .xsmall()
+                                    .icon(IconName::Delete)
+                                    .label("Clear")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.response_meta.clear();
+                                        this.collapsed_meta_paths.clear();
+                                        this.sync_meta_desc_inputs(window, cx);
+                                        this.on_edited(window, cx);
+                                    })),
+                                )
+                            }),
                     ),
             )
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_medium()
+                                .child("No Response Meta Info"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Save a JSON or XML response as an example, or click \"Extract Current\" on a JSON/XML response."),
+                        ),
+                )
+            })
+            .when(!rows.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .px_3()
+                                .py_1p5()
+                                .gap_3()
+                                .bg(cx.theme().table_head)
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(div().w(px(240.)).child("Field"))
+                                .child(div().w(px(120.)).child("Type"))
+                                .child(div().w(px(180.)).child("Example"))
+                                .child(div().flex_1().min_w_0().child("Description")),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scrollbar()
+                                .children(rows),
+                        ),
+                )
+            })
     }
+
+    fn collect_meta_tree_rows(
+        &self,
+        fields: &[ResponseMetaField],
+        prefix: &str,
+        depth: usize,
+        out: &mut Vec<gpui_kit::AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let id_base = self.request_id.clone();
+        for field in fields {
+            let path = if prefix.is_empty() {
+                field.name.clone()
+            } else {
+                format!("{prefix}.{}", field.name)
+            };
+            let has_children = !field.children.is_empty();
+            let is_collapsed = self.collapsed_meta_paths.contains(&path);
+            let row_ix = out.len();
+            let toggle_path = path.clone();
+
+            let row = h_flex()
+                .w_full()
+                .px_3()
+                .py_1()
+                .gap_3()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .when(row_ix % 2 == 1, |r| r.bg(cx.theme().table_even))
+                .child(
+                    h_flex()
+                        .w(px(240.))
+                        .items_center()
+                        .gap_1()
+                        .pl(px((depth as f32) * 16.0))
+                        .child(if has_children {
+                            Button::new(SharedString::from(format!(
+                                "meta-toggle-{id_base}-{row_ix}"
+                            )))
+                            .ghost()
+                            .xsmall()
+                            .icon(if is_collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.collapsed_meta_paths.contains(&toggle_path) {
+                                    this.collapsed_meta_paths.remove(&toggle_path);
+                                } else {
+                                    this.collapsed_meta_paths.insert(toggle_path.clone());
+                                }
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                        } else {
+                            div().w(px(20.)).into_any_element()
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .font_semibold()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child(field.name.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(120.))
+                        .child(Tag::secondary().small().child(field.field_type.clone())),
+                )
+                .child(
+                    div()
+                        .w(px(180.))
+                        .min_w_0()
+                        .text_xs()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .child(if field.example.is_empty() {
+                            "—".to_string()
+                        } else {
+                            field.example.clone()
+                        }),
+                )
+                .child(
+                    div().flex_1().min_w_0().when_some(
+                        self.meta_desc_inputs.get(&path),
+                        |d, input| d.child(Input::new(input).xsmall()),
+                    ),
+                )
+                .into_any_element();
+
+            out.push(row);
+
+            if has_children && !is_collapsed {
+                self.collect_meta_tree_rows(&field.children, &path, depth + 1, out, cx);
+            }
+        }
+    }
+}
+
+fn count_meta_fields(fields: &[ResponseMetaField]) -> usize {
+    fields
+        .iter()
+        .map(|f| 1 + count_meta_fields(&f.children))
+        .sum()
+}
+
+fn collect_meta_paths(
+    fields: &[ResponseMetaField],
+    prefix: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    for field in fields {
+        let path = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        out.push((path.clone(), field.description.clone()));
+        if !field.children.is_empty() {
+            collect_meta_paths(&field.children, &path, out);
+        }
+    }
+}
+
+fn set_meta_description_by_path(
+    fields: &mut [ResponseMetaField],
+    target_path: &str,
+    prefix: &str,
+    next_desc: &str,
+) -> bool {
+    for field in fields {
+        let path = if prefix.is_empty() {
+            field.name.clone()
+        } else {
+            format!("{prefix}.{}", field.name)
+        };
+        if path == target_path {
+            if field.description != next_desc {
+                field.description = next_desc.to_string();
+                return true;
+            }
+            return false;
+        }
+        if !field.children.is_empty()
+            && set_meta_description_by_path(&mut field.children, target_path, &path, next_desc)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Render for RequestTabView {

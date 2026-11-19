@@ -10,6 +10,7 @@ mod model;
 mod openapi;
 mod postman;
 mod response;
+mod response_meta;
 mod search;
 mod template;
 
@@ -18,7 +19,7 @@ pub use auth::{
     AuthChainStep, AuthNodeRef, ResolvedAuth, resolve_folder_auth, resolve_folder_chain_auth,
     resolve_project_auth, resolve_request_auth, resolve_request_doc_auth,
 };
-pub use codegen::{CodegenTarget, generate_request_code};
+pub use codegen::{CodegenTarget, generate_request_code, parse_request_script};
 pub use error::CoreError;
 pub use materialize::{
     PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,
@@ -40,6 +41,10 @@ pub use postman::{
 pub use response::{
     HttpResponseSnapshot, RequestExecutionState, ResponseHeader, SentRequestSnapshot,
     detect_body_language, format_pretty_body,
+};
+pub use response_meta::{
+    ResponseExample, ResponseMetaField, extract_and_merge_response_meta, extract_response_meta,
+    merge_response_meta,
 };
 pub use search::{FilteredFolder, FilteredProject, filter_workspace};
 pub use template::{

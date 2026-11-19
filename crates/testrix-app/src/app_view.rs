@@ -24,10 +24,11 @@ use gpui_kit::{
         },
         form::{Field, Form},
         h_flex,
-        input::{Input, InputState},
+        input::{Input, InputState, Textarea, TextareaState},
         menu::{ContextMenuExt as _, PopupMenuItem},
         resizable::{h_resizable, resizable_panel},
         select::{Select, SelectEvent, SelectItem, SelectState},
+        spinner::Spinner,
         status_bar::StatusBar,
         switch::Switch,
         tab::{Tab, TabBar},
@@ -40,13 +41,14 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthConfig, AuthNodeRef, EnvironmentDoc, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
-    ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
+    HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
     merge_environments_into_bundle, parse_apifox, parse_openapi_3_0, parse_postman_collection,
-    parse_postman_zip, rename_template_variables, resolve_request_auth,
+    parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
 };
 use testrix_http::{
-    HttpRunner, ShareChannel, dispatch_share_future, login_testrix_server,
-    revoke_cloudflare_r2_share, revoke_testrix_server_share,
+    HttpRunner, ShareChannel, ShareFile, collect_project_yaml_files, dispatch_share_future,
+    login_testrix_server, revoke_cloudflare_r2_share, revoke_testrix_server_share,
+    upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
     ShareSettings, clear_saved_responses, create_environment, create_folder, create_project,
@@ -161,6 +163,10 @@ pub struct TestrixApp {
     remember_responses: bool,
     share_settings: ShareSettings,
     active_shares: Vec<ActiveShareRecord>,
+    share_sync_count: usize,
+    quit_after_sync: bool,
+    force_quit: bool,
+    exit_prompt_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -227,8 +233,36 @@ impl TestrixApp {
             remember_responses: cfg.remember_responses,
             share_settings: ShareSettings::from(&cfg),
             active_shares: Vec::new(),
+            share_sync_count: 0,
+            quit_after_sync: false,
+            force_quit: false,
+            exit_prompt_open: false,
             _subscriptions: Vec::new(),
         };
+
+        let app_weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let Some(app_entity) = app_weak.upgrade() else {
+                return true;
+            };
+            let (force_quit, syncing, prompt_open) = {
+                let app = app_entity.read(cx);
+                (
+                    app.force_quit,
+                    app.share_sync_count > 0,
+                    app.exit_prompt_open,
+                )
+            };
+            if force_quit || !syncing {
+                return true;
+            }
+            if !prompt_open {
+                app_entity.update(cx, |this, cx| {
+                    this.open_exit_sync_dialog(window, cx);
+                });
+            }
+            false
+        });
 
         app.wire_subscriptions(window, cx);
         app.explorer.update(cx, |panel, cx| {
@@ -732,6 +766,8 @@ impl TestrixApp {
                         window.push_notification(format!("Failed saving YAML request: {err}"), cx);
                         return;
                     }
+                    let req_file_path = req_node.file_path.clone();
+                    let changed_file = share_file_from_disk(&proj.root_dir, &req_file_path);
                     let target_key = format!("req:{request_id}");
                     if let Some(WorkbenchTab::Request(tab)) =
                         self.tabs.iter().find(|t| t.key(cx) == target_key)
@@ -743,6 +779,7 @@ impl TestrixApp {
                         panel.reveal_and_select(&target_key, cx);
                     });
                     self.refresh_dirty_indicators(cx);
+                    self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
                 }
             }
             RequestTabEvent::OpenAuthSource { project_id, node } => {
@@ -825,12 +862,18 @@ impl TestrixApp {
                             }
                         }
                     }
+                    let changed_file = if base_changed {
+                        None
+                    } else {
+                        share_file_from_disk(&proj.root_dir, &proj.manifest_path)
+                    };
                     self.explorer.update(cx, |panel, cx| {
                         panel.set_workspace(self.workspace.clone(), cx);
                         panel.reveal_and_select(&target_key, cx);
                     });
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
+                    self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
                 }
             }
             ContainerTabEvent::SaveFolder {
@@ -853,12 +896,15 @@ impl TestrixApp {
                     {
                         tab.update(cx, |view, cx| view.mark_saved(cx));
                     }
+                    let folder_manifest_path = folder.manifest_path.clone();
+                    let changed_file = share_file_from_disk(&proj.root_dir, &folder_manifest_path);
                     self.explorer.update(cx, |panel, cx| {
                         panel.set_workspace(self.workspace.clone(), cx);
                         panel.reveal_and_select(&target_key, cx);
                     });
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
+                    self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
                 }
             }
             ContainerTabEvent::OpenAuthSource(node) => {
@@ -881,6 +927,186 @@ impl TestrixApp {
                 cx.notify();
             }
         }
+    }
+
+    fn sync_shared_project_after_save(
+        &mut self,
+        project_id: &str,
+        changed_file: Option<ShareFile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<ActiveShareRecord> = self
+            .active_shares
+            .iter()
+            .filter(|s| s.project_id == project_id && s.channel != ShareChannel::LocalNetwork)
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let Some(proj) = self.workspace.find_project(project_id) else {
+            return;
+        };
+        let project_name = proj.doc.name.clone();
+        let project_root = proj.root_dir.clone();
+        let settings = self.share_settings.clone();
+
+        for share in targets {
+            let files = match share.channel {
+                ShareChannel::TestrixServer => match collect_project_yaml_files(&project_root) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        window.push_notification(format!("Share sync failed: {err}"), cx);
+                        continue;
+                    }
+                },
+                ShareChannel::CloudflareR2 => {
+                    if let Some(file) = changed_file.clone() {
+                        vec![file]
+                    } else {
+                        match collect_project_yaml_files(&project_root) {
+                            Ok(f) => f,
+                            Err(err) => {
+                                window.push_notification(format!("Share sync failed: {err}"), cx);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                ShareChannel::LocalNetwork => continue,
+            };
+
+            let rx = match share.channel {
+                ShareChannel::TestrixServer => dispatch_share_future(upload_to_testrix_server(
+                    settings.share_server_url.clone(),
+                    settings.share_token.clone(),
+                    share.project_slug.clone(),
+                    project_name.clone(),
+                    settings.share_access_token.clone(),
+                    files,
+                )),
+                ShareChannel::CloudflareR2 => dispatch_share_future(upload_to_cloudflare_r2(
+                    settings.cloudflare_account_id.clone(),
+                    settings.cloudflare_r2_bucket.clone(),
+                    settings.cloudflare_api_token.clone(),
+                    settings.cloudflare_pages_url.clone(),
+                    share.project_slug.clone(),
+                    settings.share_access_token.clone(),
+                    files,
+                )),
+                ShareChannel::LocalNetwork => unreachable!(),
+            };
+
+            self.share_sync_count += 1;
+            cx.notify();
+
+            cx.spawn_in(window, async move |weak_self, cx| {
+                let outcome = rx.await;
+                _ = weak_self.update_in(cx, |this, window, cx| {
+                    this.share_sync_count = this.share_sync_count.saturating_sub(1);
+                    match outcome {
+                        Ok(Ok(res)) => {
+                            info!(
+                                project = %share.project_slug,
+                                channel = %res.channel.label(),
+                                files = res.files_uploaded,
+                                "background share sync completed"
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            window.push_notification(format!("Share sync failed: {err}"), cx);
+                        }
+                        Err(_) => {
+                            window.push_notification(
+                                "Share sync failed: upload task cancelled".to_string(),
+                                cx,
+                            );
+                        }
+                    }
+                    if this.share_sync_count == 0 && this.quit_after_sync {
+                        cx.quit();
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn request_app_exit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.force_quit || self.share_sync_count == 0 {
+            cx.quit();
+        } else if !self.exit_prompt_open {
+            self.open_exit_sync_dialog(window, cx);
+        }
+    }
+
+    fn open_exit_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_prompt_open = true;
+        let app_entity = cx.entity();
+        let syncing_count = self.share_sync_count;
+        window.open_dialog(cx, move |dialog, _, _| {
+            let app_cancel = app_entity.clone();
+            let app_now = app_entity.clone();
+            let app_wait = app_entity.clone();
+            dialog
+                .title("Background Share Sync in Progress")
+                .width(px(460.))
+                .child(
+                    div().text_sm().child(format!(
+                        "{syncing_count} background share upload(s) are still running. Do you want to wait for them to finish before exiting?"
+                    )),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("exit-sync-cancel")
+                                    .outline()
+                                    .label("Cancel")
+                                    .on_click(move |_, _, cx| {
+                                        app_cancel.update(cx, |this, cx| {
+                                            this.exit_prompt_open = false;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("exit-sync-now")
+                                    .danger()
+                                    .label("Exit Now")
+                                    .on_click(move |_, _, cx| {
+                                        app_now.update(cx, |this, cx| {
+                                            this.force_quit = true;
+                                            this.exit_prompt_open = false;
+                                            cx.quit();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("exit-sync-wait")
+                                    .primary()
+                                    .label("Wait & Exit")
+                                    .on_click(move |_, _, cx| {
+                                        app_wait.update(cx, |this, cx| {
+                                            this.exit_prompt_open = false;
+                                            this.quit_after_sync = true;
+                                            if this.share_sync_count == 0 {
+                                                cx.quit();
+                                            } else {
+                                                cx.notify();
+                                            }
+                                        });
+                                    }),
+                            ),
+                        ),
+                )
+        });
     }
 
     fn open_auth_source(
@@ -2172,6 +2398,11 @@ impl TestrixApp {
                 .placeholder("{{base_url}}/v1/orders")
                 .default_value("{{base_url}}/get")
         });
+        let script_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(5)
+                .placeholder("Optional: paste cURL, wget, or PowerShell (Invoke-WebRequest) command…")
+        });
         let app_entity = cx.entity();
         let initial_focus = Cell::new(true);
 
@@ -2182,19 +2413,84 @@ impl TestrixApp {
             let app_ok = app_entity.clone();
             let name_ok = name_input.clone();
             let url_ok = url_input.clone();
+            let script_ok = script_input.clone();
+            let name_parse = name_input.clone();
+            let url_parse = url_input.clone();
+            let script_parse = script_input.clone();
             let pid = project_id.clone();
             let fid = folder_id.clone();
 
+            let script_preview = script_input.read(cx).value().to_string();
+            let parsed_preview = if script_preview.trim().is_empty() {
+                None
+            } else {
+                Some(parse_request_script(&script_preview))
+            };
+
             dialog
                 .title("New HTTP Request")
+                .width(px(540.))
                 .child(
                     Form::new()
                         .child(Field::new().label("Name").child(Input::new(&name_input)))
-                        .child(Field::new().label("URL").child(Input::new(&url_input))),
+                        .child(Field::new().label("URL").child(Input::new(&url_input)))
+                        .child(
+                            Field::new()
+                                .label("Import from cURL / wget / PowerShell (Optional)")
+                                .child(Textarea::new(&script_input)),
+                        )
+                        .when_some(parsed_preview, |form, res| {
+                            form.child(
+                                Field::new().child(match res {
+                                    Ok(spec) => div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!(
+                                            "Detected: {} {} ({} param(s), {} header(s))",
+                                            spec.method.as_str(),
+                                            spec.url,
+                                            spec.params.len(),
+                                            spec.headers.len()
+                                        )),
+                                    Err(err) => div()
+                                        .text_xs()
+                                        .text_color(cx.theme().danger)
+                                        .child(format!("Parse error: {err}")),
+                                }),
+                            )
+                        }),
                 )
                 .footer(
                     DialogFooter::new()
                         .gap_2()
+                        .child(
+                            Button::new("new-req-parse")
+                                .label("Parse Script")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    let raw = script_parse.read(cx).value().to_string();
+                                    match parse_request_script(&raw) {
+                                        Ok(spec) => {
+                                            let url_val = spec.url.clone();
+                                            url_parse.update(cx, |s, cx| {
+                                                s.set_value(url_val, window, cx);
+                                            });
+                                            if name_parse.read(cx).value().trim().is_empty() {
+                                                let inferred = infer_request_name(&spec);
+                                                name_parse.update(cx, |s, cx| {
+                                                    s.set_value(inferred, window, cx);
+                                                });
+                                            }
+                                        }
+                                        Err(err) => {
+                                            window.push_notification(
+                                                format!("Failed parsing script: {err}"),
+                                                cx,
+                                            );
+                                        }
+                                    }
+                                }),
+                        )
                         .child(
                             DialogClose::new()
                                 .child(Button::new("new-req-cancel").label("Cancel").outline()),
@@ -2204,23 +2500,109 @@ impl TestrixApp {
                                 .label("Create")
                                 .primary()
                                 .on_click(move |_, window, cx| {
-                                    let name = name_ok.read(cx).value().trim().to_string();
-                                    let url = url_ok.read(cx).value().trim().to_string();
-                                    app_ok.update(cx, |this, cx| {
-                                        this.create_request_node(
-                                            &pid,
-                                            fid.as_deref(),
-                                            &name,
-                                            &url,
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                    window.close_dialog(cx);
+                                    let raw_name = name_ok.read(cx).value().trim().to_string();
+                                    let raw_url = url_ok.read(cx).value().trim().to_string();
+                                    let raw_script = script_ok.read(cx).value().to_string();
+
+                                    if !raw_script.trim().is_empty() {
+                                        match parse_request_script(&raw_script) {
+                                            Ok(spec) => {
+                                                let name = if raw_name.is_empty() {
+                                                    infer_request_name(&spec)
+                                                } else {
+                                                    raw_name
+                                                };
+                                                app_ok.update(cx, |this, cx| {
+                                                    this.create_request_from_spec(
+                                                        &pid,
+                                                        fid.as_deref(),
+                                                        &name,
+                                                        spec,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                                window.close_dialog(cx);
+                                            }
+                                            Err(err) => {
+                                                window.push_notification(
+                                                    format!("Failed parsing script: {err}"),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        app_ok.update(cx, |this, cx| {
+                                            this.create_request_node(
+                                                &pid,
+                                                fid.as_deref(),
+                                                &raw_name,
+                                                &raw_url,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                        window.close_dialog(cx);
+                                    }
                                 }),
                         ),
                 )
         });
+    }
+
+    fn create_request_from_spec(
+        &mut self,
+        project_id: &str,
+        folder_id: Option<&str>,
+        name: &str,
+        spec: HttpRequestSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(proj) = self.workspace.find_project(project_id) else {
+            return;
+        };
+        let parent_dir = folder_id
+            .and_then(|fid| proj.find_folder(fid))
+            .and_then(|chain| chain.last().map(|f| f.dir_path.clone()))
+            .unwrap_or_else(|| proj.root_dir.clone());
+
+        match create_request(&parent_dir, name, spec.method, &spec.url) {
+            Ok(mut req_node) => {
+                req_node.doc.request = spec;
+                if let Err(err) = save_request(&req_node) {
+                    window.push_notification(format!("Failed saving parsed request: {err}"), cx);
+                    return;
+                }
+                let req_id = req_node.doc.id.clone();
+                let req_file_path = req_node.file_path.clone();
+                let changed_file = share_file_from_disk(&proj.root_dir, &req_file_path);
+                if let Some(proj_mut) = self.workspace.find_project_mut(project_id) {
+                    if let Some(fid) = folder_id
+                        && let Some(folder_mut) = proj_mut.find_folder_mut(fid)
+                    {
+                        folder_mut.requests.push(req_node);
+                    } else {
+                        proj_mut.requests.push(req_node);
+                    }
+                }
+                self.explorer.update(cx, |panel, cx| {
+                    panel.set_workspace(self.workspace.clone(), cx);
+                });
+                self.open_node(
+                    ExplorerNode::Request {
+                        project_id: project_id.to_string(),
+                        request_id: req_id,
+                    },
+                    window,
+                    cx,
+                );
+                self.sync_shared_project_after_save(project_id, changed_file, window, cx);
+            }
+            Err(err) => {
+                window.push_notification(format!("Failed creating request: {err}"), cx);
+            }
+        }
     }
 
     fn create_request_node(
@@ -2723,7 +3105,7 @@ impl Render for TestrixApp {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_app_exit(window, cx)))
             .on_action(cx.listener(|this, _: &SaveActive, _, cx| this.save_active_tab(cx)))
             .on_action(cx.listener(|this, _: &SendRequest, window, cx| {
                 this.send_active_request(window, cx);
@@ -2929,6 +3311,22 @@ impl Render for TestrixApp {
                         project_count,
                         total_requests
                     ))
+                    .when(self.share_sync_count > 0, |sb| {
+                        sb.right(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(cx.theme().primary)
+                                .child(Spinner::new().xsmall())
+                                .child(Icon::new(IconName::RefreshCw).xsmall())
+                                .child(if self.share_sync_count == 1 {
+                                    "Syncing share…".to_string()
+                                } else {
+                                    format!("Syncing {} shares…", self.share_sync_count)
+                                }),
+                        )
+                    })
                     .right(active_auth_summary)
                     .right(format!("Profile: {active_env_name}")),
             )
@@ -3365,6 +3763,37 @@ fn propagate_base_url_in_project(proj: &mut ProjectNode, old_base: &str, new_bas
     for folder in &mut proj.folders {
         propagate_base_url_in_folder(folder, old_base, new_base);
     }
+}
+
+fn infer_request_name(spec: &HttpRequestSpec) -> String {
+    let path_part = spec
+        .url
+        .split('?')
+        .next()
+        .unwrap_or(&spec.url)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if path_part.is_empty() || path_part.contains("://") {
+        format!("{} Request", spec.method.as_str())
+    } else {
+        format!("{} {}", spec.method.as_str(), path_part)
+    }
+}
+
+fn share_file_from_disk(
+    project_root: &std::path::Path,
+    file_path: &std::path::Path,
+) -> Option<ShareFile> {
+    let rel = file_path.strip_prefix(project_root).ok()?;
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let content = std::fs::read_to_string(file_path).ok()?;
+    Some(ShareFile {
+        path: rel_str,
+        content,
+    })
 }
 
 #[cfg(test)]

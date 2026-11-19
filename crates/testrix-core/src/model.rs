@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::CoreError;
+use crate::{
+    error::CoreError,
+    response_meta::{ResponseExample, ResponseMetaField},
+};
 
 /// Canonical `apiVersion` for all Testrix YAML documents.
 pub const API_VERSION: &str = "testrix.io/v1";
@@ -473,6 +476,10 @@ pub struct HttpRequestSpec {
     pub post_script: String,
     #[serde(default)]
     pub settings: RequestSettings,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_examples: Vec<ResponseExample>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_meta: Vec<ResponseMetaField>,
 }
 
 impl Default for HttpRequestSpec {
@@ -486,6 +493,8 @@ impl Default for HttpRequestSpec {
             body: RequestBody::None,
             post_script: String::new(),
             settings: RequestSettings::default(),
+            response_examples: Vec::new(),
+            response_meta: Vec::new(),
         }
     }
 }

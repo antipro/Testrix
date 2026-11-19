@@ -9,7 +9,10 @@ use std::{
 };
 
 use gpui_kit::assets::AllAssets;
-use testrix_app::{init_app, open_main_window};
+use testrix_app::{
+    cli_api::{execute_cli_api, format_api_error, is_api_resource},
+    init_app, open_main_window,
+};
 use testrix_storage::{
     default_workspace_dir, init_or_load_config, load_project, load_workspace, validate_yaml_file,
 };
@@ -20,6 +23,7 @@ struct CliArgs {
     workspace: Option<PathBuf>,
     check: bool,
     check_paths: Vec<PathBuf>,
+    api_args: Vec<String>,
     help: bool,
 }
 
@@ -45,6 +49,10 @@ where
             }
         } else if arg == "-h" || arg == "--help" {
             parsed.help = true;
+        } else if is_api_resource(&arg) {
+            parsed.api_args.push(arg);
+            parsed.api_args.extend(iter);
+            break;
         } else if !arg.starts_with('-') {
             parsed.check_paths.push(PathBuf::from(arg));
         }
@@ -129,11 +137,19 @@ Testrix — YAML API Workbench
 
 Usage:
   testrix [OPTIONS] [PATH ...]
+  testrix [--workspace <DIR>] <RESOURCE> <ACTION> [FLAGS]
 
 Options:
-  --workspace <DIR>       Open or check the specified workspace directory
+  --workspace <DIR>       Open or operate on the specified workspace directory
   --check [PATH ...]      Validate Testrix YAML file(s), project, or workspace in console mode
-  -h, --help              Print this help message and exit"
+  -h, --help              Print this help message and exit
+
+CLI API Resources (validated JSON CRUD):
+  project  <list|get|create|update|delete>
+  folder   <list|create|update|delete>
+  item     <list|get|create|update|delete>
+  profile  <list|get|create|update|delete|merge>
+  var      <list|get|create|update|set|delete>"
     );
 }
 
@@ -147,6 +163,20 @@ fn main() -> ExitCode {
 
     if cli.check {
         return run_check(&cli);
+    }
+
+    if !cli.api_args.is_empty() {
+        let workspace_dir = resolve_startup_workspace_dir(cli.workspace);
+        return match execute_cli_api(&workspace_dir, &cli.api_args) {
+            Ok(json_out) => {
+                println!("{json_out}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("{}", format_api_error(&err));
+                ExitCode::FAILURE
+            }
+        };
     }
 
     tracing_subscriber::fmt()

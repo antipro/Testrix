@@ -10,6 +10,7 @@ use gpui_kit::{
         h_flex,
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
+        select::{Select, SelectItem, SelectState},
         tab::{Tab, TabBar},
         v_flex,
     },
@@ -48,6 +49,24 @@ pub(crate) enum EnvEditorEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeProfileOption {
+    id: String,
+    name: String,
+}
+
+impl SelectItem for MergeProfileOption {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.name.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+}
+
 /// Persistent editor view rendered inside the Environment Profiles sheet.
 pub(crate) struct EnvEditorView {
     profiles: Vec<EnvironmentNode>,
@@ -55,6 +74,9 @@ pub(crate) struct EnvEditorView {
     active_env_id: Option<String>,
     profile_name_input: Entity<InputState>,
     new_profile_input: Entity<InputState>,
+    merge_panel_open: bool,
+    merge_overwrite: bool,
+    merge_source_select: Entity<SelectState<Vec<MergeProfileOption>>>,
     rows: Vec<EnvVarRowState>,
     next_row_id: u64,
     dirty: bool,
@@ -69,6 +91,8 @@ impl EnvEditorView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Profile name"));
         let new_profile_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("New profile name…"));
+        let merge_source_select =
+            cx.new(|cx| SelectState::new(Vec::<MergeProfileOption>::new(), None, window, cx));
 
         let sub = cx.subscribe(&profile_name_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -83,6 +107,9 @@ impl EnvEditorView {
             active_env_id: None,
             profile_name_input,
             new_profile_input,
+            merge_panel_open: false,
+            merge_overwrite: false,
+            merge_source_select,
             rows: Vec::new(),
             next_row_id: 1,
             dirty: false,
@@ -128,6 +155,7 @@ impl EnvEditorView {
         self.editing_env_id = env_id.map(str::to_string);
         self.rows.clear();
         self.dirty = false;
+        self.refresh_merge_source_options(window, cx);
 
         if let Some(profile) = env_id.and_then(|id| self.profiles.iter().find(|p| p.doc.id == id)) {
             let name = profile.doc.name.clone();
@@ -192,6 +220,93 @@ impl EnvEditorView {
             description,
             _subscriptions: subs,
         }
+    }
+
+    fn refresh_merge_source_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editing_id = self.editing_env_id.as_deref();
+        let options: Vec<MergeProfileOption> = self
+            .profiles
+            .iter()
+            .filter(|p| Some(p.doc.id.as_str()) != editing_id)
+            .map(|p| MergeProfileOption {
+                id: p.doc.id.clone(),
+                name: p.doc.name.clone(),
+            })
+            .collect();
+        let has_options = !options.is_empty();
+        if !has_options {
+            self.merge_panel_open = false;
+        }
+        self.merge_source_select.update(cx, |sel, cx| {
+            sel.set_items(options, window, cx);
+            if has_options {
+                sel.set_selected_index(Some(gpui_kit::component::IndexPath::default().row(0)), window, cx);
+            }
+        });
+    }
+
+    fn merge_from_selected_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source_id) = self.merge_source_select.read(cx).selected_value().cloned() else {
+            window.push_notification("Select a profile to merge variables from.", cx);
+            return;
+        };
+        let Some(source_profile) = self.profiles.iter().find(|p| p.doc.id == source_id) else {
+            return;
+        };
+        let source_name = source_profile.doc.name.clone();
+        let source_vars = source_profile.doc.variables.clone();
+
+        let mut added = 0usize;
+        let mut updated = 0usize;
+
+        for src_var in &source_vars {
+            let src_key = src_var.key.trim();
+            if src_key.is_empty() {
+                continue;
+            }
+            let existing_ix = self
+                .rows
+                .iter()
+                .position(|r| r.key.read(cx).value().trim() == src_key);
+
+            if let Some(ix) = existing_ix {
+                if self.merge_overwrite {
+                    let row = &mut self.rows[ix];
+                    row.enabled = src_var.enabled;
+                    row.secret = src_var.secret;
+                    let val = src_var.value.clone();
+                    let desc = src_var.description.clone();
+                    let masked = src_var.secret;
+                    row.value.update(cx, |s, cx| {
+                        s.set_masked(masked, window, cx);
+                        s.set_value(val, window, cx);
+                    });
+                    row.description.update(cx, |s, cx| {
+                        s.set_value(desc, window, cx);
+                    });
+                    updated += 1;
+                }
+            } else {
+                let row = self.build_row(src_var, window, cx);
+                self.rows.push(row);
+                added += 1;
+            }
+        }
+
+        if added > 0 || updated > 0 {
+            self.dirty = true;
+            self.merge_panel_open = false;
+            window.push_notification(
+                format!("Merged from '{source_name}': {added} added, {updated} updated."),
+                cx,
+            );
+        } else {
+            window.push_notification(
+                format!("No new variables to merge from '{source_name}'."),
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     fn add_variable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -489,6 +604,60 @@ impl Render for EnvEditorView {
                             )
                     })),
             )
+            // Merge from other profile panel (collapsible)
+            .when(self.merge_panel_open && self.profiles.len() > 1, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .p_2()
+                        .gap_2()
+                        .items_center()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary)
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .child("Merge from:"),
+                        )
+                        .child(
+                            div()
+                                .w(px(180.))
+                                .child(Select::new(&self.merge_source_select).small()),
+                        )
+                        .child(
+                            Checkbox::new("env-merge-overwrite")
+                                .label("Overwrite existing")
+                                .checked(self.merge_overwrite)
+                                .on_change(cx.listener(|this, next, _, cx| {
+                                    this.merge_overwrite = *next;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("env-merge-apply")
+                                .primary()
+                                .xsmall()
+                                .label("Merge")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.merge_from_selected_profile(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("env-merge-cancel")
+                                .ghost()
+                                .xsmall()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.merge_panel_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             // Footer actions
             .child(
                 h_flex()
@@ -498,15 +667,36 @@ impl Render for EnvEditorView {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
-                        Button::new("env-add-variable")
-                            .outline()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label("Add Variable")
-                            .disabled(self.editing_env_id.is_none())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_variable(window, cx);
-                            })),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("env-add-variable")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .label("Add Variable")
+                                    .disabled(self.editing_env_id.is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_variable(window, cx);
+                                    })),
+                            )
+                            .when(self.profiles.len() > 1, |row| {
+                                row.child(
+                                    Button::new("env-merge-toggle")
+                                        .outline()
+                                        .small()
+                                        .icon(Icon::new(LucideIcon::GitMerge))
+                                        .label("Merge from…")
+                                        .disabled(self.editing_env_id.is_none())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.merge_panel_open = !this.merge_panel_open;
+                                            if this.merge_panel_open {
+                                                this.refresh_merge_source_options(window, cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()

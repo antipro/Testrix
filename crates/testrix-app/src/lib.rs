@@ -3,6 +3,7 @@
 mod actions;
 mod app_view;
 mod auth_section;
+pub mod cli_api;
 mod container_editor;
 mod editable_combobox;
 mod env_editor;

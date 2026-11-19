@@ -77,6 +77,7 @@ impl SelectItem for AdapterIpOption {
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveShareRecord {
     pub(crate) id: String,
+    pub(crate) project_id: String,
     pub(crate) project_name: String,
     pub(crate) project_slug: String,
     pub(crate) channel: ShareChannel,
@@ -400,6 +401,7 @@ impl ContainerTabView {
                     }));
                     cx.emit(ContainerTabEvent::ShareStarted(ActiveShareRecord {
                         id: format!("{project_id}:local"),
+                        project_id: project_id.clone(),
                         project_name,
                         project_slug,
                         channel: ShareChannel::LocalNetwork,
@@ -459,6 +461,7 @@ impl ContainerTabView {
                 if let Ok(ok) = &res {
                     cx.emit(ContainerTabEvent::ShareStarted(ActiveShareRecord {
                         id: format!("{project_id}:{}", ok.channel.label()),
+                        project_id: project_id.clone(),
                         project_name: project_name.clone(),
                         project_slug: project_slug.clone(),
                         channel: ok.channel,
