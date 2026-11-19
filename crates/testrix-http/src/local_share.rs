@@ -1,4 +1,8 @@
-use std::{collections::HashSet, net::UdpSocket};
+use std::{
+    collections::HashSet,
+    net::UdpSocket,
+    sync::{Arc, RwLock},
+};
 
 use serde::Serialize;
 use testrix_core::{FolderNode, ProjectNode};
@@ -30,6 +34,8 @@ impl NetworkAdapterIp {
 pub struct LocalShareHandle {
     pub share_url: String,
     pub bind_addr: String,
+    project_slug: String,
+    project_json: Arc<RwLock<String>>,
     cancel: CancellationToken,
 }
 
@@ -37,6 +43,15 @@ impl LocalShareHandle {
     /// Stops the local HTTP server and closes its listening socket.
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Updates the served project snapshot after local edits are saved.
+    pub fn update_project(&self, project: &ProjectNode) {
+        if let Ok(next_json) = serialize_local_project(project, &self.project_slug)
+            && let Ok(mut guard) = self.project_json.write()
+        {
+            *guard = next_json;
+        }
     }
 }
 
@@ -70,7 +85,7 @@ pub fn list_outbound_ipv4_addresses() -> Vec<NetworkAdapterIp> {
             .output()
             && out.status.success()
         {
-            let text = String::from_utf8_lossy(&out.stdout);
+            let text = decode_windows_console_output(&out.stdout);
             let mut current_iface = String::new();
             for line in text.lines() {
                 let raw = line.trim_end();
@@ -106,13 +121,13 @@ pub fn list_outbound_ipv4_addresses() -> Vec<NetworkAdapterIp> {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { \"$($_.InterfaceAlias)|$($_.IPAddress)\" }",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { \"$($_.InterfaceAlias)|$($_.IPAddress)\" }",
                 ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
             && out.status.success()
         {
-            let text = String::from_utf8_lossy(&out.stdout);
+            let text = decode_windows_console_output(&out.stdout);
             for line in text.lines() {
                 if let Some((iface, ip)) = line.trim().split_once('|') {
                     let ip = ip.trim();
@@ -193,6 +208,47 @@ fn is_valid_ipv4(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
+/// Decodes Windows console output that may be UTF-8 or the system's OEM code page (e.g., GBK/CP936).
+#[cfg(target_os = "windows")]
+fn decode_windows_console_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    const CP_OEMCP: u32 = 1;
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            dw_flags: u32,
+            lp_multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            lp_wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    // SAFETY: `bytes.as_ptr()` is valid for `len` bytes and `lp_wide_char_str` is null when querying length.
+    let wide_len = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0)
+    };
+    if wide_len <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; wide_len as usize];
+    // SAFETY: `wide` has capacity `wide_len` `u16` elements.
+    let written = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), wide_len)
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalProjectPayload<'a> {
@@ -247,15 +303,9 @@ fn map_folder<'a>(folder: &'a FolderNode, prefix: &str) -> LocalFolderPayload<'a
     }
 }
 
-/// Starts a lightweight embedded HTTP server on `bind_ip:port` serving `project`'s API docs.
-pub fn start_local_share_server(
-    bind_ip: String,
-    port: u16,
-    project: ProjectNode,
-    project_slug: String,
-) -> Result<LocalShareHandle, String> {
+fn serialize_local_project(project: &ProjectNode, project_slug: &str) -> Result<String, String> {
     let payload = LocalProjectPayload {
-        slug: &project_slug,
+        slug: project_slug,
         doc: &project.doc,
         environments: project
             .environments
@@ -279,8 +329,19 @@ pub fn start_local_share_server(
             })
             .collect(),
     };
-    let project_json = serde_json::to_string(&payload)
-        .map_err(|err| format!("Failed serializing project JSON: {err}"))?;
+    serde_json::to_string(&payload).map_err(|err| format!("Failed serializing project JSON: {err}"))
+}
+
+/// Starts a lightweight embedded HTTP server on `bind_ip:port` serving `project`'s API docs.
+pub fn start_local_share_server(
+    bind_ip: String,
+    port: u16,
+    project: ProjectNode,
+    project_slug: String,
+) -> Result<LocalShareHandle, String> {
+    let project_json = serialize_local_project(&project, &project_slug)?;
+    let project_json_lock = Arc::new(RwLock::new(project_json));
+    let json_for_server = project_json_lock.clone();
 
     let cancel = CancellationToken::new();
     let cancel_bg = cancel.clone();
@@ -316,7 +377,6 @@ pub fn start_local_share_server(
             };
             let _ = tx.send(Ok(local_addr));
 
-            let json_arc = std::sync::Arc::new(project_json);
             loop {
                 tokio::select! {
                     _ = cancel_bg.cancelled() => {
@@ -324,7 +384,7 @@ pub fn start_local_share_server(
                     }
                     accepted = listener.accept() => {
                         let Ok((mut socket, _)) = accepted else { break; };
-                        let json_data = json_arc.clone();
+                        let json_data = json_for_server.clone();
                         tokio::spawn(async move {
                             let mut buf = [0u8; 4096];
                             let n = socket.read(&mut buf).await.unwrap_or(0);
@@ -333,8 +393,10 @@ pub fn start_local_share_server(
                             let first_line = req_str.lines().next().unwrap_or("");
                             let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
+                            let json_snapshot;
                             let (status, content_type, body) = if path.starts_with("/api/project") {
-                                ("200 OK", "application/json; charset=utf-8", json_data.as_str())
+                                json_snapshot = json_data.read().map(|g| g.clone()).unwrap_or_default();
+                                ("200 OK", "application/json; charset=utf-8", json_snapshot.as_str())
                             } else {
                                 ("200 OK", "text/html; charset=utf-8", LOCAL_VIEWER_HTML)
                             };
@@ -358,6 +420,8 @@ pub fn start_local_share_server(
     Ok(LocalShareHandle {
         share_url,
         bind_addr: bound_addr.to_string(),
+        project_slug,
+        project_json: project_json_lock,
         cancel,
     })
 }
@@ -395,7 +459,22 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
 table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
 th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
 th{background:var(--surface2);color:var(--muted)}
-pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;overflow-x:auto;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;overflow-x:auto;font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.btn{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.doc-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.code-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.code-tabs{display:flex;gap:6px;flex-wrap:wrap}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;background:var(--surface2);border:1px solid var(--border);color:var(--muted)}
+.meta-cell{display:flex;align-items:center;gap:6px}
+.meta-branch{color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+.ex-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:12px}
+.ex-card pre{border:none;border-top:1px solid var(--border);border-radius:0;margin:0}
+.ex-hdr{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface2)}
+.st-2xx{background:rgba(74,222,128,.16);color:#4ade80}
+.st-3xx{background:rgba(96,165,250,.16);color:#60a5fa}
+.st-err{background:rgba(248,113,113,.16);color:#f87171}
 </style>
 </head>
 <body>
@@ -411,8 +490,8 @@ pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;p
   <section class="content" id="content"></section>
 </main>
 <script>
-let project = null, sel = null, envIdx = 0, query = '';
-const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+let project = null, sel = null, envIdx = 0, query = '', codeTarget = 'curl';
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 function envMap(){
   const m = new Map();
   for(const v of project?.doc?.variables || []) if(v.enabled!==false && v.key) m.set(v.key, v.value||'');
@@ -423,12 +502,97 @@ function envMap(){
 function resolve(s){ const m = envMap(); return String(s||'').replace(/\{\{([^}]+)\}\}/g,(a,k)=>m.has(k.trim())?m.get(k.trim()):a); }
 function kvTable(rows){
   if(!rows||!rows.length) return '<div style="color:var(--muted)">None</div>';
-  return '<table><thead><tr><th>Key</th><th>Value</th><th>Description</th></tr></thead><tbody>'+rows.map(r=>`<tr><td><code>${esc(r.key)}</code></td><td><code>${esc(resolve(r.value||''))}</code></td><td style="color:var(--muted)">${esc(r.description||'')}</td></tr>`).join('')+'</tbody></table>';
+  return '<table><thead><tr><th>Key</th><th>Value</th><th>Description</th></tr></thead><tbody>'+rows.map(r=>`<tr><td><code>${esc(r.name??r.key??'')}</code></td><td><code>${esc(resolve(r.value||''))}</code></td><td style="color:var(--muted)">${esc(r.description||'')}</td></tr>`).join('')+'</tbody></table>';
+}
+function buildReqUrl(r){
+  let u = r.url||'';
+  if(u && !/^https?:\/\//i.test(u) && !u.startsWith('{{') && project?.doc?.baseUrl) u = project.doc.baseUrl.replace(/\/+$/,'')+'/'+u.replace(/^\/+/,'');
+  return resolve(u);
+}
+const escPosix = s => String(s).replace(/'/g,"'\\''");
+const escCmd = s => String(s).replace(/"/g,'\\"').replace(/\r/g,'').replace(/\n/g,'\\n');
+const escPs1 = s => String(s).replace(/'/g,"''");
+const escPs2 = s => String(s).replace(/`/g,'``').replace(/"/g,'`"').replace(/\$/g,'`$');
+function genCode(doc, target){
+  const r = doc?.request||{};
+  const method = (r.method||'GET').toUpperCase();
+  let url = buildReqUrl(r);
+  const params = (r.params||[]).filter(p=>p.enabled!==false && (p.name||p.key));
+  if(params.length){
+    const qs = params.map(p=>`${encodeURIComponent(resolve(p.name||p.key))}=${encodeURIComponent(resolve(p.value||''))}`).join('&');
+    url += (url.includes('?')?'&':'?')+qs;
+  }
+  const headers = (r.headers||[]).filter(h=>h.enabled!==false && (h.name||h.key)).map(h=>({name:resolve(h.name||h.key),value:resolve(h.value||'')}));
+  const body = r.body||{type:'none'};
+  if(!headers.some(h=>h.name.toLowerCase()==='content-type')){
+    if(body.type==='json') headers.push({name:'Content-Type',value:'application/json'});
+    else if(body.type==='raw') headers.push({name:'Content-Type',value:body.rawFormat==='xml'?'application/xml':body.rawFormat==='html'?'text/html':'text/plain'});
+    else if(body.type==='formUrlEncoded') headers.push({name:'Content-Type',value:'application/x-www-form-urlencoded'});
+    else if(body.type==='binary' && body.contentType) headers.push({name:'Content-Type',value:resolve(body.contentType)});
+  }
+  if(target==='curl-win'){
+    const ls=[`curl.exe -X ${method} "${escCmd(url)}"`];
+    for(const h of headers) ls.push(`  -H "${escCmd(h.name)}: ${escCmd(h.value)}"`);
+    if(body.type==='json'||body.type==='raw') ls.push(`  --data-raw "${escCmd(resolve(body.content||''))}"`);
+    else if(body.type==='formUrlEncoded') for(const f of body.fields||[]) if(f.enabled!==false&&(f.name||f.key)) ls.push(`  --data-urlencode "${escCmd(resolve(f.name||f.key))}=${escCmd(resolve(f.value||''))}"`);
+    else if(body.type==='multipart') for(const f of body.fields||[]) if(f.enabled!==false&&(f.name||f.key)) ls.push(f.fieldType==='file'?`  -F "${escCmd(resolve(f.name||f.key))}=@${escCmd(resolve(f.value||''))}"`:`  -F "${escCmd(resolve(f.name||f.key))}=${escCmd(resolve(f.value||''))}"`);
+    else if(body.type==='binary'&&body.filePath) ls.push(`  --data-binary "@${escCmd(resolve(body.filePath))}"`);
+    return ls.join(' ^\n');
+  }
+  if(target==='wget'){
+    const ls=[`wget --method=${method}`];
+    for(const h of headers) ls.push(`  --header='${escPosix(h.name)}: ${escPosix(h.value)}'`);
+    if(body.type==='json'||body.type==='raw') ls.push(`  --body-data='${escPosix(resolve(body.content||''))}'`);
+    else if(body.type==='formUrlEncoded'){ const enc=(body.fields||[]).filter(f=>f.enabled!==false&&(f.name||f.key)).map(f=>`${encodeURIComponent(resolve(f.name||f.key))}=${encodeURIComponent(resolve(f.value||''))}`).join('&'); ls.push(`  --body-data='${escPosix(enc)}'`); }
+    else if(body.type==='multipart') ls.push('  # Note: wget does not natively build multipart/form-data; use cURL');
+    else if(body.type==='binary'&&body.filePath) ls.push(`  --body-file='${escPosix(resolve(body.filePath))}'`);
+    ls.push(`  -qO- '${escPosix(url)}'`);
+    return ls.join(' \\\n');
+  }
+  if(target==='powershell'){
+    const out=[], hl=[]; let ct=null;
+    for(const h of headers){ if(h.name.toLowerCase()==='content-type') ct=h.value; else hl.push(`    "${escPs2(h.name)}" = "${escPs2(h.value)}"`); }
+    if(hl.length) out.push('$headers = @{',...hl,'}');
+    let hasBody=false;
+    if(body.type==='json'||body.type==='raw'){ hasBody=true; const c=resolve(body.content||''); out.push(c.includes('\n')?`$body = @'\n${c}\n'@`:`$body = '${escPs1(c)}'`); }
+    else if(body.type==='formUrlEncoded'){ hasBody=true; out.push('$body = @{'); for(const f of body.fields||[]) if(f.enabled!==false&&(f.name||f.key)) out.push(`    "${escPs2(resolve(f.name||f.key))}" = "${escPs2(resolve(f.value||''))}"`); out.push('}'); }
+    else if(body.type==='binary'&&body.filePath){ hasBody=true; out.push(`$body = [System.IO.File]::ReadAllBytes('${escPs1(resolve(body.filePath))}')`); }
+    let inv=`$response = Invoke-WebRequest -Uri '${escPs1(url)}' -Method ${method} -UseBasicParsing`;
+    if(hl.length) inv+=' -Headers $headers'; if(ct) inv+=` -ContentType '${escPs1(ct)}'`; if(hasBody) inv+=' -Body $body';
+    out.push(inv); return out.join('\n');
+  }
+  const ls=[`curl -X ${method} '${escPosix(url)}'`];
+  for(const h of headers) ls.push(`  -H '${escPosix(h.name)}: ${escPosix(h.value)}'`);
+  if(body.type==='json'||body.type==='raw') ls.push(`  --data-raw '${escPosix(resolve(body.content||''))}'`);
+  else if(body.type==='formUrlEncoded') for(const f of body.fields||[]) if(f.enabled!==false&&(f.name||f.key)) ls.push(`  --data-urlencode '${escPosix(resolve(f.name||f.key))}=${escPosix(resolve(f.value||''))}'`);
+  else if(body.type==='multipart') for(const f of body.fields||[]) if(f.enabled!==false&&(f.name||f.key)) ls.push(f.fieldType==='file'?`  -F '${escPosix(resolve(f.name||f.key))}=@${escPosix(resolve(f.value||''))}'`:`  -F '${escPosix(resolve(f.name||f.key))}=${escPosix(resolve(f.value||''))}'`);
+  else if(body.type==='binary'&&body.filePath) ls.push(`  --data-binary '@${escPosix(resolve(body.filePath))}'`);
+  return ls.join(' \\\n');
+}
+function renderMeta(meta){
+  if(!Array.isArray(meta)||!meta.length) return '';
+  const rows=[];
+  function walk(fs,d){
+    for(const f of fs||[]){
+      rows.push(`<tr><td><div class="meta-cell" style="padding-left:${d*18}px">${d>0?'<span class="meta-branch">└─</span>':''}<code>${esc(f.name)}</code></div></td><td><span class="pill">${esc(f.type||'any')}</span></td><td><code style="color:var(--muted)">${esc(f.example||'—')}</code></td><td style="color:var(--muted)">${esc(f.description||'')}</td></tr>`);
+      if(Array.isArray(f.children)&&f.children.length) walk(f.children,d+1);
+    }
+  }
+  walk(meta,0);
+  return `<div class="section"><div class="section-title">Response Meta Info</div><table><thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+function fmtEx(b,ct){ const s=String(b??''); if(String(ct||'').toLowerCase().includes('json')||s.trim().startsWith('{')||s.trim().startsWith('[')){ try{ return JSON.stringify(JSON.parse(s),null,2); }catch{} } return s; }
+function renderExamples(exs){
+  if(!Array.isArray(exs)||!exs.length) return '';
+  return `<div class="section"><div class="section-title">Response Examples (${exs.length})</div>${exs.map(ex=>{
+    const n=Number(ex.statusCode||0); const cls=n>=200&&n<300?'st-2xx':n>=300&&n<400?'st-3xx':n>=400?'st-err':'';
+    return `<div class="ex-card"><div class="ex-hdr"><span class="badge ${cls}">${esc(ex.reason?`${n} ${ex.reason}`:String(n))}</span><strong>${esc(ex.name||'Example')}</strong>${ex.contentType?`<span class="pill">${esc(ex.contentType)}</span>`:''}</div><pre>${esc(fmtEx(ex.body,ex.contentType))}</pre></div>`;
+  }).join('')}</div>`;
 }
 function render(){
   if(!project) return;
   const sb = document.getElementById('sidebar');
-  let html = `<div class="tree-item ${sel?.type==='project'?'active':''}" onclick="sel={type:'project'};render()"><strong>${esc(project.doc.name)}</strong></div>`;
+  let html = `<div class="tree-item ${sel?.type==='project'?'active':''}" onclick="selectProject()"><strong>${esc(project.doc.name)}</strong></div>`;
   function walkF(f){
     let inner = (f.folders||[]).map(walkF).join('') + (f.requests||[]).filter(r=>!query||(r.doc.name+r.doc.request.url).toLowerCase().includes(query)).map(r=>`<div class="tree-item ${sel?.id===r.relPath?'active':''}" onclick="selectReq('${esc(r.relPath)}')"><span class="badge ${esc((r.doc.request.method||'GET').toUpperCase())}">${esc((r.doc.request.method||'GET').toUpperCase())}</span><span>${esc(r.doc.name)}</span></div>`).join('');
     return `<div><div class="tree-item ${sel?.id===f.relPath?'active':''}" onclick="selectFolder('${esc(f.relPath)}')">▾ ${esc(f.doc.name)}</div><div class="children">${inner}</div></div>`;
@@ -446,23 +610,41 @@ function render(){
   } else {
     const d = sel.data.doc, r = d.request||{};
     const m = (r.method||'GET').toUpperCase();
-    let u = r.url||'';
-    if(u && !/^https?:\/\//i.test(u) && !u.startsWith('{{') && project.doc.baseUrl) u = project.doc.baseUrl.replace(/\/+$/,'')+'/'+u.replace(/^\/+/,'');
-    ct.innerHTML = `<h1>${esc(d.name)}</h1><p style="color:var(--muted)">${esc(d.description||'')}</p><div class="url-bar"><span class="badge ${esc(m)}">${esc(m)}</span><span>${esc(resolve(u))}</span></div><div class="section"><div class="section-title">Query Params</div>${kvTable(r.params)}</div><div class="section"><div class="section-title">Headers</div>${kvTable(r.headers)}</div>${r.body&&r.body.type!=='none'?`<div class="section"><div class="section-title">Body</div><pre>${esc(r.body.content||JSON.stringify(r.body,null,2))}</pre></div>`:''}`;
+    const u = buildReqUrl(r);
+    const targets=[['curl','cURL'],['curl-win','cURL (Win)'],['wget','wget'],['powershell','PowerShell']];
+    ct.innerHTML = `<div class="doc-header"><h1>${esc(d.name)}</h1><div style="display:flex;gap:8px"><button class="btn" onclick="copyLink(this)">Copy Link</button><button class="btn" onclick="copyCode('curl',this)">Copy cURL</button></div></div><p style="color:var(--muted)">${esc(d.description||'')}</p><div class="url-bar"><span class="badge ${esc(m)}">${esc(m)}</span><span>${esc(u)}</span></div><div class="section"><div class="section-title">Query Params</div>${kvTable(r.params)}</div><div class="section"><div class="section-title">Headers</div>${kvTable(r.headers)}</div>${r.body&&r.body.type!=='none'?`<div class="section"><div class="section-title">Body</div><pre>${esc(r.body.content||JSON.stringify(r.body,null,2))}</pre></div>`:''}<div class="section"><div class="code-hdr"><div class="section-title" style="margin:0">Code Snippet</div><div class="code-tabs">${targets.map(([id,lbl])=>`<button class="btn ${codeTarget===id?'active':''}" onclick="setTarget('${id}')">${lbl}</button>`).join('')}<button class="btn" onclick="copyCode(codeTarget,this)">Copy</button></div></div><pre id="codeBlock">${esc(genCode(d,codeTarget))}</pre></div>${renderMeta(r.responseMeta)}${renderExamples(r.responseExamples)}`;
   }
 }
 function findF(list,id){ for(const f of list||[]){ if(f.relPath===id) return f; const sub=findF(f.folders,id); if(sub) return sub; } }
-function findR(id){ for(const r of project.requests||[]) if(r.relPath===id) return r; function w(fs){ for(const f of fs||[]){ for(const r of f.requests||[]) if(r.relPath===id) return r; const s=w(f.folders); if(s) return s; } } return w(project.folders); }
+function findR(target){
+  const t = String(target||'').replace(/^\/+/,'');
+  for(const r of project.requests||[]) if(r.relPath===t||r.doc?.id===t) return r;
+  function w(fs){ for(const f of fs||[]){ for(const r of f.requests||[]) if(r.relPath===t||r.doc?.id===t) return r; const s=w(f.folders); if(s) return s; } }
+  return w(project.folders);
+}
+window.selectProject = () => { sel={type:'project'}; history.pushState({},'','/'); render(); };
 window.selectFolder = id => { const f=findF(project.folders,id); if(f){ sel={type:'folder',id,data:f}; render(); } };
-window.selectReq = id => { const r=findR(id); if(r){ sel={type:'request',id,data:r}; render(); } };
+window.selectReq = id => { const r=findR(id); if(r){ sel={type:'request',id:r.relPath,data:r}; history.pushState({},'','/r/'+r.relPath.split('/').map(encodeURIComponent).join('/')); render(); } };
+window.setTarget = t => { codeTarget=t; render(); };
+window.copyCode = (t,btn) => { if(sel?.type==='request'){ navigator.clipboard?.writeText(genCode(sel.data.doc,t)); const prev=btn.textContent; btn.textContent='Copied!'; setTimeout(()=>btn.textContent=prev,1400); } };
+window.copyLink = btn => { if(sel?.type==='request'){ navigator.clipboard?.writeText(location.origin+'/r/'+sel.data.relPath.split('/').map(encodeURIComponent).join('/')); btn.textContent='Copied!'; setTimeout(()=>btn.textContent='Copy Link',1400); } };
+function syncFromUrl(){
+  if(!project) return;
+  const sp = new URLSearchParams(location.search);
+  const m = location.pathname.match(/^\/r\/(.+)$/);
+  const target = m ? m[1].split('/').map(decodeURIComponent).join('/') : sp.get('request');
+  const r = target ? findR(target) : null;
+  sel = r ? {type:'request',id:r.relPath,data:r} : {type:'project'};
+  render();
+}
+window.addEventListener('popstate', syncFromUrl);
 document.getElementById('searchInput').oninput = e => { query = e.target.value.trim().toLowerCase(); render(); };
 fetch('/api/project').then(r=>r.json()).then(d=>{
   project = d;
   document.getElementById('projTitle').textContent = d.doc.name || 'Testrix Local Share';
-  sel = {type:'project'};
   const es = document.getElementById('envSelect');
   if((d.environments||[]).length){ es.style.display='inline-block'; es.innerHTML=d.environments.map((e,i)=>`<option value="${i}">${esc(e.name)}</option>`).join(''); es.onchange=()=>{ envIdx=Number(es.value); render(); }; }
-  render();
+  syncFromUrl();
 });
 </script>
 </body>

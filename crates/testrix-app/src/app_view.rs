@@ -994,6 +994,17 @@ impl TestrixApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(proj) = self.workspace.find_project(project_id) else {
+            return;
+        };
+        for share in &self.active_shares {
+            if share.project_id == project_id
+                && share.channel == ShareChannel::LocalNetwork
+                && let Some(handle) = &share.local_handle
+            {
+                handle.update_project(proj);
+            }
+        }
         let targets: Vec<ActiveShareRecord> = self
             .active_shares
             .iter()
@@ -1003,9 +1014,6 @@ impl TestrixApp {
         if targets.is_empty() {
             return;
         }
-        let Some(proj) = self.workspace.find_project(project_id) else {
-            return;
-        };
         let project_name = proj.doc.name.clone();
         let project_root = proj.root_dir.clone();
         let settings = self.share_settings.clone();
