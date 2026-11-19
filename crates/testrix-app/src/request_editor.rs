@@ -190,7 +190,6 @@ pub(crate) enum RequestTabEvent {
         node: AuthNodeRef,
     },
     ApplyPostScriptEnv {
-        project_id: String,
         env_id: String,
         vars: BTreeMap<String, String>,
     },
@@ -925,7 +924,6 @@ impl RequestTabView {
                                         && let Some(env) = &this.active_env
                                     {
                                         cx.emit(RequestTabEvent::ApplyPostScriptEnv {
-                                            project_id: this.project_id.clone(),
                                             env_id: env.id.clone(),
                                             vars: res.next_vars,
                                         });

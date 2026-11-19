@@ -990,7 +990,6 @@ impl TestrixApp {
                 self.refresh_dirty_indicators(cx);
             }
             RequestTabEvent::ApplyPostScriptEnv {
-                project_id: _,
                 env_id,
                 vars,
             } => {
