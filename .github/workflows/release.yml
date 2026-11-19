@@ -349,6 +349,9 @@ jobs:
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -359,22 +362,53 @@ jobs:
         working-directory: release-assets
         run: sha256sum * > SHA256SUMS.txt
 
+      - name: Extract release notes from docs/CHANGELOG.md
+        id: changelog
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, textwrap
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["VERSION"]
+          changelog = Path("docs/CHANGELOG.md")
+          notes = ""
+          if changelog.is_file():
+              text = changelog.read_text(encoding="utf-8")
+              pattern = re.compile(rf"^## \[{re.escape(tag)}\][^\n]*\n(.*?)(?=^## \[|\Z)", re.M | re.S)
+              m = pattern.search(text)
+              if m:
+                  notes = m.group(1).strip()
+
+          parts = []
+          if notes:
+              parts.append(notes)
+          parts.append(textwrap.dedent(f"""\
+              ## Downloads
+
+              | Platform | Package |
+              |---|---|
+              | **macOS (Universal: Apple Silicon & Intel)** | `Testrix-{version}-macos-universal.dmg` |
+              | **Windows (x86_64 Installer)** | `Testrix-{version}-windows-x86_64.msi` |
+              | **Windows (x86_64 Standalone)** | `Testrix-{version}-windows-x86_64.exe` |
+              | **Linux (Debian / Ubuntu)** | `Testrix-{version}-linux-amd64.deb` |
+              | **Linux (Fedora / RHEL)** | `Testrix-{version}-linux-x86_64.rpm` |
+
+              Verify downloads with `SHA256SUMS.txt`."""))
+
+          Path("RELEASE_BODY.md").write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"has_notes={'true' if notes else 'false'}\n")
+          EOF
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: Testrix ${{ needs.prepare.outputs.release_tag }}
-          generate_release_notes: true
-          body: |
-            ## Downloads
-
-            | Platform | Package |
-            |---|---|
-            | **macOS (Universal: Apple Silicon & Intel)** | `Testrix-${{ needs.prepare.outputs.version }}-macos-universal.dmg` |
-            | **Windows (x86_64 Installer)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.msi` |
-            | **Windows (x86_64 Standalone)** | `Testrix-${{ needs.prepare.outputs.version }}-windows-x86_64.exe` |
-            | **Linux (Debian / Ubuntu)** | `Testrix-${{ needs.prepare.outputs.version }}-linux-amd64.deb` |
-            | **Linux (Fedora / RHEL)** | `Testrix-${{ needs.prepare.outputs.version }}-linux-x86_64.rpm` |
-
-            Verify downloads with `SHA256SUMS.txt`.
+          generate_release_notes: ${{ steps.changelog.outputs.has_notes != 'true' }}
+          body_path: RELEASE_BODY.md
           files: release-assets/*
