@@ -42,8 +42,9 @@ use gpui_kit::{
 use testrix_core::{
     AuthConfig, AuthNodeRef, EnvironmentDoc, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
     HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
-    merge_environments_into_bundle, parse_apifox, parse_openapi_3_0, parse_postman_collection,
-    parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
+    export_openapi_3_0, merge_environments_into_bundle, parse_apifox, parse_openapi_3_0,
+    parse_postman_collection, parse_postman_zip, parse_request_script, rename_template_variables,
+    resolve_request_auth,
 };
 use testrix_http::{
     HttpRunner, ShareChannel, ShareFile, collect_project_yaml_files, dispatch_share_future,
@@ -506,6 +507,9 @@ impl TestrixApp {
             ExplorerEvent::ImportOpenApi => self.prompt_import_openapi(window, cx),
             ExplorerEvent::ImportPostmanZip => self.prompt_import_postman_zip(window, cx),
             ExplorerEvent::ImportApifox => self.prompt_import_apifox(window, cx),
+            ExplorerEvent::ExportOpenApi { project_id } => {
+                self.prompt_export_openapi(project_id, window, cx)
+            }
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
     }
@@ -1473,6 +1477,66 @@ impl TestrixApp {
             window,
             cx,
         );
+    }
+
+    fn prompt_export_openapi(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self
+            .workspace
+            .projects
+            .iter()
+            .find(|p| p.doc.id == project_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let json = match export_openapi_3_0(&project) {
+            Ok(json) => json,
+            Err(err) => {
+                window.push_notification(format!("OpenAPI export failed: {err}"), cx);
+                return;
+            }
+        };
+
+        let safe_name: String = project
+            .doc
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let suggested_name = format!("{}.openapi.json", safe_name.trim_matches('-'));
+        let prompt = cx.prompt_for_new_path(&self.workspace_dir, Some(&suggested_name));
+
+        cx.spawn_in(window, async move |_, window| {
+            let path = prompt.await.ok()?.ok()??;
+            let result = std::fs::write(&path, json.as_bytes())
+                .map_err(|err| format!("Failed writing {}: {err}", path.display()));
+            window
+                .update(|window, cx| match result {
+                    Ok(()) => {
+                        window.push_notification(
+                            format!("Exported OpenAPI 3.0 JSON to {}.", path.display()),
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        window.push_notification(err, cx);
+                    }
+                })
+                .ok()
+        })
+        .detach();
     }
 
     fn prompt_import_json_project(

@@ -56,6 +56,9 @@ pub(crate) enum ExplorerEvent {
     ImportOpenApi,
     ImportPostmanZip,
     ImportApifox,
+    ExportOpenApi {
+        project_id: String,
+    },
     ReloadWorkspace,
 }
 
@@ -322,7 +325,7 @@ impl Render for ExplorerPanel {
                                 Button::new("explorer-import-menu")
                                     .ghost()
                                     .xsmall()
-                                    .icon(LucideIcon::FileUp)
+                                    .icon(LucideIcon::Upload)
                                     .tooltip(crate::i18n::t("import_menu"))
                                     .dropdown_menu(move |menu, _, _| {
                                         let v1 = view.clone();
@@ -714,9 +717,11 @@ fn build_context_menu(
             let v3 = view.clone();
             let v4 = view.clone();
             let v5 = view.clone();
+            let v_exp = view.clone();
             let p1 = project_id.clone();
             let p2 = project_id.clone();
             let p3 = project_id.clone();
+            let p_exp = project_id.clone();
             let p4 = project_id;
             menu.item(
                 PopupMenuItem::new(crate::i18n::t("new_request"))
@@ -760,6 +765,17 @@ fn build_context_menu(
                     .on_click(move |_, _, cx| {
                         v4.update(cx, |_, cx| {
                             cx.emit(ExplorerEvent::ReloadWorkspace);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(crate::i18n::t("export_openapi"))
+                    .icon(LucideIcon::Download)
+                    .on_click(move |_, _, cx| {
+                        v_exp.update(cx, |_, cx| {
+                            cx.emit(ExplorerEvent::ExportOpenApi {
+                                project_id: p_exp.clone(),
+                            });
                         });
                     }),
             )

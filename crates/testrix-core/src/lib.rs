@@ -33,7 +33,8 @@ pub use model::{
     generate_id,
 };
 pub use openapi::{
-    ImportedFolder, ImportedProjectBundle, merge_environments_into_bundle, parse_openapi_3_0,
+    ImportedFolder, ImportedProjectBundle, export_openapi_3_0, merge_environments_into_bundle,
+    parse_openapi_3_0,
 };
 pub use postman::{
     parse_postman_collection, parse_postman_environment, parse_postman_zip,

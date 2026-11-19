@@ -5,9 +5,9 @@ use serde_json::Value;
 use crate::{
     error::CoreError,
     model::{
-        ApiKeyLocation, AuthConfig, EnvVariable, EnvironmentDoc, FolderDoc, HttpMethod,
-        HttpRequestDoc, KeyValueRow, MultipartField, ProjectDoc, RawBodyFormat, RequestBody,
-        generate_id,
+        ApiKeyLocation, AuthConfig, EnvVariable, EnvironmentDoc, FolderDoc, FolderNode,
+        HttpMethod, HttpRequestDoc, KeyValueRow, MultipartField, MultipartFieldType, ProjectDoc,
+        ProjectNode, RawBodyFormat, RequestBody, RequestNode, generate_id,
     },
     response::ResponseHeader,
     response_meta::{
@@ -797,6 +797,592 @@ fn format_openapi_example_body(val: &Value) -> String {
     }
 }
 
+/// Exports a [`ProjectNode`] as an OpenAPI 3.0.1 JSON document string.
+pub fn export_openapi_3_0(project: &ProjectNode) -> Result<String, CoreError> {
+    let mut info = serde_json::Map::new();
+    info.insert("title".to_string(), Value::String(project.doc.name.clone()));
+    info.insert("version".to_string(), Value::String("1.0.0".to_string()));
+    if !project.doc.description.trim().is_empty() {
+        info.insert(
+            "description".to_string(),
+            Value::String(project.doc.description.clone()),
+        );
+    }
+
+    let mut servers = Vec::new();
+    for env in &project.environments {
+        if let Some(var) = env
+            .doc
+            .variables
+            .iter()
+            .find(|v| v.enabled && (v.key == "base_url" || v.key == "baseUrl") && !v.value.trim().is_empty())
+        {
+            servers.push(serde_json::json!({
+                "url": var.value,
+                "description": env.doc.name,
+            }));
+        }
+    }
+    if servers.is_empty()
+        && !project.doc.base_url.trim().is_empty()
+        && !project.doc.base_url.contains("{{")
+    {
+        servers.push(serde_json::json!({ "url": project.doc.base_url }));
+    }
+
+    let mut security_schemes = serde_json::Map::new();
+    let mut tags = Vec::new();
+    let mut paths: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
+
+    if let Some(scheme_name) = register_security_scheme(&project.doc.auth, &mut security_schemes) {
+        let _ = scheme_name;
+    }
+
+    for req in &project.requests {
+        export_request_into_paths(
+            req,
+            None,
+            &project.doc.base_url,
+            &mut security_schemes,
+            &mut paths,
+        );
+    }
+
+    for folder in &project.folders {
+        export_folder_into_paths(
+            folder,
+            None,
+            &project.doc.base_url,
+            &mut tags,
+            &mut security_schemes,
+            &mut paths,
+        );
+    }
+
+    let mut root = serde_json::Map::new();
+    root.insert("openapi".to_string(), Value::String("3.0.1".to_string()));
+    root.insert("info".to_string(), Value::Object(info));
+    if !servers.is_empty() {
+        root.insert("servers".to_string(), Value::Array(servers));
+    }
+    if !tags.is_empty() {
+        root.insert("tags".to_string(), Value::Array(tags));
+    }
+    root.insert(
+        "paths".to_string(),
+        Value::Object(
+            paths
+                .into_iter()
+                .map(|(p, ops)| (p, Value::Object(ops)))
+                .collect(),
+        ),
+    );
+    if !security_schemes.is_empty() {
+        root.insert(
+            "components".to_string(),
+            serde_json::json!({ "securitySchemes": security_schemes }),
+        );
+    }
+    if let Some(sec_name) = register_security_scheme(&project.doc.auth, &mut serde_json::Map::new()) {
+        root.insert("security".to_string(), serde_json::json!([{ sec_name: [] }]));
+    }
+
+    serde_json::to_string_pretty(&Value::Object(root)).map_err(|err| CoreError::Validation {
+        reason: format!("Failed serializing OpenAPI JSON: {err}"),
+    })
+}
+
+fn export_folder_into_paths(
+    folder: &FolderNode,
+    parent_tag: Option<&str>,
+    project_base_url: &str,
+    tags: &mut Vec<Value>,
+    security_schemes: &mut serde_json::Map<String, Value>,
+    paths: &mut BTreeMap<String, serde_json::Map<String, Value>>,
+) {
+    let tag_name = match parent_tag {
+        Some(parent) => format!("{parent} / {}", folder.doc.name),
+        None => folder.doc.name.clone(),
+    };
+    let mut tag_obj = serde_json::Map::new();
+    tag_obj.insert("name".to_string(), Value::String(tag_name.clone()));
+    if !folder.doc.description.trim().is_empty() {
+        tag_obj.insert(
+            "description".to_string(),
+            Value::String(folder.doc.description.clone()),
+        );
+    }
+    tags.push(Value::Object(tag_obj));
+
+    for req in &folder.requests {
+        export_request_into_paths(
+            req,
+            Some(&tag_name),
+            project_base_url,
+            security_schemes,
+            paths,
+        );
+    }
+    for sub in &folder.folders {
+        export_folder_into_paths(
+            sub,
+            Some(&tag_name),
+            project_base_url,
+            tags,
+            security_schemes,
+            paths,
+        );
+    }
+}
+
+fn export_request_into_paths(
+    req: &RequestNode,
+    tag: Option<&str>,
+    project_base_url: &str,
+    security_schemes: &mut serde_json::Map<String, Value>,
+    paths: &mut BTreeMap<String, serde_json::Map<String, Value>>,
+) {
+    let path_str = normalize_export_path(&req.doc.request.url, project_base_url);
+    let method_key = match req.doc.request.method {
+        HttpMethod::Get => "get",
+        HttpMethod::Post => "post",
+        HttpMethod::Put => "put",
+        HttpMethod::Patch => "patch",
+        HttpMethod::Delete => "delete",
+        HttpMethod::Head => "head",
+        HttpMethod::Options => "options",
+    };
+
+    let mut op = serde_json::Map::new();
+    op.insert("summary".to_string(), Value::String(req.doc.name.clone()));
+    if !req.doc.description.trim().is_empty() {
+        op.insert(
+            "description".to_string(),
+            Value::String(req.doc.description.clone()),
+        );
+    }
+    if let Some(tag_name) = tag {
+        op.insert(
+            "tags".to_string(),
+            Value::Array(vec![Value::String(tag_name.to_string())]),
+        );
+    }
+
+    let mut params = Vec::new();
+    for p in &req.doc.request.params {
+        if p.name.trim().is_empty() {
+            continue;
+        }
+        let mut p_obj = serde_json::Map::new();
+        p_obj.insert("name".to_string(), Value::String(p.name.clone()));
+        p_obj.insert("in".to_string(), Value::String("query".to_string()));
+        if !p.description.trim().is_empty() {
+            p_obj.insert(
+                "description".to_string(),
+                Value::String(p.description.clone()),
+            );
+        }
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), Value::String("string".to_string()));
+        if !p.value.is_empty() {
+            schema.insert("example".to_string(), Value::String(p.value.clone()));
+        }
+        p_obj.insert("schema".to_string(), Value::Object(schema));
+        params.push(Value::Object(p_obj));
+    }
+    for h in &req.doc.request.headers {
+        if h.name.trim().is_empty() {
+            continue;
+        }
+        let mut h_obj = serde_json::Map::new();
+        h_obj.insert("name".to_string(), Value::String(h.name.clone()));
+        h_obj.insert("in".to_string(), Value::String("header".to_string()));
+        if !h.description.trim().is_empty() {
+            h_obj.insert(
+                "description".to_string(),
+                Value::String(h.description.clone()),
+            );
+        }
+        let mut schema = serde_json::Map::new();
+        schema.insert("type".to_string(), Value::String("string".to_string()));
+        if !h.value.is_empty() {
+            schema.insert("example".to_string(), Value::String(h.value.clone()));
+        }
+        h_obj.insert("schema".to_string(), Value::Object(schema));
+        params.push(Value::Object(h_obj));
+    }
+    if !params.is_empty() {
+        op.insert("parameters".to_string(), Value::Array(params));
+    }
+
+    if let Some(req_body) = export_request_body(&req.doc.request.body) {
+        op.insert("requestBody".to_string(), req_body);
+    }
+
+    match &req.doc.request.auth {
+        AuthConfig::Inherit => {}
+        AuthConfig::None => {
+            op.insert("security".to_string(), Value::Array(Vec::new()));
+        }
+        other => {
+            if let Some(sec_name) = register_security_scheme(other, security_schemes) {
+                op.insert("security".to_string(), serde_json::json!([{ sec_name: [] }]));
+            }
+        }
+    }
+
+    op.insert(
+        "responses".to_string(),
+        export_responses(
+            &req.doc.request.response_examples,
+            &req.doc.request.response_meta,
+        ),
+    );
+
+    paths
+        .entry(path_str)
+        .or_default()
+        .insert(method_key.to_string(), Value::Object(op));
+}
+
+fn normalize_export_path(raw_url: &str, project_base_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    let path = without_query
+        .strip_prefix("{{base_url}}")
+        .or_else(|| without_query.strip_prefix("{{baseUrl}}"))
+        .or_else(|| {
+            let base = project_base_url.trim().trim_end_matches('/');
+            if !base.is_empty() {
+                without_query.strip_prefix(base)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(without_query);
+
+    let path_str = if let Ok(parsed) = url::Url::parse(path) {
+        parsed.path().to_string()
+    } else {
+        path.to_string()
+    };
+
+    let path = path_str.trim();
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn export_request_body(body: &RequestBody) -> Option<Value> {
+    match body {
+        RequestBody::None => None,
+        RequestBody::Json { content } => {
+            let example_val = serde_json::from_str::<Value>(content)
+                .unwrap_or_else(|_| Value::String(content.clone()));
+            Some(serde_json::json!({
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "object" },
+                        "example": example_val
+                    }
+                }
+            }))
+        }
+        RequestBody::FormUrlEncoded { fields } => {
+            let props = kv_rows_to_schema_props(fields);
+            Some(serde_json::json!({
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "properties": props
+                        }
+                    }
+                }
+            }))
+        }
+        RequestBody::Multipart { fields } => {
+            let mut props = serde_json::Map::new();
+            for f in fields {
+                if f.name.trim().is_empty() {
+                    continue;
+                }
+                let mut prop = serde_json::Map::new();
+                prop.insert("type".to_string(), Value::String("string".to_string()));
+                if f.field_type == MultipartFieldType::File {
+                    prop.insert("format".to_string(), Value::String("binary".to_string()));
+                } else if !f.value.is_empty() {
+                    prop.insert("example".to_string(), Value::String(f.value.clone()));
+                }
+                if !f.description.trim().is_empty() {
+                    prop.insert(
+                        "description".to_string(),
+                        Value::String(f.description.clone()),
+                    );
+                }
+                props.insert(f.name.clone(), Value::Object(prop));
+            }
+            Some(serde_json::json!({
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": props
+                        }
+                    }
+                }
+            }))
+        }
+        RequestBody::Raw {
+            raw_format,
+            content,
+        } => {
+            let media_type = match raw_format {
+                RawBodyFormat::Xml => "application/xml",
+                RawBodyFormat::Yaml => "application/yaml",
+                RawBodyFormat::Html => "text/html",
+                RawBodyFormat::Javascript => "application/javascript",
+                RawBodyFormat::Text => "text/plain",
+            };
+            Some(serde_json::json!({
+                "content": {
+                    media_type: {
+                        "schema": { "type": "string" },
+                        "example": content
+                    }
+                }
+            }))
+        }
+        RequestBody::Binary { .. } => Some(serde_json::json!({
+            "content": {
+                "application/octet-stream": {
+                    "schema": { "type": "string", "format": "binary" }
+                }
+            }
+        })),
+    }
+}
+
+fn kv_rows_to_schema_props(rows: &[KeyValueRow]) -> serde_json::Map<String, Value> {
+    let mut props = serde_json::Map::new();
+    for r in rows {
+        if r.name.trim().is_empty() {
+            continue;
+        }
+        let mut prop = serde_json::Map::new();
+        prop.insert("type".to_string(), Value::String("string".to_string()));
+        if !r.value.is_empty() {
+            prop.insert("example".to_string(), Value::String(r.value.clone()));
+        }
+        if !r.description.trim().is_empty() {
+            prop.insert(
+                "description".to_string(),
+                Value::String(r.description.clone()),
+            );
+        }
+        props.insert(r.name.clone(), Value::Object(prop));
+    }
+    props
+}
+
+fn export_responses(
+    examples: &[ResponseExample],
+    meta: &[ResponseMetaField],
+) -> Value {
+    let mut responses = serde_json::Map::new();
+    let meta_schema = if meta.is_empty() {
+        None
+    } else {
+        Some(meta_fields_to_json_schema(meta))
+    };
+
+    if examples.is_empty() {
+        let mut resp = serde_json::Map::new();
+        resp.insert("description".to_string(), Value::String("OK".to_string()));
+        if let Some(schema) = meta_schema {
+            resp.insert(
+                "content".to_string(),
+                serde_json::json!({ "application/json": { "schema": schema } }),
+            );
+        }
+        responses.insert("200".to_string(), Value::Object(resp));
+        return Value::Object(responses);
+    }
+
+    let mut grouped: BTreeMap<u16, Vec<&ResponseExample>> = BTreeMap::new();
+    for ex in examples {
+        let code = if ex.status_code == 0 { 200 } else { ex.status_code };
+        grouped.entry(code).or_default().push(ex);
+    }
+
+    for (code, group) in grouped {
+        let first = group[0];
+        let reason = if first.reason.trim().is_empty() {
+            "Response"
+        } else {
+            first.reason.trim()
+        };
+        let mut resp = serde_json::Map::new();
+        resp.insert("description".to_string(), Value::String(reason.to_string()));
+
+        if !first.headers.is_empty() {
+            let mut hdrs = serde_json::Map::new();
+            for h in &first.headers {
+                if !h.name.trim().is_empty() {
+                    hdrs.insert(
+                        h.name.clone(),
+                        serde_json::json!({
+                            "schema": { "type": "string", "example": h.value }
+                        }),
+                    );
+                }
+            }
+            if !hdrs.is_empty() {
+                resp.insert("headers".to_string(), Value::Object(hdrs));
+            }
+        }
+
+        let mut content = serde_json::Map::new();
+        let media_type = first
+            .content_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/json")
+            .split(';')
+            .next()
+            .unwrap_or("application/json")
+            .trim()
+            .to_string();
+
+        let mut media_obj = serde_json::Map::new();
+        if let Some(schema) = &meta_schema {
+            media_obj.insert("schema".to_string(), schema.clone());
+        }
+        if group.len() == 1 {
+            let parsed_body = serde_json::from_str::<Value>(&first.body)
+                .unwrap_or_else(|_| Value::String(first.body.clone()));
+            media_obj.insert("example".to_string(), parsed_body);
+        } else {
+            let mut named = serde_json::Map::new();
+            for ex in group {
+                let parsed_body = serde_json::from_str::<Value>(&ex.body)
+                    .unwrap_or_else(|_| Value::String(ex.body.clone()));
+                named.insert(
+                    ex.name.clone(),
+                    serde_json::json!({ "summary": ex.name, "value": parsed_body }),
+                );
+            }
+            media_obj.insert("examples".to_string(), Value::Object(named));
+        }
+
+        content.insert(media_type, Value::Object(media_obj));
+        resp.insert("content".to_string(), Value::Object(content));
+        responses.insert(code.to_string(), Value::Object(resp));
+    }
+
+    Value::Object(responses)
+}
+
+fn meta_fields_to_json_schema(fields: &[ResponseMetaField]) -> Value {
+    if fields.len() == 1 && fields[0].name == "[]" {
+        let items = meta_fields_to_json_schema(&fields[0].children);
+        let mut arr = serde_json::Map::new();
+        arr.insert("type".to_string(), Value::String("array".to_string()));
+        arr.insert("items".to_string(), items);
+        if !fields[0].description.trim().is_empty() {
+            arr.insert(
+                "description".to_string(),
+                Value::String(fields[0].description.clone()),
+            );
+        }
+        return Value::Object(arr);
+    }
+
+    let mut props = serde_json::Map::new();
+    for f in fields {
+        let mut prop = serde_json::Map::new();
+        let ty = f
+            .field_type
+            .split(" | ")
+            .next()
+            .unwrap_or("string")
+            .trim();
+        let json_ty = match ty {
+            "integer" | "number" | "boolean" | "object" | "array" => ty,
+            _ => "string",
+        };
+        prop.insert("type".to_string(), Value::String(json_ty.to_string()));
+        if !f.description.trim().is_empty() {
+            prop.insert(
+                "description".to_string(),
+                Value::String(f.description.clone()),
+            );
+        }
+        if !f.example.trim().is_empty() {
+            prop.insert("example".to_string(), Value::String(f.example.clone()));
+        }
+        if !f.children.is_empty() {
+            if json_ty == "array" {
+                prop.insert("items".to_string(), meta_fields_to_json_schema(&f.children));
+            } else {
+                let nested = meta_fields_to_json_schema(&f.children);
+                if let Some(nested_props) = nested.get("properties") {
+                    prop.insert("properties".to_string(), nested_props.clone());
+                }
+            }
+        }
+        props.insert(f.name.clone(), Value::Object(prop));
+    }
+
+    serde_json::json!({
+        "type": "object",
+        "properties": props
+    })
+}
+
+fn register_security_scheme(
+    auth: &AuthConfig,
+    schemes: &mut serde_json::Map<String, Value>,
+) -> Option<&'static str> {
+    match auth {
+        AuthConfig::Bearer { .. } => {
+            schemes.insert(
+                "bearerAuth".to_string(),
+                serde_json::json!({ "type": "http", "scheme": "bearer" }),
+            );
+            Some("bearerAuth")
+        }
+        AuthConfig::Basic { .. } => {
+            schemes.insert(
+                "basicAuth".to_string(),
+                serde_json::json!({ "type": "http", "scheme": "basic" }),
+            );
+            Some("basicAuth")
+        }
+        AuthConfig::ApiKey { key, location, .. } => {
+            let in_loc = match location {
+                ApiKeyLocation::Query => "query",
+                ApiKeyLocation::Header => "header",
+            };
+            schemes.insert(
+                "apiKeyAuth".to_string(),
+                serde_json::json!({
+                    "type": "apiKey",
+                    "in": in_loc,
+                    "name": if key.trim().is_empty() { "X-API-Key" } else { key.trim() }
+                }),
+            );
+            Some("apiKeyAuth")
+        }
+        AuthConfig::Inherit | AuthConfig::None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,5 +1561,75 @@ mod tests {
             .unwrap();
         assert_eq!(id_field.description, "User ID");
         assert_eq!(id_field.example, "42");
+    }
+
+    #[test]
+    fn exports_project_to_openapi_3_0_and_roundtrips() {
+        let mut proj_doc = ProjectDoc::new("proj-exp", "Exported API");
+        proj_doc.base_url = "{{base_url}}".to_string();
+        proj_doc.auth = AuthConfig::Bearer {
+            token: "{{token}}".to_string(),
+            prefix: "Bearer".to_string(),
+        };
+
+        let mut env_doc = EnvironmentDoc::new("env-1", "Prod");
+        env_doc
+            .variables
+            .push(EnvVariable::new("base_url", "https://api.example.com"));
+
+        let mut req_doc = HttpRequestDoc::new(
+            "req-1",
+            "Get User",
+            HttpMethod::Get,
+            "{{base_url}}/users",
+        );
+        req_doc
+            .request
+            .params
+            .push(KeyValueRow::new("active", "true"));
+        req_doc.request.response_examples.push(ResponseExample::new(
+            "ex-1",
+            "200",
+            200,
+            "OK",
+            Some("application/json".to_string()),
+            Vec::new(),
+            r#"{"id":1,"name":"Ada"}"#,
+        ));
+        req_doc.request.response_meta.push(
+            ResponseMetaField::new("name", "string").with_description("User full name"),
+        );
+
+        let project = ProjectNode {
+            root_dir: std::path::PathBuf::from("/tmp/proj-exp"),
+            manifest_path: std::path::PathBuf::from("/tmp/proj-exp/project.yaml"),
+            doc: proj_doc,
+            environments: vec![crate::model::EnvironmentNode {
+                file_path: std::path::PathBuf::from("/tmp/proj-exp/environments/prod.env.yaml"),
+                doc: env_doc,
+            }],
+            folders: Vec::new(),
+            requests: vec![RequestNode {
+                file_path: std::path::PathBuf::from("/tmp/proj-exp/get-user.request.yaml"),
+                doc: req_doc,
+            }],
+        };
+
+        let exported_json = export_openapi_3_0(&project).expect("export openapi");
+        let reimported = parse_openapi_3_0(&exported_json).expect("reimport exported openapi");
+        assert_eq!(reimported.project.name, "Exported API");
+        assert_eq!(reimported.environments[0].name, "Prod");
+        assert_eq!(reimported.root_requests.len(), 1);
+        let re_req = &reimported.root_requests[0];
+        assert_eq!(re_req.name, "Get User");
+        assert_eq!(re_req.request.params.len(), 1);
+        assert_eq!(re_req.request.response_examples.len(), 1);
+        assert!(
+            re_req
+                .request
+                .response_meta
+                .iter()
+                .any(|f| f.name == "name" && f.description == "User full name")
+        );
     }
 }
