@@ -838,6 +838,12 @@ impl RequestTabView {
     }
 
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
+        tracing::info!(
+            project_id = %self.project_id,
+            request_id = %self.request_id,
+            dirty = self.dirty,
+            "RequestTabView::save triggered"
+        );
         let doc = self.build_doc(cx);
         cx.emit(RequestTabEvent::SaveRequest {
             project_id: self.project_id.clone(),

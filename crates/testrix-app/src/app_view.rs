@@ -239,6 +239,11 @@ impl TestrixApp {
                 })
             })
             .collect();
+        info!(
+            restored_share_count = restored_shares.len(),
+            configured_shared_projects = cfg.shared_projects.len(),
+            "loaded Testrix config on startup"
+        );
 
         let mut app = Self {
             focus_handle: cx.focus_handle(),
@@ -805,6 +810,12 @@ impl TestrixApp {
                     }
                     let req_file_path = req_node.file_path.clone();
                     let changed_file = share_file_from_disk(&proj.root_dir, &req_file_path);
+                    info!(
+                        project_id = %project_id,
+                        request_id = %request_id,
+                        changed_file = ?changed_file.as_ref().map(|f| &f.path),
+                        "SaveRequest persisted to disk; checking auto-sync"
+                    );
                     let target_key = format!("req:{request_id}");
                     if let Some(WorkbenchTab::Request(tab)) =
                         self.tabs.iter().find(|t| t.key(cx) == target_key)
@@ -954,6 +965,13 @@ impl TestrixApp {
                 self.refresh_dirty_indicators(cx);
             }
             ContainerTabEvent::ShareStarted(record) => {
+                info!(
+                    share_id = %record.id,
+                    project_id = %record.project_id,
+                    project_slug = %record.project_slug,
+                    channel = %record.channel.label(),
+                    "ShareStarted received"
+                );
                 if let Some(prev) = self.active_shares.iter().find(|s| s.id == record.id)
                     && let Some(handle) = &prev.local_handle
                 {
@@ -982,8 +1000,9 @@ impl TestrixApp {
                 target_info: s.target_info.clone(),
             })
             .collect();
-        if let Err(err) = save_config_shared_projects(&persisted) {
-            tracing::warn!(error = %err, "failed persisting remote share records");
+        match save_config_shared_projects(&persisted) {
+            Ok(()) => info!(count = persisted.len(), "persisted remote share records to config.yaml"),
+            Err(err) => tracing::warn!(error = %err, "failed persisting remote share records"),
         }
     }
 
@@ -994,7 +1013,14 @@ impl TestrixApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        info!(
+            project_id = %project_id,
+            active_shares = self.active_shares.len(),
+            changed_file = ?changed_file.as_ref().map(|f| &f.path),
+            "sync_shared_project_after_save called"
+        );
         let Some(proj) = self.workspace.find_project(project_id) else {
+            tracing::warn!(project_id = %project_id, "sync_shared_project_after_save: project not found in workspace");
             return;
         };
         for share in &self.active_shares {
@@ -1012,11 +1038,19 @@ impl TestrixApp {
             .cloned()
             .collect();
         if targets.is_empty() {
+            info!(project_id = %project_id, "no remote active_shares for project; skipping upload");
             return;
         }
         let project_name = proj.doc.name.clone();
         let project_root = proj.root_dir.clone();
         let settings = self.share_settings.clone();
+        info!(
+            project_id = %project_id,
+            target_count = targets.len(),
+            r2_bucket = %settings.cloudflare_r2_bucket,
+            r2_account = %settings.cloudflare_account_id,
+            "starting background share sync"
+        );
 
         for share in targets {
             let files = match share.channel {
@@ -1081,6 +1115,7 @@ impl TestrixApp {
                             );
                         }
                         Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "background share sync failed");
                             window.push_notification(format!("Share sync failed: {err}"), cx);
                         }
                         Err(_) => {
@@ -3106,6 +3141,7 @@ impl TestrixApp {
     }
 
     fn save_active_tab(&mut self, cx: &mut Context<Self>) {
+        info!(active_tab_ix = ?self.active_tab_ix, tab_count = self.tabs.len(), "save_active_tab triggered");
         if let Some(ix) = self.active_tab_ix
             && let Some(tab) = self.tabs.get(ix)
         {
