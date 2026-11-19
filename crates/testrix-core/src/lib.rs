@@ -44,7 +44,8 @@ pub use response::{
     detect_body_language, format_pretty_body,
 };
 pub use response_meta::{
-    ResponseExample, ResponseMetaField, extract_and_merge_response_meta, extract_response_meta,
+    ResponseExample, ResponseMetaField, extract_and_merge_request_body_meta,
+    extract_and_merge_response_meta, extract_request_body_meta, extract_response_meta,
     merge_response_meta,
 };
 pub use search::{FilteredFolder, FilteredProject, filter_workspace};

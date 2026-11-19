@@ -31,9 +31,9 @@ use testrix_core::{
     AuthNodeRef, CodegenTarget, EnvironmentDoc, FolderNode, HttpMethod, HttpRequestDoc,
     HttpResponseSnapshot, KeyValueRow, ProjectNode, RawBodyFormat, RequestBody,
     RequestExecutionState, RequestNode, RequestSettings, ResponseExample, ResponseMetaField,
-    detect_body_language, extract_and_merge_response_meta, extract_url_query_params,
-    generate_id, generate_request_code, materialize_request_doc, rename_template_variables,
-    resolve_request_doc_auth,
+    detect_body_language, extract_and_merge_request_body_meta, extract_and_merge_response_meta,
+    extract_url_query_params, generate_id, generate_request_code, materialize_request_doc,
+    rename_template_variables, resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -252,16 +252,15 @@ pub(crate) struct RequestTabView {
     active_cancel: Option<CancellationToken>,
     request_revision: u64,
 
-    // Saved response examples & extracted meta tree
+    // Saved response examples & extracted meta trees
     response_examples: Vec<ResponseExample>,
     selected_example_id: Option<String>,
     example_name_input: Entity<InputState>,
     example_body_editor: Entity<EditorState>,
     syncing_example_ui: bool,
-    response_meta: Vec<ResponseMetaField>,
-    collapsed_meta_paths: HashSet<String>,
-    meta_desc_inputs: BTreeMap<String, Entity<InputState>>,
-    meta_desc_subscriptions: Vec<Subscription>,
+    show_body_meta: bool,
+    body_meta: MetaTreeState,
+    response_meta: MetaTreeState,
 
     breadcrumb: SharedString,
     dirty: bool,
@@ -269,6 +268,28 @@ pub(crate) struct RequestTabView {
 }
 
 impl EventEmitter<RequestTabEvent> for RequestTabView {}
+
+#[derive(Default)]
+struct MetaTreeState {
+    fields: Vec<ResponseMetaField>,
+    collapsed_paths: HashSet<String>,
+    desc_inputs: BTreeMap<String, Entity<InputState>>,
+    desc_subscriptions: Vec<Subscription>,
+}
+
+impl MetaTreeState {
+    fn new(fields: Vec<ResponseMetaField>) -> Self {
+        Self {
+            fields,
+            ..Self::default()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.fields.clear();
+        self.collapsed_paths.clear();
+    }
+}
 
 impl RequestTabView {
     pub(crate) fn new(
@@ -459,7 +480,8 @@ impl RequestTabView {
                 .folding(true)
                 .default_value("")
         });
-        let response_meta = doc.request.response_meta.clone();
+        let body_meta = MetaTreeState::new(doc.request.body_meta.clone());
+        let response_meta = MetaTreeState::new(doc.request.response_meta.clone());
 
         let breadcrumb = build_breadcrumb(project, parent_folders, &doc.name);
         let parent_folder_ids = parent_folders.iter().map(|f| f.doc.id.clone()).collect();
@@ -511,17 +533,17 @@ impl RequestTabView {
             example_name_input,
             example_body_editor,
             syncing_example_ui: false,
+            show_body_meta: false,
+            body_meta,
             response_meta,
-            collapsed_meta_paths: HashSet::new(),
-            meta_desc_inputs: BTreeMap::new(),
-            meta_desc_subscriptions: Vec::new(),
             breadcrumb,
             dirty: false,
             _subscriptions: Vec::new(),
         };
         view.wire_subscriptions(window, cx);
         view.sync_selected_example_ui(window, cx);
-        view.sync_meta_desc_inputs(window, cx);
+        view.sync_meta_desc_inputs(true, window, cx);
+        view.sync_meta_desc_inputs(false, window, cx);
         view.refresh_code_preview(window, cx);
         view
     }
@@ -1063,7 +1085,28 @@ impl RequestTabView {
         doc.request.headers = self.headers_table.read(cx).snapshot(cx);
         doc.request.auth = self.auth_editor.read(cx).snapshot(cx);
         doc.request.post_script = self.post_script_editor.read(cx).value().to_string();
-        doc.request.body = match self.body_mode {
+        doc.request.body = self.current_request_body(cx);
+
+        let timeout_ms = self
+            .timeout_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .unwrap_or(self.saved_doc.request.settings.timeout_ms.max(1));
+
+        doc.request.settings =
+            RequestSettings::new(timeout_ms, self.follow_redirects, self.verify_tls);
+        doc.request.body_meta = self.body_meta.fields.clone();
+        doc.request.response_examples = self.response_examples.clone();
+        doc.request.response_meta = self.response_meta.fields.clone();
+        doc
+    }
+
+    fn current_request_body(&self, cx: &App) -> RequestBody {
+        match self.body_mode {
             BodyMode::None => RequestBody::None,
             BodyMode::Json => RequestBody::Json {
                 content: self.json_editor.read(cx).value().to_string(),
@@ -1085,23 +1128,7 @@ impl RequestTabView {
                     content_type: if ct.is_empty() { None } else { Some(ct) },
                 }
             }
-        };
-
-        let timeout_ms = self
-            .timeout_input
-            .read(cx)
-            .value()
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|ms| *ms > 0)
-            .unwrap_or(self.saved_doc.request.settings.timeout_ms.max(1));
-
-        doc.request.settings =
-            RequestSettings::new(timeout_ms, self.follow_redirects, self.verify_tls);
-        doc.request.response_examples = self.response_examples.clone();
-        doc.request.response_meta = self.response_meta.clone();
-        doc
+        }
     }
 
     fn format_json_body(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1450,88 +1477,115 @@ impl RequestTabView {
                             }))
                             .children(BodyMode::ALL.iter().map(|m| Tab::new().label(m.label()))),
                     )
-                    .when(self.body_mode == BodyMode::Json, |row| {
-                        row.child(
-                            Button::new(SharedString::from(format!("format-json-{id_base}")))
-                                .outline()
-                                .xsmall()
-                                .icon(Icon::new(LucideIcon::Sparkles))
-                                .label(crate::i18n::t("format_json"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.format_json_body(window, cx);
-                                })),
-                        )
-                    })
-                    .when(self.body_mode == BodyMode::Raw, |row| {
-                        row.child(
-                            h_flex()
-                                .gap_1()
-                                .children(RawBodyFormat::ALL.iter().map(|fmt| {
-                                    let fmt = *fmt;
-                                    Button::new(SharedString::from(format!(
-                                        "raw-fmt-{id_base}-{}",
-                                        fmt.label()
-                                    )))
-                                    .xsmall()
-                                    .label(fmt.label())
-                                    .when(self.raw_format == fmt, |b| b.primary())
-                                    .when(self.raw_format != fmt, |b| b.outline())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.raw_format = fmt;
-                                        this.raw_editor.update(cx, |ed, cx| {
-                                            ed.set_highlighter(fmt.editor_language(), cx);
-                                        });
-                                        this.on_edited(window, cx);
-                                    }))
-                                }))
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "raw-fmt-detect-{id_base}"
-                                    )))
-                                    .outline()
-                                    .xsmall()
-                                    .icon(Icon::new(LucideIcon::Sparkles))
-                                    .label(crate::i18n::t("detect"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let text = this.raw_editor.read(cx).value().to_string();
-                                        let detected = detect_body_language(&text, None);
-                                        if detected == "json" {
-                                            this.body_mode = BodyMode::Json;
-                                            this.json_editor.update(cx, |ed, cx| {
-                                                ed.set_value(text, window, cx);
-                                            });
-                                        } else {
-                                            let next_fmt = match detected {
-                                                "html" => {
-                                                    let lower = text.trim().to_ascii_lowercase();
-                                                    if lower.contains("<html")
-                                                        || lower.starts_with("<!doctype html")
-                                                    {
-                                                        RawBodyFormat::Html
-                                                    } else {
-                                                        RawBodyFormat::Xml
-                                                    }
+                    .child({
+                        let body_meta_count = count_meta_fields(&self.body_meta.fields);
+                        let meta_label = if body_meta_count > 0 {
+                            format!("Meta Info ({body_meta_count})")
+                        } else {
+                            "Meta Info".to_string()
+                        };
+                        h_flex()
+                            .gap_1()
+                            .when(self.body_mode == BodyMode::Json && !self.show_body_meta, |row| {
+                                row.child(
+                                    Button::new(SharedString::from(format!("format-json-{id_base}")))
+                                        .outline()
+                                        .xsmall()
+                                        .icon(Icon::new(LucideIcon::Sparkles))
+                                        .label(crate::i18n::t("format_json"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.format_json_body(window, cx);
+                                        })),
+                                )
+                            })
+                            .when(self.body_mode == BodyMode::Raw && !self.show_body_meta, |row| {
+                                row.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .children(RawBodyFormat::ALL.iter().map(|fmt| {
+                                            let fmt = *fmt;
+                                            Button::new(SharedString::from(format!(
+                                                "raw-fmt-{id_base}-{}",
+                                                fmt.label()
+                                            )))
+                                            .xsmall()
+                                            .label(fmt.label())
+                                            .when(self.raw_format == fmt, |b| b.primary())
+                                            .when(self.raw_format != fmt, |b| b.outline())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.raw_format = fmt;
+                                                this.raw_editor.update(cx, |ed, cx| {
+                                                    ed.set_highlighter(fmt.editor_language(), cx);
+                                                });
+                                                this.on_edited(window, cx);
+                                            }))
+                                        }))
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "raw-fmt-detect-{id_base}"
+                                            )))
+                                            .outline()
+                                            .xsmall()
+                                            .icon(Icon::new(LucideIcon::Sparkles))
+                                            .label(crate::i18n::t("detect"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let text = this.raw_editor.read(cx).value().to_string();
+                                                let detected = detect_body_language(&text, None);
+                                                if detected == "json" {
+                                                    this.body_mode = BodyMode::Json;
+                                                    this.json_editor.update(cx, |ed, cx| {
+                                                        ed.set_value(text, window, cx);
+                                                    });
+                                                } else {
+                                                    let next_fmt = match detected {
+                                                        "html" => {
+                                                            let lower = text.trim().to_ascii_lowercase();
+                                                            if lower.contains("<html")
+                                                                || lower.starts_with("<!doctype html")
+                                                            {
+                                                                RawBodyFormat::Html
+                                                            } else {
+                                                                RawBodyFormat::Xml
+                                                            }
+                                                        }
+                                                        "yaml" => RawBodyFormat::Yaml,
+                                                        "javascript" => RawBodyFormat::Javascript,
+                                                        _ => RawBodyFormat::Text,
+                                                    };
+                                                    this.raw_format = next_fmt;
+                                                    this.raw_editor.update(cx, |ed, cx| {
+                                                        ed.set_highlighter(next_fmt.editor_language(), cx);
+                                                    });
                                                 }
-                                                "yaml" => RawBodyFormat::Yaml,
-                                                "javascript" => RawBodyFormat::Javascript,
-                                                _ => RawBodyFormat::Text,
-                                            };
-                                            this.raw_format = next_fmt;
-                                            this.raw_editor.update(cx, |ed, cx| {
-                                                ed.set_highlighter(next_fmt.editor_language(), cx);
-                                            });
-                                        }
-                                        this.on_edited(window, cx);
-                                    })),
-                                ),
-                        )
+                                                this.on_edited(window, cx);
+                                            })),
+                                        ),
+                                )
+                            })
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "body-meta-toggle-{id_base}"
+                                )))
+                                .xsmall()
+                                .when(self.show_body_meta, |b| b.primary())
+                                .when(!self.show_body_meta, |b| b.outline())
+                                .label(meta_label)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_body_meta = !this.show_body_meta;
+                                    cx.notify();
+                                })),
+                            )
                     }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when(self.body_mode == BodyMode::None, |this| {
+            .when(self.show_body_meta, |this| {
+                this.child(div().flex_1().min_h_0().child(self.render_body_meta_tab(cx)))
+            })
+            .when(!self.show_body_meta, |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .when(self.body_mode == BodyMode::None, |this| {
                         this.child(
                             div()
                                 .p_4()
@@ -1606,7 +1660,8 @@ impl RequestTabView {
                                 ),
                         )
                     }),
-            )
+                )
+            })
     }
 
     fn render_post_script_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1838,12 +1893,12 @@ impl RequestTabView {
         self.selected_example_id = Some(ex_id);
 
         let extracted = extract_and_merge_response_meta(
-            &mut self.response_meta,
+            &mut self.response_meta.fields,
             &body,
             snapshot.content_type.as_deref(),
         );
         self.sync_selected_example_ui(window, cx);
-        self.sync_meta_desc_inputs(window, cx);
+        self.sync_meta_desc_inputs(false, window, cx);
         self.on_edited(window, cx);
 
         if extracted {
@@ -1867,8 +1922,8 @@ impl RequestTabView {
         };
         let body = ex.body.clone();
         let ct = ex.content_type.clone();
-        if extract_and_merge_response_meta(&mut self.response_meta, &body, ct.as_deref()) {
-            self.sync_meta_desc_inputs(window, cx);
+        if extract_and_merge_response_meta(&mut self.response_meta.fields, &body, ct.as_deref()) {
+            self.sync_meta_desc_inputs(false, window, cx);
             self.on_edited(window, cx);
             window.push_notification("Extracted and merged meta info from example.", cx);
         } else {
@@ -1884,7 +1939,7 @@ impl RequestTabView {
         let examples = self.response_examples.clone();
         for ex in &examples {
             if extract_and_merge_response_meta(
-                &mut self.response_meta,
+                &mut self.response_meta.fields,
                 &ex.body,
                 ex.content_type.as_deref(),
             ) {
@@ -1892,7 +1947,7 @@ impl RequestTabView {
             }
         }
         if extracted_count > 0 {
-            self.sync_meta_desc_inputs(window, cx);
+            self.sync_meta_desc_inputs(false, window, cx);
             self.on_edited(window, cx);
             window.push_notification(
                 format!("Merged meta info from {extracted_count} JSON/XML example(s)."),
@@ -1968,15 +2023,38 @@ impl RequestTabView {
         }
     }
 
-    fn sync_meta_desc_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn meta_state(&self, is_body: bool) -> &MetaTreeState {
+        if is_body {
+            &self.body_meta
+        } else {
+            &self.response_meta
+        }
+    }
+
+    fn meta_state_mut(&mut self, is_body: bool) -> &mut MetaTreeState {
+        if is_body {
+            &mut self.body_meta
+        } else {
+            &mut self.response_meta
+        }
+    }
+
+    fn sync_meta_desc_inputs(
+        &mut self,
+        is_body: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut flat = Vec::new();
-        collect_meta_paths(&self.response_meta, "", &mut flat);
+        collect_meta_paths(&self.meta_state(is_body).fields, "", &mut flat);
 
         let valid_paths: HashSet<String> = flat.iter().map(|(p, _)| p.clone()).collect();
-        self.meta_desc_inputs.retain(|k, _| valid_paths.contains(k));
+        self.meta_state_mut(is_body)
+            .desc_inputs
+            .retain(|k, _| valid_paths.contains(k));
 
         for (path, desc) in flat {
-            if !self.meta_desc_inputs.contains_key(&path) {
+            if !self.meta_state(is_body).desc_inputs.contains_key(&path) {
                 let input = cx.new(|cx| {
                     InputState::new(window, cx)
                         .placeholder("Add description…")
@@ -1988,27 +2066,29 @@ impl RequestTabView {
                     window,
                     move |this, _, event: &InputEvent, window, cx| {
                         if matches!(event, InputEvent::Change) {
-                            this.on_meta_description_changed(&path_clone, window, cx);
+                            this.on_meta_description_changed(is_body, &path_clone, window, cx);
                         }
                     },
                 );
-                self.meta_desc_subscriptions.push(sub);
-                self.meta_desc_inputs.insert(path, input);
+                let state = self.meta_state_mut(is_body);
+                state.desc_subscriptions.push(sub);
+                state.desc_inputs.insert(path, input);
             }
         }
     }
 
     fn on_meta_description_changed(
         &mut self,
+        is_body: bool,
         path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(input) = self.meta_desc_inputs.get(path) else {
+        let Some(input) = self.meta_state(is_body).desc_inputs.get(path) else {
             return;
         };
         let next_desc = input.read(cx).value().to_string();
-        if set_meta_description_by_path(&mut self.response_meta, path, "", &next_desc) {
+        if set_meta_description_by_path(&mut self.meta_state_mut(is_body).fields, path, "", &next_desc) {
             self.on_edited(window, cx);
         }
     }
@@ -2036,7 +2116,7 @@ impl RequestTabView {
             _ => crate::i18n::t("headers").to_string(),
         };
         let examples_label = format!("Examples ({})", self.response_examples.len());
-        let meta_count = count_meta_fields(&self.response_meta);
+        let meta_count = count_meta_fields(&self.response_meta.fields);
         let meta_label = if meta_count > 0 {
             format!("Meta Info ({meta_count})")
         } else {
@@ -2589,14 +2669,110 @@ impl RequestTabView {
             .into_any_element()
     }
 
+    fn extract_current_body_meta(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.current_request_body(cx);
+        if extract_and_merge_request_body_meta(&mut self.body_meta.fields, &body) {
+            self.sync_meta_desc_inputs(true, window, cx);
+            self.on_edited(window, cx);
+            window.push_notification("Extracted and merged request body meta info.", cx);
+        } else {
+            window.push_notification(
+                "Skipped meta extraction: body is empty or not JSON, XML, Form, or Multipart.",
+                cx,
+            );
+        }
+    }
+
+    fn render_body_meta_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
+        let has_meta = !self.body_meta.fields.is_empty();
+        let mut rows = Vec::new();
+        self.collect_meta_tree_rows(true, &self.body_meta.fields, "", 0, &mut rows, cx);
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .p_2()
+            .gap_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Extracted request body schema tree (JSON / XML / Form / Multipart) with editable descriptions"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "body-meta-extract-{id_base}"
+                                )))
+                                .outline()
+                                .xsmall()
+                                .icon(Icon::new(LucideIcon::Sparkles))
+                                .label("Extract Current")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.extract_current_body_meta(window, cx);
+                                })),
+                            )
+                            .when(has_meta, |this| {
+                                this.child(
+                                    Button::new(SharedString::from(format!(
+                                        "body-meta-clear-{id_base}"
+                                    )))
+                                    .outline()
+                                    .xsmall()
+                                    .icon(IconName::Delete)
+                                    .label("Clear")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.body_meta.clear();
+                                        this.sync_meta_desc_inputs(true, window, cx);
+                                        this.on_edited(window, cx);
+                                    })),
+                                )
+                            }),
+                    ),
+            )
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_medium()
+                                .child("No Request Body Meta Info"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Click \"Extract Current\" to parse fields from a JSON, XML, Form, or Multipart request body."),
+                        ),
+                )
+            })
+            .when(!rows.is_empty(), |this| {
+                this.child(self.render_meta_tree_table(rows, cx))
+            })
+    }
+
     fn render_meta_info_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let id_base = self.request_id.clone();
         let has_completed = matches!(self.execution, RequestExecutionState::Completed(_));
         let has_examples = !self.response_examples.is_empty();
-        let has_meta = !self.response_meta.is_empty();
+        let has_meta = !self.response_meta.fields.is_empty();
 
         let mut rows = Vec::new();
-        self.collect_meta_tree_rows(&self.response_meta, "", 0, &mut rows, cx);
+        self.collect_meta_tree_rows(false, &self.response_meta.fields, "", 0, &mut rows, cx);
 
         v_flex()
             .size_full()
@@ -2638,11 +2814,11 @@ impl RequestTabView {
                                             };
                                             let ct = snapshot.content_type.clone();
                                             if extract_and_merge_response_meta(
-                                                &mut this.response_meta,
+                                                &mut this.response_meta.fields,
                                                 &body,
                                                 ct.as_deref(),
                                             ) {
-                                                this.sync_meta_desc_inputs(window, cx);
+                                                this.sync_meta_desc_inputs(false, window, cx);
                                                 this.on_edited(window, cx);
                                                 window.push_notification(
                                                     "Extracted and merged response meta info.",
@@ -2683,8 +2859,7 @@ impl RequestTabView {
                                     .label("Clear")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.response_meta.clear();
-                                        this.collapsed_meta_paths.clear();
-                                        this.sync_meta_desc_inputs(window, cx);
+                                        this.sync_meta_desc_inputs(false, window, cx);
                                         this.on_edited(window, cx);
                                     })),
                                 )
@@ -2713,44 +2888,51 @@ impl RequestTabView {
                 )
             })
             .when(!rows.is_empty(), |this| {
-                this.child(
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded(cx.theme().radius)
-                        .overflow_hidden()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .px_3()
-                                .py_1p5()
-                                .gap_3()
-                                .bg(cx.theme().table_head)
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(div().w(px(240.)).child("Field"))
-                                .child(div().w(px(120.)).child("Type"))
-                                .child(div().w(px(180.)).child("Example"))
-                                .child(div().flex_1().min_w_0().child("Description")),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scrollbar()
-                                .children(rows),
-                        ),
-                )
+                this.child(self.render_meta_tree_table(rows, cx))
             })
+    }
+
+    fn render_meta_tree_table(
+        &self,
+        rows: Vec<gpui_kit::AnyElement>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_1p5()
+                    .gap_3()
+                    .bg(cx.theme().table_head)
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(div().w(px(240.)).child("Field"))
+                    .child(div().w(px(120.)).child("Type"))
+                    .child(div().w(px(180.)).child("Example"))
+                    .child(div().flex_1().min_w_0().child("Description")),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .children(rows),
+            )
     }
 
     fn collect_meta_tree_rows(
         &self,
+        is_body: bool,
         fields: &[ResponseMetaField],
         prefix: &str,
         depth: usize,
@@ -2758,6 +2940,8 @@ impl RequestTabView {
         cx: &mut Context<Self>,
     ) {
         let id_base = self.request_id.clone();
+        let kind_tag = if is_body { "body-meta" } else { "resp-meta" };
+        let meta_state = self.meta_state(is_body);
         for field in fields {
             let path = if prefix.is_empty() {
                 field.name.clone()
@@ -2765,7 +2949,7 @@ impl RequestTabView {
                 format!("{prefix}.{}", field.name)
             };
             let has_children = !field.children.is_empty();
-            let is_collapsed = self.collapsed_meta_paths.contains(&path);
+            let is_collapsed = meta_state.collapsed_paths.contains(&path);
             let row_ix = out.len();
             let toggle_path = path.clone();
 
@@ -2786,7 +2970,7 @@ impl RequestTabView {
                         .pl(px((depth as f32) * 16.0))
                         .child(if has_children {
                             Button::new(SharedString::from(format!(
-                                "meta-toggle-{id_base}-{row_ix}"
+                                "{kind_tag}-toggle-{id_base}-{row_ix}"
                             )))
                             .ghost()
                             .xsmall()
@@ -2796,10 +2980,11 @@ impl RequestTabView {
                                 IconName::ChevronDown
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.collapsed_meta_paths.contains(&toggle_path) {
-                                    this.collapsed_meta_paths.remove(&toggle_path);
+                                let state = this.meta_state_mut(is_body);
+                                if state.collapsed_paths.contains(&toggle_path) {
+                                    state.collapsed_paths.remove(&toggle_path);
                                 } else {
-                                    this.collapsed_meta_paths.insert(toggle_path.clone());
+                                    state.collapsed_paths.insert(toggle_path.clone());
                                 }
                                 cx.notify();
                             }))
@@ -2838,7 +3023,7 @@ impl RequestTabView {
                 )
                 .child(
                     div().flex_1().min_w_0().when_some(
-                        self.meta_desc_inputs.get(&path),
+                        meta_state.desc_inputs.get(&path),
                         |d, input| d.child(Input::new(input).xsmall()),
                     ),
                 )
@@ -2847,7 +3032,14 @@ impl RequestTabView {
             out.push(row);
 
             if has_children && !is_collapsed {
-                self.collect_meta_tree_rows(&field.children, &path, depth + 1, out, cx);
+                self.collect_meta_tree_rows(
+                    is_body,
+                    &field.children,
+                    &path,
+                    depth + 1,
+                    out,
+                    cx,
+                );
             }
         }
     }

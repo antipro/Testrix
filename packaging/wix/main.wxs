@@ -3,7 +3,8 @@
   WiX Toolset v4/v5 installer definition for Testrix (Windows x86_64).
   Built in CI via: wix build packaging/wix/main.wxs -d Version=<ver> -d ExePath=<path> -o <out.msi>
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
     Name="Testrix"
     Manufacturer="Testrix Contributors"
@@ -21,24 +22,30 @@
     <Icon Id="AppIcon.ico" SourceFile="crates/testrix-app/assets/icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
+    <!-- Allow changing the installation directory during setup -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="packaging/wix/license.rtf" />
+
     <!-- Resolve %USERPROFILE% for installing the agent skill into ~/.agents/skills/testrix-yaml/ -->
     <SetDirectory Id="USERPROFILE_DIR" Value="[%USERPROFILE]" />
 
     <Feature Id="MainFeature" Title="Testrix" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
       <ComponentRef Id="AgentSkillFile" />
     </Feature>
 
-    <!-- Install to Program Files\Testrix -->
+    <!-- Install to Program Files\Testrix (user-configurable via WixUI_InstallDir) -->
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="Testrix" />
     </StandardDirectory>
 
-    <!-- Start Menu folder -->
+    <!-- Start Menu & Desktop folders -->
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ApplicationProgramsFolder" Name="Testrix" />
     </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
 
     <!-- User profile ~/.agents/skills/testrix-yaml/ directory -->
     <Directory Id="USERPROFILE_DIR" Name="UserProfile">
@@ -76,6 +83,26 @@
           Root="HKCU"
           Key="Software\Testrix"
           Name="installed"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Desktop shortcut -->
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="B5D2F1C3-8E4A-4B9D-9F1E-7A3C6D5B8E2A">
+        <Shortcut
+          Id="ApplicationDesktopShortcut"
+          Name="Testrix"
+          Description="Testrix — YAML API Workbench"
+          Target="[INSTALLFOLDER]testrix.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon.ico" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Testrix"
+          Name="desktop_shortcut"
           Type="integer"
           Value="1"
           KeyPath="yes" />

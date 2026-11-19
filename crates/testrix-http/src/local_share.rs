@@ -569,7 +569,7 @@ function genCode(doc, target){
   else if(body.type==='binary'&&body.filePath) ls.push(`  --data-binary '@${escPosix(resolve(body.filePath))}'`);
   return ls.join(' \\\n');
 }
-function renderMeta(meta){
+function renderMeta(meta,title){
   if(!Array.isArray(meta)||!meta.length) return '';
   const rows=[];
   function walk(fs,d){
@@ -579,7 +579,7 @@ function renderMeta(meta){
     }
   }
   walk(meta,0);
-  return `<div class="section"><div class="section-title">Response Meta Info</div><table><thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+  return `<div class="section"><div class="section-title">${esc(title||'Response Meta Info')}</div><table><thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 function fmtEx(b,ct){ const s=String(b??''); if(String(ct||'').toLowerCase().includes('json')||s.trim().startsWith('{')||s.trim().startsWith('[')){ try{ return JSON.stringify(JSON.parse(s),null,2); }catch{} } return s; }
 function renderExamples(exs){
@@ -612,7 +612,7 @@ function render(){
     const m = (r.method||'GET').toUpperCase();
     const u = buildReqUrl(r);
     const targets=[['curl','cURL'],['curl-win','cURL (Win)'],['wget','wget'],['powershell','PowerShell']];
-    ct.innerHTML = `<div class="doc-header"><h1>${esc(d.name)}</h1><div style="display:flex;gap:8px"><button class="btn" onclick="copyLink(this)">Copy Link</button><button class="btn" onclick="copyCode('curl',this)">Copy cURL</button></div></div><p style="color:var(--muted)">${esc(d.description||'')}</p><div class="url-bar"><span class="badge ${esc(m)}">${esc(m)}</span><span>${esc(u)}</span></div><div class="section"><div class="section-title">Query Params</div>${kvTable(r.params)}</div><div class="section"><div class="section-title">Headers</div>${kvTable(r.headers)}</div>${r.body&&r.body.type!=='none'?`<div class="section"><div class="section-title">Body</div><pre>${esc(r.body.content||JSON.stringify(r.body,null,2))}</pre></div>`:''}<div class="section"><div class="code-hdr"><div class="section-title" style="margin:0">Code Snippet</div><div class="code-tabs">${targets.map(([id,lbl])=>`<button class="btn ${codeTarget===id?'active':''}" onclick="setTarget('${id}')">${lbl}</button>`).join('')}<button class="btn" onclick="copyCode(codeTarget,this)">Copy</button></div></div><pre id="codeBlock">${esc(genCode(d,codeTarget))}</pre></div>${renderMeta(r.responseMeta)}${renderExamples(r.responseExamples)}`;
+    ct.innerHTML = `<div class="doc-header"><h1>${esc(d.name)}</h1><div style="display:flex;gap:8px"><button class="btn" onclick="copyLink(this)">Copy Link</button><button class="btn" onclick="copyCode('curl',this)">Copy cURL</button></div></div><p style="color:var(--muted)">${esc(d.description||'')}</p><div class="url-bar"><span class="badge ${esc(m)}">${esc(m)}</span><span>${esc(u)}</span></div><div class="section"><div class="section-title">Query Params</div>${kvTable(r.params)}</div><div class="section"><div class="section-title">Headers</div>${kvTable(r.headers)}</div>${r.body&&r.body.type!=='none'?`<div class="section"><div class="section-title">Body</div><pre>${esc(r.body.content||JSON.stringify(r.body,null,2))}</pre></div>`:''}${renderMeta(r.bodyMeta,'Body Meta Info')}<div class="section"><div class="code-hdr"><div class="section-title" style="margin:0">Code Snippet</div><div class="code-tabs">${targets.map(([id,lbl])=>`<button class="btn ${codeTarget===id?'active':''}" onclick="setTarget('${id}')">${lbl}</button>`).join('')}<button class="btn" onclick="copyCode(codeTarget,this)">Copy</button></div></div><pre id="codeBlock">${esc(genCode(d,codeTarget))}</pre></div>${renderMeta(r.responseMeta,'Response Meta Info')}${renderExamples(r.responseExamples)}`;
   }
 }
 function findF(list,id){ for(const f of list||[]){ if(f.relPath===id) return f; const sub=findF(f.folders,id); if(sub) return sub; } }

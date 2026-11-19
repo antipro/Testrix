@@ -477,6 +477,8 @@ pub struct HttpRequestSpec {
     #[serde(default)]
     pub settings: RequestSettings,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_meta: Vec<ResponseMetaField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub response_examples: Vec<ResponseExample>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub response_meta: Vec<ResponseMetaField>,
@@ -493,6 +495,7 @@ impl Default for HttpRequestSpec {
             body: RequestBody::None,
             post_script: String::new(),
             settings: RequestSettings::default(),
+            body_meta: Vec::new(),
             response_examples: Vec::new(),
             response_meta: Vec::new(),
         }

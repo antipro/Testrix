@@ -133,6 +133,8 @@ pub fn extract_response_meta(
     None
 }
 
+use crate::model::{MultipartFieldType, RawBodyFormat, RequestBody};
+
 /// Extracts meta-info from `body` and merges it into `existing`.
 ///
 /// Returns `true` if `body` was JSON or XML and extraction succeeded, or `false` if
@@ -143,6 +145,80 @@ pub fn extract_and_merge_response_meta(
     content_type: Option<&str>,
 ) -> bool {
     let Some(incoming) = extract_response_meta(body, content_type) else {
+        return false;
+    };
+    merge_response_meta(existing, incoming);
+    true
+}
+
+/// Extracts structured field metadata from an HTTP [`RequestBody`].
+///
+/// Supports JSON, XML (in `Raw`), `application/x-www-form-urlencoded`, and
+/// `multipart/form-data` payloads. Returns `None` for empty, binary, or
+/// unparseable payloads.
+pub fn extract_request_body_meta(body: &RequestBody) -> Option<Vec<ResponseMetaField>> {
+    match body {
+        RequestBody::Json { content } => extract_response_meta(content, Some("application/json")),
+        RequestBody::Raw {
+            content,
+            raw_format,
+        } => {
+            let ct = match raw_format {
+                RawBodyFormat::Xml => Some("application/xml"),
+                RawBodyFormat::Html => Some("text/html"),
+                RawBodyFormat::Text | RawBodyFormat::Javascript | RawBodyFormat::Yaml => None,
+            };
+            extract_response_meta(content, ct)
+        }
+        RequestBody::FormUrlEncoded { fields } => {
+            let mut out = Vec::new();
+            for row in fields {
+                if !row.enabled || row.name.trim().is_empty() {
+                    continue;
+                }
+                let mut f = ResponseMetaField::new(row.name.trim(), "string")
+                    .with_example(truncate_example(&row.value));
+                if !row.description.trim().is_empty() {
+                    f = f.with_description(row.description.trim());
+                }
+                out.push(f);
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        RequestBody::Multipart { fields } => {
+            let mut out = Vec::new();
+            for field in fields {
+                if !field.enabled || field.name.trim().is_empty() {
+                    continue;
+                }
+                let ty = match field.field_type {
+                    MultipartFieldType::File => "file",
+                    MultipartFieldType::Text => "string",
+                };
+                let example = if field.value.is_empty() {
+                    field.file_name.as_deref().unwrap_or("")
+                } else {
+                    field.value.as_str()
+                };
+                let mut f =
+                    ResponseMetaField::new(field.name.trim(), ty).with_example(truncate_example(example));
+                if !field.description.trim().is_empty() {
+                    f = f.with_description(field.description.trim());
+                }
+                out.push(f);
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        RequestBody::None | RequestBody::Binary { .. } => None,
+    }
+}
+
+/// Extracts meta-info from a [`RequestBody`] and merges it into `existing`.
+pub fn extract_and_merge_request_body_meta(
+    existing: &mut Vec<ResponseMetaField>,
+    body: &RequestBody,
+) -> bool {
+    let Some(incoming) = extract_request_body_meta(body) else {
         return false;
     };
     merge_response_meta(existing, incoming);
@@ -767,5 +843,52 @@ mod tests {
         assert!(extract_response_meta("<!DOCTYPE html><html></html>", None).is_none());
         assert!(extract_response_meta("{broken json", Some("application/json")).is_none());
         assert!(extract_response_meta("<unclosed><tag>", Some("application/xml")).is_none());
+    }
+
+    #[test]
+    fn extracts_and_merges_request_body_meta_across_payload_modes() {
+        use crate::model::{KeyValueRow, MultipartField, RawBodyFormat};
+
+        let mut meta = Vec::new();
+        let json_body = RequestBody::Json {
+            content: r#"{"username":"alice","profile":{"age":30}}"#.to_string(),
+        };
+        assert!(extract_and_merge_request_body_meta(&mut meta, &json_body));
+        meta.iter_mut()
+            .find(|f| f.name == "username")
+            .unwrap()
+            .description = "Login account".to_string();
+
+        let json_body_v2 = RequestBody::Json {
+            content: r#"{"username":"bob","role":"admin"}"#.to_string(),
+        };
+        assert!(extract_and_merge_request_body_meta(&mut meta, &json_body_v2));
+        assert_eq!(
+            meta.iter().find(|f| f.name == "username").unwrap().description,
+            "Login account"
+        );
+        assert!(meta.iter().any(|f| f.name == "role" && f.field_type == "string"));
+
+        let form_body = RequestBody::FormUrlEncoded {
+            fields: vec![KeyValueRow::new("grant_type", "password").with_description("OAuth grant")],
+        };
+        let form_meta = extract_request_body_meta(&form_body).unwrap();
+        assert_eq!(form_meta.len(), 1);
+        assert_eq!(form_meta[0].name, "grant_type");
+        assert_eq!(form_meta[0].description, "OAuth grant");
+
+        let multipart_body = RequestBody::Multipart {
+            fields: vec![MultipartField::file("avatar", "/tmp/a.png")],
+        };
+        let mp_meta = extract_request_body_meta(&multipart_body).unwrap();
+        assert_eq!(mp_meta[0].name, "avatar");
+        assert_eq!(mp_meta[0].field_type, "file");
+
+        let xml_body = RequestBody::Raw {
+            raw_format: RawBodyFormat::Xml,
+            content: "<user><id>1</id></user>".to_string(),
+        };
+        assert!(extract_request_body_meta(&xml_body).is_some());
+        assert!(extract_request_body_meta(&RequestBody::None).is_none());
     }
 }

@@ -385,8 +385,9 @@ function renderRightContent() {
       ${renderAuthSummary(r.auth)}
     </div>
     ${renderBodySection(r.body)}
+    ${renderResponseMetaSection(r.bodyMeta, 'Body Meta Info')}
     ${renderCodeSection(d)}
-    ${renderResponseMetaSection(r.responseMeta)}
+    ${renderResponseMetaSection(r.responseMeta, 'Response Meta Info')}
     ${renderResponseExamplesSection(r.responseExamples)}
   `;
 }
@@ -606,7 +607,7 @@ function renderCodeSection(reqDoc) {
   `;
 }
 
-function renderResponseMetaSection(meta) {
+function renderResponseMetaSection(meta, title = 'Response Meta Info') {
   if (!Array.isArray(meta) || meta.length === 0) return '';
   const rows = [];
   function walk(fields, depth) {
@@ -633,7 +634,7 @@ function renderResponseMetaSection(meta) {
   walk(meta, 0);
   return `
     <div class="section">
-      <div class="section-title">Response Meta Info</div>
+      <div class="section-title">${esc(title)}</div>
       <table class="kv-table">
         <thead><tr><th>Field</th><th>Type</th><th>Example</th><th>Description</th></tr></thead>
         <tbody>${rows.join('')}</tbody>
