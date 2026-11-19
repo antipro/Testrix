@@ -314,6 +314,20 @@ impl TestrixApp {
             .map(|tab| tab.key(cx))
     }
 
+    pub fn set_share_settings_for_test(
+        &mut self,
+        settings: ShareSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.share_settings = settings;
+        self.sync_all_tabs(window, cx);
+    }
+
+    pub fn active_share_count(&self) -> usize {
+        self.active_shares.len()
+    }
+
     fn wire_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut subs = Vec::new();
 

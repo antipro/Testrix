@@ -504,3 +504,133 @@ async fn workspace_button_in_titlebar_opens_workspace_dialog(cx: &mut TestAppCon
     })
     .await;
 }
+
+#[gpui_kit::test]
+async fn auto_sync_triggers_on_ctrl_s_after_editing_meta_info(cx: &mut TestAppContext) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                let s = String::from_utf8_lossy(&buf);
+                if let Some(hdr_end) = s.find("\r\n\r\n") {
+                    let headers = &s[..hdr_end];
+                    let content_len = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= hdr_end + 4 + content_len {
+                        let body = String::from_utf8_lossy(&buf[hdr_end + 4..]).to_string();
+                        let _ = tx.send(body);
+                        let resp_body = format!(
+                            r#"{{"ok":true,"filesWritten":1,"shareUrl":"http://{addr}/s/starter"}}"#
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        socket.write_all(resp.as_bytes()).unwrap();
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let dir = TempDir::new().unwrap();
+    ensure_seeded_workspace(dir.path()).unwrap();
+    cx.update(init_app);
+
+    let (handle, app) = open_testrix_test_window(cx, dir.path().to_path_buf());
+
+    // Configure mock share server and click Upload YAML on the project
+    cx.update_window(handle.into(), |_, window, cx| {
+        app.update(cx, |this, cx| {
+            this.set_share_settings_for_test(
+                testrix_storage::ShareSettings {
+                    share_server_url: format!("http://{addr}"),
+                    share_email: "test@example.com".to_string(),
+                    share_token: "tok-123".to_string(),
+                    cloudflare_account_id: String::new(),
+                    cloudflare_r2_bucket: String::new(),
+                    cloudflare_api_token: String::new(),
+                    cloudflare_pages_url: String::new(),
+                    share_access_token: String::new(),
+                },
+                window,
+                cx,
+            );
+        });
+        app.update(cx, |this, cx| {
+            this.open_node(
+                ExplorerNode::Project {
+                    project_id: "proj-starter".to_string(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window
+            .within("container-sections-proj:proj-starter")
+            .click(4usize, cx);
+        window.render_frame(cx);
+        window.click("share-upload-btn", cx);
+    })
+    .unwrap();
+
+    // Wait for initial share upload
+    let first_upload = rx.recv_timeout(Duration::from_secs(5)).expect("initial share upload");
+    assert!(first_upload.contains("Starter Platform API"));
+
+    cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+        app.read(cx).active_share_count() >= 1
+    })
+    .await;
+
+    // Now open a request, edit URL, and press ctrl-s
+    cx.update_window(handle.into(), |_, window, cx| {
+        app.update(cx, |this, cx| {
+            this.open_node(
+                ExplorerNode::Request {
+                    project_id: "proj-starter".to_string(),
+                    request_id: "req-inspect-get".to_string(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.click("req-url-req-inspect-get", cx);
+        window.input("/v2", cx);
+        window.render_frame(cx);
+        window.press("ctrl-s", cx);
+    })
+    .unwrap();
+
+    let second_upload = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("auto-sync upload after ctrl-s");
+    assert!(
+        second_upload.contains("/v2"),
+        "expected updated request YAML in auto-sync upload"
+    );
+}
