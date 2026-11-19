@@ -59,6 +59,7 @@ pub(crate) enum ExplorerEvent {
     ExportOpenApi {
         project_id: String,
     },
+    ExpandedStateChanged(Vec<String>),
     ReloadWorkspace,
 }
 
@@ -123,6 +124,9 @@ impl ExplorerPanel {
                     this.expanded_ids.remove(id.as_ref());
                 }
             }
+            cx.emit(ExplorerEvent::ExpandedStateChanged(
+                this.sorted_expanded_ids(),
+            ));
             cx.notify();
         });
 
@@ -148,16 +152,17 @@ impl ExplorerPanel {
         cx.notify();
     }
 
+    pub(crate) fn set_expanded_ids(&mut self, ids: Vec<String>) {
+        self.expanded_ids = ids.into_iter().collect();
+    }
+
+    fn sorted_expanded_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.expanded_ids.iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn set_workspace(&mut self, workspace: WorkspaceTree, cx: &mut Context<Self>) {
-        // Auto-expand projects and top-level folders on initial population.
-        if self.expanded_ids.is_empty() {
-            for proj in &workspace.projects {
-                self.expanded_ids.insert(format!("proj:{}", proj.doc.id));
-                for folder in &proj.folders {
-                    self.expanded_ids.insert(format!("fld:{}", folder.doc.id));
-                }
-            }
-        }
         self.workspace_snapshot = workspace;
         self.rebuild_tree(cx);
     }
@@ -179,6 +184,9 @@ impl ExplorerPanel {
         } else {
             self.expanded_ids.insert(tree_id.to_string());
         }
+        cx.emit(ExplorerEvent::ExpandedStateChanged(
+            self.sorted_expanded_ids(),
+        ));
         self.rebuild_tree(cx);
     }
 

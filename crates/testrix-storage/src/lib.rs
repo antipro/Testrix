@@ -14,13 +14,13 @@ pub use workspace::{
     default_workspace_dir, delete_environment, delete_folder, delete_project, delete_request,
     duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
     init_or_load_config, init_or_load_config_at, load_project, load_request_response,
-    load_workspace, load_workspace_environments, load_workspace_tabs, merge_environments_into_dir,
-    save_config_preferences, save_config_preferences_at,
-    save_config_share_settings, save_config_share_settings_at, save_config_shared_projects,
-    save_config_shared_projects_at, save_config_workspace_dir, save_config_workspace_dir_at,
-    save_environment, save_folder, save_project, save_request, save_request_response,
-    save_workspace_state, save_workspace_tabs, to_yaml_pretty, validate_yaml_file,
-    write_yaml_atomic,
+    load_workspace, load_workspace_environments, load_workspace_explorer_state,
+    load_workspace_tabs, merge_environments_into_dir, save_config_preferences,
+    save_config_preferences_at, save_config_share_settings, save_config_share_settings_at,
+    save_config_shared_projects, save_config_shared_projects_at, save_config_workspace_dir,
+    save_config_workspace_dir_at, save_environment, save_folder, save_project, save_request,
+    save_request_response, save_workspace_explorer_state, save_workspace_state, save_workspace_tabs,
+    to_yaml_pretty, validate_yaml_file, write_yaml_atomic,
 };
 
 #[cfg(test)]

@@ -38,6 +38,8 @@ struct WorkspaceStateFile {
     open_tabs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_tab_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expanded_nodes: Vec<String>,
 }
 
 /// Persisted open-tab list and active tab key for a workspace.
@@ -247,6 +249,33 @@ pub fn load_workspace_tabs(workspace_root: &Path) -> WorkspaceTabState {
         open_tabs: state.open_tabs,
         active_tab_key: state.active_tab_key,
     }
+}
+
+/// Loads the persisted expanded explorer node IDs from `.testrix-state.yaml`.
+pub fn load_workspace_explorer_state(workspace_root: &Path) -> Vec<String> {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    if !state_path.is_file() {
+        return Vec::new();
+    }
+    read_yaml_file::<WorkspaceStateFile>(&state_path)
+        .map(|s| s.expanded_nodes)
+        .unwrap_or_default()
+}
+
+/// Persists the expanded explorer node IDs in `.testrix-state.yaml`,
+/// preserving active project/environment and open-tab state.
+pub fn save_workspace_explorer_state(
+    workspace_root: &Path,
+    expanded_nodes: &[String],
+) -> Result<(), StorageError> {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    let mut state = if state_path.is_file() {
+        read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
+    } else {
+        WorkspaceStateFile::default()
+    };
+    state.expanded_nodes = expanded_nodes.to_vec();
+    write_yaml_atomic(&state_path, &state)
 }
 
 /// Persists the open-tab keys and active tab key into `.testrix-state.yaml`.

@@ -55,9 +55,10 @@ use testrix_storage::{
     create_project, create_request, delete_environment, delete_folder, delete_project,
     delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
     init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
-    load_workspace_tabs, save_config_preferences, save_config_share_settings, save_config_shared_projects,
-    save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
-    save_request_response, save_workspace_state, save_workspace_tabs,
+    load_workspace_explorer_state, load_workspace_tabs, save_config_preferences,
+    save_config_share_settings, save_config_shared_projects, save_config_workspace_dir,
+    save_environment, save_folder, save_project, save_request, save_request_response,
+    save_workspace_explorer_state, save_workspace_state, save_workspace_tabs,
 };
 use tracing::{error, info};
 
@@ -293,7 +294,9 @@ impl TestrixApp {
         });
 
         app.wire_subscriptions(window, cx);
+        let saved_expanded = load_workspace_explorer_state(&app.workspace.root_dir);
         app.explorer.update(cx, |panel, cx| {
+            panel.set_expanded_ids(saved_expanded);
             panel.set_workspace(app.workspace.clone(), cx);
         });
         app.sync_env_editor(window, cx);
@@ -508,6 +511,9 @@ impl TestrixApp {
             ExplorerEvent::ImportApifox => self.prompt_import_apifox(window, cx),
             ExplorerEvent::ExportOpenApi { project_id } => {
                 self.prompt_export_openapi(project_id, window, cx)
+            }
+            ExplorerEvent::ExpandedStateChanged(expanded) => {
+                let _ = save_workspace_explorer_state(&self.workspace.root_dir, &expanded);
             }
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
@@ -2481,7 +2487,9 @@ impl TestrixApp {
                 self.workspace = tree;
                 self.tabs.clear();
                 self.active_tab_ix = None;
+                let saved_expanded = load_workspace_explorer_state(&self.workspace.root_dir);
                 self.explorer.update(cx, |panel, cx| {
+                    panel.set_expanded_ids(saved_expanded);
                     panel.set_workspace(self.workspace.clone(), cx)
                 });
                 self.refresh_profile_selector(window, cx);
