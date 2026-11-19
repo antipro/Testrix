@@ -25,9 +25,9 @@ use gpui_kit::{
         },
         form::{Field, Form},
         h_flex,
-        input::{Input, InputState, Textarea, TextareaState},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
         menu::{ContextMenuExt as _, PopupMenuItem},
-        resizable::{h_resizable, resizable_panel},
+        resizable::{h_resizable, resizable_panel, v_resizable},
         select::{Select, SelectEvent, SelectItem, SelectState},
         spinner::Spinner,
         status_bar::StatusBar,
@@ -42,8 +42,9 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthConfig, AuthNodeRef, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
-    HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
-    export_openapi_3_0, parse_apifox, parse_openapi_3_0, parse_postman_collection,
+    HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody,
+    RequestHistoryEntry, RequestSet, RequestSetFolder, RequestSetItem, WorkspaceTree,
+    export_openapi_3_0, generate_id, parse_apifox, parse_openapi_3_0, parse_postman_collection,
     parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
 };
 use testrix_http::{
@@ -56,10 +57,11 @@ use testrix_storage::{
     create_project, create_request, delete_environment, delete_folder, delete_project,
     delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
     init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
-    load_workspace_explorer_state, load_workspace_tabs, move_request, save_config_preferences,
-    save_config_share_settings, save_config_shared_projects, save_config_workspace_dir,
-    save_environment, save_folder, save_project, save_request, save_request_response,
-    save_workspace_explorer_state, save_workspace_state, save_workspace_tabs,
+    load_workspace_explorer_state, load_workspace_history, load_workspace_sets, load_workspace_tabs,
+    move_request, save_config_preferences, save_config_share_settings, save_config_shared_projects,
+    save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
+    save_request_response, save_workspace_explorer_state, save_workspace_history,
+    save_workspace_sets, save_workspace_state, save_workspace_tabs,
 };
 use tracing::{error, info};
 
@@ -70,8 +72,11 @@ use crate::{
     },
     container_editor::{ActiveShareRecord, ContainerTabEvent, ContainerTabView},
     env_editor::{EnvEditorEvent, EnvEditorView},
-    explorer::{ExplorerEvent, ExplorerPanel},
+    explorer::ExplorerEvent,
+    history_panel::HistoryPanelEvent,
     request_editor::{RequestTabEvent, RequestTabView},
+    sets_panel::SetsPanelEvent,
+    sidebar_pane::{SidebarPane, SidebarPaneEvent, SidebarViewMode},
     theme_helpers::method_badge,
 };
 
@@ -237,7 +242,10 @@ pub struct TestrixApp {
     workspace_dir: PathBuf,
     workspace: WorkspaceTree,
     runner: HttpRunner,
-    explorer: Entity<ExplorerPanel>,
+    sidebar_panes: Vec<Entity<SidebarPane>>,
+    sidebar_pane_subscriptions: Vec<Subscription>,
+    history_entries: Vec<RequestHistoryEntry>,
+    request_sets: Vec<RequestSet>,
     env_editor: Entity<EnvEditorView>,
     profile_select: Entity<SelectState<Vec<ProfileOption>>>,
     language_select: Entity<SelectState<Vec<LanguageOption>>>,
@@ -277,7 +285,12 @@ impl TestrixApp {
         };
 
         let runner = HttpRunner::new().expect("failed to initialize HTTP runner");
-        let explorer = cx.new(|cx| ExplorerPanel::new(window, cx));
+        let initial_pane_id = generate_id("pane");
+        let initial_pane = cx.new(|cx| {
+            SidebarPane::new(initial_pane_id, SidebarViewMode::Explorer, false, window, cx)
+        });
+        let history_entries = load_workspace_history(&workspace.root_dir);
+        let request_sets = load_workspace_sets(&workspace.root_dir);
         let env_editor = cx.new(|cx| EnvEditorView::new(window, cx));
 
         let (profile_items, selected_ix) = build_profile_options(&workspace);
@@ -354,7 +367,10 @@ impl TestrixApp {
             workspace_dir,
             workspace,
             runner,
-            explorer,
+            sidebar_panes: vec![initial_pane],
+            sidebar_pane_subscriptions: Vec::new(),
+            history_entries,
+            request_sets,
             env_editor,
             profile_select,
             language_select,
@@ -430,10 +446,7 @@ impl TestrixApp {
 
         app.wire_subscriptions(window, cx);
         let saved_expanded = load_workspace_explorer_state(&app.workspace.root_dir);
-        app.explorer.update(cx, |panel, cx| {
-            panel.set_expanded_ids(saved_expanded);
-            panel.set_workspace(app.workspace.clone(), cx);
-        });
+        app.sync_sidebars(Some(&saved_expanded), cx);
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
         app
@@ -524,13 +537,7 @@ impl TestrixApp {
             },
         ));
 
-        subs.push(cx.subscribe_in(
-            &self.explorer,
-            window,
-            |this, _, event: &ExplorerEvent, window, cx| {
-                this.handle_explorer_event(event.clone(), window, cx);
-            },
-        ));
+        self.wire_sidebar_pane_subscriptions(window, cx);
 
         subs.push(cx.subscribe_in(
             &self.env_editor,
@@ -541,6 +548,60 @@ impl TestrixApp {
         ));
 
         self._subscriptions = subs;
+    }
+
+    fn wire_sidebar_pane_subscriptions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let can_close = self.sidebar_panes.len() > 1;
+        let mut pane_subs = Vec::new();
+        for pane in &self.sidebar_panes {
+            pane.update(cx, |p, cx| p.set_can_close(can_close, cx));
+            pane_subs.push(cx.subscribe_in(
+                pane,
+                window,
+                |this, _, event: &SidebarPaneEvent, window, cx| {
+                    this.handle_sidebar_pane_event(event.clone(), window, cx);
+                },
+            ));
+        }
+        self.sidebar_pane_subscriptions = pane_subs;
+    }
+
+    fn sync_sidebars(&mut self, expanded_nodes: Option<&[String]>, cx: &mut Context<Self>) {
+        for pane in &self.sidebar_panes {
+            pane.update(cx, |p, cx| {
+                p.sync_data(
+                    &self.workspace,
+                    &self.history_entries,
+                    &self.request_sets,
+                    expanded_nodes,
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn reveal_and_select_in_explorers(&mut self, key: &str, cx: &mut Context<Self>) {
+        for pane in &self.sidebar_panes {
+            pane.update(cx, |p, cx| {
+                p.explorer.update(cx, |panel, cx| {
+                    panel.reveal_and_select(key, cx);
+                });
+            });
+        }
+    }
+
+    fn set_dirty_keys_in_explorers(&mut self, dirty: HashSet<String>, cx: &mut Context<Self>) {
+        for pane in &self.sidebar_panes {
+            pane.update(cx, |p, cx| {
+                p.explorer.update(cx, |panel, cx| {
+                    panel.set_dirty_keys(dirty.clone(), cx);
+                });
+            });
+        }
     }
 
     fn restore_or_open_initial_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -558,8 +619,7 @@ impl TestrixApp {
                     && let Some(ix) = self.tabs.iter().position(|t| t.key(cx) == active_key)
                 {
                     self.active_tab_ix = Some(ix);
-                    self.explorer
-                        .update(cx, |panel, cx| panel.reveal_and_select(&active_key, cx));
+                    self.reveal_and_select_in_explorers(&active_key, cx);
                 }
                 self.persist_open_tabs(cx);
                 return;
@@ -683,11 +743,475 @@ impl TestrixApp {
                 window,
                 cx,
             ),
+            ExplorerEvent::CreateRequestFromDoc {
+                target_project_id,
+                target_folder_id,
+                doc,
+            } => self.create_request_from_doc(
+                &target_project_id,
+                target_folder_id.as_deref(),
+                doc,
+                window,
+                cx,
+            ),
             ExplorerEvent::ExpandedStateChanged(expanded) => {
                 let _ = save_workspace_explorer_state(&self.workspace.root_dir, &expanded);
             }
             ExplorerEvent::ReloadWorkspace => self.reload_workspace(window, cx),
         }
+    }
+
+    fn handle_sidebar_pane_event(
+        &mut self,
+        event: SidebarPaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SidebarPaneEvent::Explorer(e) => self.handle_explorer_event(e, window, cx),
+            SidebarPaneEvent::History(e) => self.handle_history_event(e, window, cx),
+            SidebarPaneEvent::Sets(e) => self.handle_sets_event(e, window, cx),
+            SidebarPaneEvent::SplitRequested(pane_id) => {
+                let Some(pos) = self.sidebar_panes.iter().position(|p| p.read(cx).id == pane_id)
+                else {
+                    return;
+                };
+                let next_mode = match self.sidebar_panes[pos].read(cx).mode {
+                    SidebarViewMode::Explorer => SidebarViewMode::Set,
+                    SidebarViewMode::Set => SidebarViewMode::History,
+                    SidebarViewMode::History => SidebarViewMode::Explorer,
+                };
+                let new_id = generate_id("pane");
+                let new_pane = cx.new(|cx| {
+                    SidebarPane::new(new_id, next_mode, true, window, cx)
+                });
+                self.sidebar_panes.insert(pos + 1, new_pane);
+                self.wire_sidebar_pane_subscriptions(window, cx);
+                let saved_expanded = load_workspace_explorer_state(&self.workspace.root_dir);
+                self.sync_sidebars(Some(&saved_expanded), cx);
+                cx.notify();
+            }
+            SidebarPaneEvent::CloseRequested(pane_id) => {
+                if self.sidebar_panes.len() <= 1 {
+                    return;
+                }
+                self.sidebar_panes.retain(|p| p.read(cx).id != pane_id);
+                self.wire_sidebar_pane_subscriptions(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_history_event(
+        &mut self,
+        event: HistoryPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            HistoryPanelEvent::ClearHistory => {
+                self.history_entries.clear();
+                let _ = save_workspace_history(&self.workspace.root_dir, &self.history_entries);
+                self.sync_sidebars(None, cx);
+                window.push_notification("History cleared.", cx);
+            }
+            HistoryPanelEvent::OpenEntry(entry) => {
+                let existing = entry
+                    .project_id
+                    .as_ref()
+                    .zip(entry.request_id.as_ref())
+                    .and_then(|(pid, rid)| {
+                        self.workspace
+                            .find_project(pid)
+                            .and_then(|p| p.find_request(rid))
+                            .map(|_| (pid.clone(), rid.clone()))
+                    });
+
+                if let Some((pid, rid)) = existing {
+                    self.open_node(
+                        ExplorerNode::Request {
+                            project_id: pid,
+                            request_id: rid.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                    let target_key = format!("req:{rid}");
+                    if let Some(WorkbenchTab::Request(tab)) =
+                        self.tabs.iter().find(|t| t.key(cx) == target_key)
+                    {
+                        tab.update(cx, |view, cx| {
+                            view.recover_from_doc(&entry.doc, window, cx);
+                        });
+                    }
+                    window.push_notification("Recovered request from history (unsaved).", cx);
+                } else {
+                    let mut doc = entry.doc.clone();
+                    doc.id = generate_id("req");
+                    let stub_proj = ProjectNode {
+                        doc: testrix_core::ProjectDoc::new("", "History"),
+                        root_dir: self.workspace.root_dir.clone(),
+                        manifest_path: PathBuf::new(),
+                        environments: Vec::new(),
+                        folders: Vec::new(),
+                        requests: Vec::new(),
+                    };
+                    let req_node = testrix_core::RequestNode {
+                        doc: doc.clone(),
+                        file_path: PathBuf::new(),
+                    };
+                    let active_env = self.workspace.active_environment().map(|e| e.doc.clone());
+                    let runner = self.runner.clone();
+                    let tab_view = cx.new(|cx| {
+                        let mut v = RequestTabView::new(
+                            &stub_proj,
+                            &[],
+                            &req_node,
+                            active_env,
+                            runner,
+                            window,
+                            cx,
+                        );
+                        v.set_ephemeral(true);
+                        v
+                    });
+                    let sub = cx.subscribe_in(
+                        &tab_view,
+                        window,
+                        |this, _, event: &RequestTabEvent, window, cx| {
+                            this.handle_request_tab_event(event.clone(), window, cx);
+                        },
+                    );
+                    self._subscriptions.push(sub);
+                    self.tabs.push(WorkbenchTab::Request(tab_view));
+                    self.active_tab_ix = Some(self.tabs.len() - 1);
+                    self.refresh_dirty_indicators(cx);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn handle_sets_event(
+        &mut self,
+        event: SetsPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SetsPanelEvent::CreateSet => {
+                self.open_set_name_dialog("New Package", "", None, window, cx, |this, name| {
+                    this.request_sets.push(RequestSet {
+                        id: generate_id("set"),
+                        name,
+                        folders: Vec::new(),
+                        requests: Vec::new(),
+                    });
+                });
+            }
+            SetsPanelEvent::RenameSet { set_id } => {
+                let current = self
+                    .request_sets
+                    .iter()
+                    .find(|s| s.id == set_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                self.open_set_name_dialog(
+                    "Rename Package",
+                    &current,
+                    None,
+                    window,
+                    cx,
+                    move |this, name| {
+                        if let Some(s) = this.request_sets.iter_mut().find(|s| s.id == set_id) {
+                            s.name = name;
+                        }
+                    },
+                );
+            }
+            SetsPanelEvent::DeleteSet { set_id } => {
+                self.request_sets.retain(|s| s.id != set_id);
+                let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                self.sync_sidebars(None, cx);
+            }
+            SetsPanelEvent::CreateFolder {
+                set_id,
+                parent_folder_id,
+            } => {
+                self.open_set_name_dialog(
+                    "New Package Folder",
+                    "",
+                    None,
+                    window,
+                    cx,
+                    move |this, name| {
+                        let new_folder = RequestSetFolder {
+                            id: generate_id("setf"),
+                            name,
+                            folders: Vec::new(),
+                            requests: Vec::new(),
+                        };
+                        if let Some(set) = this.request_sets.iter_mut().find(|s| s.id == set_id) {
+                            if let Some(pid) = &parent_folder_id {
+                                let _ = insert_set_folder(&mut set.folders, pid, new_folder);
+                            } else {
+                                set.folders.push(new_folder);
+                            }
+                        }
+                    },
+                );
+            }
+            SetsPanelEvent::RenameFolder { set_id, folder_id } => {
+                let current = self
+                    .request_sets
+                    .iter()
+                    .find(|s| s.id == set_id)
+                    .and_then(|s| find_set_folder_name(&s.folders, &folder_id))
+                    .unwrap_or_default();
+                self.open_set_name_dialog(
+                    "Rename Package Folder",
+                    &current,
+                    None,
+                    window,
+                    cx,
+                    move |this, name| {
+                        if let Some(set) = this.request_sets.iter_mut().find(|s| s.id == set_id) {
+                            rename_set_folder(&mut set.folders, &folder_id, &name);
+                        }
+                    },
+                );
+            }
+            SetsPanelEvent::DeleteFolder { set_id, folder_id } => {
+                if let Some(set) = self.request_sets.iter_mut().find(|s| s.id == set_id) {
+                    remove_set_folder(&mut set.folders, &folder_id);
+                    let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                    self.sync_sidebars(None, cx);
+                }
+            }
+            SetsPanelEvent::OpenRequestRef {
+                project_id,
+                request_id,
+            } => {
+                let exists = self
+                    .workspace
+                    .find_project(&project_id)
+                    .and_then(|p| p.find_request(&request_id))
+                    .is_some();
+                if exists {
+                    self.open_node(
+                        ExplorerNode::Request {
+                            project_id,
+                            request_id,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    window.push_notification(
+                        "Referenced request no longer exists in Explorer.",
+                        cx,
+                    );
+                }
+            }
+            SetsPanelEvent::RemoveItem { set_id, item_id } => {
+                if let Some(set) = self.request_sets.iter_mut().find(|s| s.id == set_id) {
+                    let _ = take_item_from_set(set, &item_id);
+                    let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                    self.sync_sidebars(None, cx);
+                }
+            }
+            SetsPanelEvent::AddRequestRef {
+                target_set_id,
+                target_folder_id,
+                project_id,
+                request_id,
+                name,
+                method,
+                url,
+            } => {
+                let item = RequestSetItem {
+                    id: generate_id("seti"),
+                    project_id,
+                    request_id,
+                    name,
+                    method,
+                    url,
+                };
+                if let Some(set) = self.request_sets.iter_mut().find(|s| s.id == target_set_id) {
+                    insert_item_into_set(set, target_folder_id.as_deref(), item);
+                    let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                    self.sync_sidebars(None, cx);
+                }
+            }
+            SetsPanelEvent::MoveItem {
+                source_set_id,
+                item_id,
+                target_set_id,
+                target_folder_id,
+            } => {
+                let Some(src_set) = self
+                    .request_sets
+                    .iter_mut()
+                    .find(|s| s.id == source_set_id)
+                else {
+                    return;
+                };
+                let Some(item) = take_item_from_set(src_set, &item_id) else {
+                    return;
+                };
+                if let Some(dst_set) = self
+                    .request_sets
+                    .iter_mut()
+                    .find(|s| s.id == target_set_id)
+                {
+                    insert_item_into_set(dst_set, target_folder_id.as_deref(), item);
+                }
+                let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                self.sync_sidebars(None, cx);
+            }
+        }
+    }
+
+    fn open_set_name_dialog<F>(
+        &mut self,
+        title: &'static str,
+        initial: &str,
+        _placeholder: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_confirm: F,
+    ) where
+        F: FnOnce(&mut Self, String) + 'static,
+    {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter name…")
+                .default_value(initial.to_string())
+        });
+        let app_entity = cx.entity();
+        let on_confirm = std::rc::Rc::new(std::cell::RefCell::new(Some(on_confirm)));
+        let initial_focus = Cell::new(true);
+
+        let input_enter = input.clone();
+        let cb_enter = on_confirm.clone();
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let val = input_enter.read(cx).value().trim().to_string();
+                    if val.is_empty() {
+                        return;
+                    }
+                    if let Some(cb) = cb_enter.borrow_mut().take() {
+                        cb(this, val);
+                        let _ = save_workspace_sets(&this.workspace.root_dir, &this.request_sets);
+                        this.sync_sidebars(None, cx);
+                    }
+                    window.close_dialog(cx);
+                }
+            },
+        );
+        self._subscriptions.push(sub);
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                input.focus_handle(cx).focus(window, cx);
+            }
+            let input_ok = input.clone();
+            let app_ok = app_entity.clone();
+            let cb_ok = on_confirm.clone();
+            dialog
+                .title(title)
+                .w(px(360.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(Input::new(&input).small()),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("set-dlg-cancel")
+                                    .outline()
+                                    .small()
+                                    .label("Cancel"),
+                            ),
+                        )
+                        .child(
+                            Button::new("set-dlg-ok")
+                                .primary()
+                                .small()
+                                .label("OK")
+                                .on_click(move |_, window, cx| {
+                                    let val = input_ok.read(cx).value().trim().to_string();
+                                    if val.is_empty() {
+                                        return;
+                                    }
+                                    if let Some(cb) = cb_ok.borrow_mut().take() {
+                                        app_ok.update(cx, |this, cx| {
+                                            cb(this, val);
+                                            let _ = save_workspace_sets(
+                                                &this.workspace.root_dir,
+                                                &this.request_sets,
+                                            );
+                                            this.sync_sidebars(None, cx);
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn create_request_from_doc(
+        &mut self,
+        target_project_id: &str,
+        target_folder_id: Option<&str>,
+        mut doc: HttpRequestDoc,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(proj) = self.workspace.find_project_mut(target_project_id) else {
+            return;
+        };
+        let target_dir = if let Some(fid) = target_folder_id {
+            find_folder_dir_in_folders(&proj.folders, fid).unwrap_or_else(|| proj.root_dir.clone())
+        } else {
+            proj.root_dir.clone()
+        };
+        let mut created = match create_request(
+            &target_dir,
+            &doc.name,
+            doc.request.method,
+            &doc.request.url,
+        ) {
+            Ok(n) => n,
+            Err(err) => {
+                window.push_notification(format!("Failed creating request: {err}"), cx);
+                return;
+            }
+        };
+        doc.id = created.doc.id.clone();
+        created.doc = doc;
+        if let Err(err) = save_request(&created) {
+            window.push_notification(format!("Failed saving request: {err}"), cx);
+            return;
+        }
+        let req_id = created.doc.id.clone();
+        insert_request_into_project(proj, target_folder_id, created);
+        self.sync_sidebars(None, cx);
+        self.open_node(
+            ExplorerNode::Request {
+                project_id: target_project_id.to_string(),
+                request_id: req_id,
+            },
+            window,
+            cx,
+        );
     }
 
     fn handle_env_editor_event(
@@ -857,8 +1381,7 @@ impl TestrixApp {
 
         if let Some(existing_ix) = self.tabs.iter().position(|tab| tab.key(cx) == target_key) {
             self.active_tab_ix = Some(existing_ix);
-            self.explorer
-                .update(cx, |panel, cx| panel.reveal_and_select(&target_key, cx));
+            self.reveal_and_select_in_explorers(&target_key, cx);
             self.persist_open_tabs(cx);
             cx.notify();
             return;
@@ -947,8 +1470,7 @@ impl TestrixApp {
 
         self.tabs.push(new_tab);
         self.active_tab_ix = Some(self.tabs.len() - 1);
-        self.explorer
-            .update(cx, |panel, cx| panel.reveal_and_select(&target_key, cx));
+        self.reveal_and_select_in_explorers(&target_key, cx);
         self.refresh_dirty_indicators(cx);
         self.persist_open_tabs(cx);
         cx.notify();
@@ -966,6 +1488,54 @@ impl TestrixApp {
                 request_id,
                 doc,
             } => {
+                if project_id.is_empty() {
+                    // Ephemeral tab (e.g. opened from a deleted History entry): save into the first project.
+                    let Some(first_proj) = self.workspace.projects.first_mut() else {
+                        window.push_notification(
+                            "Create a project first before saving this request.",
+                            cx,
+                        );
+                        return;
+                    };
+                    let target_proj_id = first_proj.doc.id.clone();
+                    let mut req_node = match create_request(
+                        &first_proj.root_dir,
+                        &doc.name,
+                        doc.request.method,
+                        &doc.request.url,
+                    ) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            window.push_notification(
+                                format!("Failed creating YAML request: {err}"),
+                                cx,
+                            );
+                            return;
+                        }
+                    };
+                    let new_id = req_node.doc.id.clone();
+                    req_node.doc = *doc;
+                    req_node.doc.id = new_id.clone();
+                    if let Err(err) = save_request(&req_node) {
+                        window.push_notification(format!("Failed saving YAML request: {err}"), cx);
+                        return;
+                    }
+                    let req_file_path = req_node.file_path.clone();
+                    first_proj.requests.push(req_node);
+                    let old_key = format!("req:{request_id}");
+                    if let Some(WorkbenchTab::Request(tab)) =
+                        self.tabs.iter().find(|t| t.key(cx) == old_key)
+                    {
+                        tab.update(cx, |view, cx| {
+                            view.set_location(target_proj_id.clone(), req_file_path);
+                            view.mark_saved(cx);
+                        });
+                    }
+                    self.sync_sidebars(None, cx);
+                    self.refresh_dirty_indicators(cx);
+                    window.push_notification("Saved request to first project.", cx);
+                    return;
+                }
                 if let Some(proj) = self.workspace.find_project_mut(&project_id)
                     && let Some(req_node) = proj.find_request_mut(&request_id)
                 {
@@ -988,10 +1558,8 @@ impl TestrixApp {
                     {
                         tab.update(cx, |view, cx| view.mark_saved(cx));
                     }
-                    self.explorer.update(cx, |panel, cx| {
-                        panel.set_workspace(self.workspace.clone(), cx);
-                        panel.reveal_and_select(&target_key, cx);
-                    });
+                    self.sync_sidebars(None, cx);
+                    self.reveal_and_select_in_explorers(&target_key, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
                 }
@@ -1034,6 +1602,30 @@ impl TestrixApp {
                 if self.remember_responses {
                     let _ = save_request_response(&self.workspace.root_dir, &request_id, &snapshot);
                 }
+            }
+            RequestTabEvent::RequestExecuted {
+                project_id,
+                request_id,
+                doc,
+                status_code,
+                duration_ms,
+            } => {
+                let entry = RequestHistoryEntry {
+                    id: generate_id("hist"),
+                    executed_at: utc_now_iso8601(),
+                    project_id,
+                    request_id,
+                    env_id: self.workspace.active_environment_id.clone(),
+                    doc: *doc,
+                    status_code,
+                    duration_ms,
+                };
+                self.history_entries.insert(0, entry);
+                if self.history_entries.len() > 200 {
+                    self.history_entries.truncate(200);
+                }
+                let _ = save_workspace_history(&self.workspace.root_dir, &self.history_entries);
+                self.sync_sidebars(None, cx);
             }
         }
     }
@@ -1082,10 +1674,8 @@ impl TestrixApp {
                     } else {
                         share_file_from_disk(&proj.root_dir, &proj.manifest_path)
                     };
-                    self.explorer.update(cx, |panel, cx| {
-                        panel.set_workspace(self.workspace.clone(), cx);
-                        panel.reveal_and_select(&target_key, cx);
-                    });
+                    self.sync_sidebars(None, cx);
+                    self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
@@ -1113,10 +1703,8 @@ impl TestrixApp {
                     }
                     let folder_manifest_path = folder.manifest_path.clone();
                     let changed_file = share_file_from_disk(&proj.root_dir, &folder_manifest_path);
-                    self.explorer.update(cx, |panel, cx| {
-                        panel.set_workspace(self.workspace.clone(), cx);
-                        panel.reveal_and_select(&target_key, cx);
-                    });
+                    self.sync_sidebars(None, cx);
+                    self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
@@ -1600,8 +2188,7 @@ impl TestrixApp {
             .filter(|tab| tab.is_dirty(cx))
             .map(|tab| tab.key(cx))
             .collect();
-        self.explorer
-            .update(cx, |panel, cx| panel.set_dirty_keys(dirty, cx));
+        self.set_dirty_keys_in_explorers(dirty, cx);
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1876,10 +2463,8 @@ impl TestrixApp {
                                     this.refresh_profile_selector(window, cx);
                                     this.sync_env_editor(window, cx);
                                     this.sync_all_tabs(window, cx);
-                                    this.explorer.update(cx, |panel, cx| {
-                                        panel.set_workspace(this.workspace.clone(), cx);
-                                        panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
-                                    });
+                                    this.sync_sidebars(None, cx);
+                                    this.reveal_and_select_in_explorers(&format!("proj:{proj_id}"), cx);
                                     window.push_notification(
                                         format!("Imported {kind_label} project \"{proj_name}\"."),
                                         cx,
@@ -1983,10 +2568,8 @@ impl TestrixApp {
                                 this.refresh_profile_selector(window, cx);
                                 this.sync_env_editor(window, cx);
                                 this.sync_all_tabs(window, cx);
-                                this.explorer.update(cx, |panel, cx| {
-                                    panel.set_workspace(this.workspace.clone(), cx);
-                                    panel.reveal_and_select(&format!("proj:{proj_id}"), cx);
-                                });
+                                this.sync_sidebars(None, cx);
+                                this.reveal_and_select_in_explorers(&format!("proj:{proj_id}"), cx);
                                 window.push_notification(
                                     format!(
                                         "Imported Postman project(s): {}.",
@@ -2051,10 +2634,8 @@ impl TestrixApp {
                         view.update(cx, |v, _| v.set_location(pid, fp));
                     }
                 }
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                    panel.reveal_and_select(&format!("req:{request_id}"), cx);
-                });
+                self.sync_sidebars(None, cx);
+                self.reveal_and_select_in_explorers(&format!("req:{request_id}"), cx);
                 self.sync_all_tabs(window, cx);
                 window.push_notification(format!("Moved \"{moved_name}\"."), cx);
                 cx.notify();
@@ -2073,9 +2654,9 @@ impl TestrixApp {
         match load_workspace(&self.workspace_dir) {
             Ok(tree) => {
                 self.workspace = tree;
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx)
-                });
+                self.history_entries = load_workspace_history(&self.workspace.root_dir);
+                self.request_sets = load_workspace_sets(&self.workspace.root_dir);
+                self.sync_sidebars(None, cx);
                 self.refresh_profile_selector(window, cx);
                 self.sync_env_editor(window, cx);
                 self.sync_all_tabs(window, cx);
@@ -2999,10 +3580,9 @@ impl TestrixApp {
                 self.tabs.clear();
                 self.active_tab_ix = None;
                 let saved_expanded = load_workspace_explorer_state(&self.workspace.root_dir);
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_expanded_ids(saved_expanded);
-                    panel.set_workspace(self.workspace.clone(), cx)
-                });
+                self.history_entries = load_workspace_history(&self.workspace.root_dir);
+                self.request_sets = load_workspace_sets(&self.workspace.root_dir);
+                self.sync_sidebars(Some(&saved_expanded), cx);
                 self.refresh_profile_selector(window, cx);
                 self.sync_env_editor(window, cx);
                 self.open_initial_request(window, cx);
@@ -3237,9 +3817,7 @@ impl TestrixApp {
                         proj_mut.requests.push(req_node);
                     }
                 }
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                });
+                self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
                         project_id: project_id.to_string(),
@@ -3285,9 +3863,7 @@ impl TestrixApp {
                         proj_mut.requests.push(req_node);
                     }
                 }
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                });
+                self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
                         project_id: project_id.to_string(),
@@ -3389,9 +3965,7 @@ impl TestrixApp {
                         proj_mut.folders.push(folder_node);
                     }
                 }
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                });
+                self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Folder {
                         project_id: project_id.to_string(),
@@ -3481,9 +4055,7 @@ impl TestrixApp {
                     self.workspace.active_project_id.as_deref(),
                     self.workspace.active_environment_id.as_deref(),
                 );
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                });
+                self.sync_sidebars(None, cx);
                 self.refresh_profile_selector(window, cx);
                 self.sync_env_editor(window, cx);
                 self.open_node(ExplorerNode::Project { project_id: pid }, window, cx);
@@ -3521,9 +4093,7 @@ impl TestrixApp {
                         proj_mut.requests.push(copy_node);
                     }
                 }
-                self.explorer.update(cx, |panel, cx| {
-                    panel.set_workspace(self.workspace.clone(), cx);
-                });
+                self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
                         project_id: project_id.to_string(),
@@ -3574,9 +4144,7 @@ impl TestrixApp {
                         if let Some(proj) = this.workspace.find_project_mut(&pid) {
                             remove_request_from_project(proj, &rid);
                         }
-                        this.explorer.update(cx, |panel, cx| {
-                            panel.set_workspace(this.workspace.clone(), cx);
-                        });
+                        this.sync_sidebars(None, cx);
                     });
                     true
                 })
@@ -3777,8 +4345,11 @@ impl Render for TestrixApp {
                 this.open_new_project_dialog(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusQuickSearch, window, cx| {
-                this.explorer
-                    .update(cx, |panel, cx| panel.focus_search(window, cx));
+                if let Some(pane) = this.sidebar_panes.first().cloned() {
+                    pane.update(cx, |p, cx| {
+                        p.explorer.update(cx, |panel, cx| panel.focus_search(window, cx));
+                    });
+                }
             }))
             .on_action(cx.listener(|this, _: &CloseActiveTab, window, cx| {
                 if let Some(ix) = this.active_tab_ix {
@@ -3957,7 +4528,23 @@ impl Render for TestrixApp {
                                         .test_support()
                                         .size_full()
                                         .min_h_0()
-                                        .child(self.explorer.clone()),
+                                        .child(if self.sidebar_panes.len() <= 1 {
+                                            self.sidebar_panes
+                                                .first()
+                                                .cloned()
+                                                .map(|p| p.into_any_element())
+                                                .unwrap_or_else(|| div().into_any_element())
+                                        } else {
+                                            let mut split = v_resizable("sidebar-vertical-split");
+                                            for pane in &self.sidebar_panes {
+                                                split = split.child(
+                                                    resizable_panel()
+                                                        .min_size(px(120.))
+                                                        .child(pane.clone()),
+                                                );
+                                            }
+                                            split.into_any_element()
+                                        }),
                                 ),
                         ),
                 ),
@@ -4061,8 +4648,7 @@ impl TestrixApp {
                             };
                             this.set_active_project(&project_id, window, cx);
                             let key = this.tabs[*ix].key(cx);
-                            this.explorer
-                                .update(cx, |panel, cx| panel.reveal_and_select(&key, cx));
+                            this.reveal_and_select_in_explorers(&key, cx);
                             this.persist_open_tabs(cx);
                             cx.notify();
                         }
@@ -4369,6 +4955,155 @@ pub fn open_main_window(
     });
     tracing::info!(?window_bounds, "opened main Testrix window");
     Ok((handle, entity))
+}
+
+fn utc_now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+
+    // Howard Hinnant's civil-from-days algorithm (UTC).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn insert_set_folder(
+    folders: &mut [RequestSetFolder],
+    parent_id: &str,
+    mut new_folder: RequestSetFolder,
+) -> Result<(), RequestSetFolder> {
+    for f in folders {
+        if f.id == parent_id {
+            f.folders.push(new_folder);
+            return Ok(());
+        }
+        match insert_set_folder(&mut f.folders, parent_id, new_folder) {
+            Ok(()) => return Ok(()),
+            Err(returned) => new_folder = returned,
+        }
+    }
+    Err(new_folder)
+}
+
+fn find_set_folder_name(folders: &[RequestSetFolder], folder_id: &str) -> Option<String> {
+    for f in folders {
+        if f.id == folder_id {
+            return Some(f.name.clone());
+        }
+        if let Some(name) = find_set_folder_name(&f.folders, folder_id) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn rename_set_folder(folders: &mut [RequestSetFolder], folder_id: &str, next_name: &str) -> bool {
+    for f in folders {
+        if f.id == folder_id {
+            f.name = next_name.to_string();
+            return true;
+        }
+        if rename_set_folder(&mut f.folders, folder_id, next_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_set_folder(folders: &mut Vec<RequestSetFolder>, folder_id: &str) -> bool {
+    if let Some(pos) = folders.iter().position(|f| f.id == folder_id) {
+        folders.remove(pos);
+        return true;
+    }
+    for f in folders {
+        if remove_set_folder(&mut f.folders, folder_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn take_item_from_set_folders(
+    folders: &mut [RequestSetFolder],
+    item_id: &str,
+) -> Option<RequestSetItem> {
+    for f in folders {
+        if let Some(pos) = f.requests.iter().position(|r| r.id == item_id) {
+            return Some(f.requests.remove(pos));
+        }
+        if let Some(found) = take_item_from_set_folders(&mut f.folders, item_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn take_item_from_set(set: &mut RequestSet, item_id: &str) -> Option<RequestSetItem> {
+    if let Some(pos) = set.requests.iter().position(|r| r.id == item_id) {
+        return Some(set.requests.remove(pos));
+    }
+    take_item_from_set_folders(&mut set.folders, item_id)
+}
+
+fn insert_item_into_set_folders(
+    folders: &mut [RequestSetFolder],
+    folder_id: &str,
+    mut item: RequestSetItem,
+) -> Result<(), RequestSetItem> {
+    for f in folders {
+        if f.id == folder_id {
+            if !f
+                .requests
+                .iter()
+                .any(|r| r.project_id == item.project_id && r.request_id == item.request_id)
+            {
+                f.requests.push(item);
+            }
+            return Ok(());
+        }
+        match insert_item_into_set_folders(&mut f.folders, folder_id, item) {
+            Ok(()) => return Ok(()),
+            Err(returned) => item = returned,
+        }
+    }
+    Err(item)
+}
+
+fn insert_item_into_set(set: &mut RequestSet, folder_id: Option<&str>, item: RequestSetItem) {
+    if let Some(fid) = folder_id {
+        if let Err(returned) = insert_item_into_set_folders(&mut set.folders, fid, item) {
+            if !set
+                .requests
+                .iter()
+                .any(|r| r.project_id == returned.project_id && r.request_id == returned.request_id)
+            {
+                set.requests.push(returned);
+            }
+        }
+        return;
+    }
+    if !set
+        .requests
+        .iter()
+        .any(|r| r.project_id == item.project_id && r.request_id == item.request_id)
+    {
+        set.requests.push(item);
+    }
 }
 
 fn rewrite_string_in_place(target: &mut String, renames: &[(String, String)]) -> bool {

@@ -197,6 +197,13 @@ pub(crate) enum RequestTabEvent {
         request_id: String,
         snapshot: Box<HttpResponseSnapshot>,
     },
+    RequestExecuted {
+        project_id: Option<String>,
+        request_id: Option<String>,
+        doc: Box<HttpRequestDoc>,
+        status_code: Option<u16>,
+        duration_ms: Option<u64>,
+    },
     DirtyChanged,
 }
 
@@ -206,6 +213,7 @@ pub(crate) struct RequestTabView {
     request_id: String,
     parent_folder_ids: Vec<String>,
     file_path: PathBuf,
+    ephemeral: bool,
     saved_doc: HttpRequestDoc,
     project_snapshot: ProjectNode,
     active_env: Option<EnvironmentDoc>,
@@ -491,6 +499,7 @@ impl RequestTabView {
             request_id: doc.id.clone(),
             parent_folder_ids,
             file_path,
+            ephemeral: false,
             saved_doc: doc.clone(),
             project_snapshot: project.clone(),
             active_env,
@@ -685,6 +694,117 @@ impl RequestTabView {
     pub(crate) fn set_location(&mut self, project_id: String, file_path: PathBuf) {
         self.project_id = project_id;
         self.file_path = file_path;
+        self.ephemeral = false;
+    }
+
+    pub(crate) fn set_ephemeral(&mut self, ephemeral: bool) {
+        self.ephemeral = ephemeral;
+        if ephemeral {
+            self.dirty = true;
+        }
+    }
+
+    /// Restores request fields from a historical [`HttpRequestDoc`] snapshot into
+    /// the editor without modifying `saved_doc` or saving to disk.
+    pub(crate) fn recover_from_doc(
+        &mut self,
+        doc: &HttpRequestDoc,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.method = doc.request.method;
+        if let Some(ix) = HttpMethod::ALL.iter().position(|m| *m == doc.request.method) {
+            self.method_select.update(cx, |sel, cx| {
+                sel.set_selected_index(Some(IndexPath::default().row(ix)), window, cx);
+            });
+        }
+
+        let (prefix, path) = split_url_prefix(&doc.request.url);
+        self.url_prefix_combo.update(cx, |combo, cx| {
+            combo.set_value(prefix, window, cx);
+        });
+        self.url_input.update(cx, |input, cx| {
+            input.set_value(path, window, cx);
+        });
+        self.name_input.update(cx, |input, cx| {
+            input.set_value(doc.name.clone(), window, cx);
+        });
+        self.description_input.update(cx, |input, cx| {
+            input.set_value(doc.description.clone(), window, cx);
+        });
+        self.params_table.update(cx, |tbl, cx| {
+            tbl.set_rows(&doc.request.params, window, cx);
+        });
+        self.headers_table.update(cx, |tbl, cx| {
+            tbl.set_rows(&doc.request.headers, window, cx);
+        });
+        self.auth_editor.update(cx, |ed, cx| {
+            ed.set_auth(&doc.request.auth, window, cx);
+        });
+        self.post_script_editor.update(cx, |ed, cx| {
+            ed.set_value(doc.request.post_script.clone(), window, cx);
+        });
+
+        self.body_mode = BodyMode::from_body(&doc.request.body);
+        match &doc.request.body {
+            RequestBody::None => {}
+            RequestBody::Json { content } => {
+                self.json_editor.update(cx, |ed, cx| {
+                    ed.set_value(content.clone(), window, cx);
+                });
+            }
+            RequestBody::Raw {
+                raw_format,
+                content,
+            } => {
+                self.raw_format = *raw_format;
+                self.raw_editor.update(cx, |ed, cx| {
+                    ed.set_highlighter(raw_format.editor_language(), cx);
+                    ed.set_value(content.clone(), window, cx);
+                });
+            }
+            RequestBody::FormUrlEncoded { fields } => {
+                self.form_table.update(cx, |tbl, cx| {
+                    tbl.set_rows(fields, window, cx);
+                });
+            }
+            RequestBody::Multipart { fields } => {
+                self.multipart_table.update(cx, |tbl, cx| {
+                    tbl.set_rows(fields, window, cx);
+                });
+            }
+            RequestBody::Binary {
+                file_path,
+                content_type,
+            } => {
+                self.binary_path_input.update(cx, |input, cx| {
+                    input.set_value(file_path.clone(), window, cx);
+                });
+                self.binary_ct_input.update(cx, |input, cx| {
+                    input.set_value(content_type.clone().unwrap_or_default(), window, cx);
+                });
+            }
+        }
+
+        self.timeout_input.update(cx, |input, cx| {
+            input.set_value(doc.request.settings.timeout_ms.to_string(), window, cx);
+        });
+        self.follow_redirects = doc.request.settings.follow_redirects;
+        self.verify_tls = doc.request.settings.verify_tls;
+
+        self.body_meta = MetaTreeState::new(doc.request.body_meta.clone());
+        self.sync_meta_desc_inputs(true, window, cx);
+        self.response_examples = doc.request.response_examples.clone();
+        self.selected_example_id = self.response_examples.first().map(|e| e.id.clone());
+        self.sync_selected_example_ui(window, cx);
+        self.response_meta = MetaTreeState::new(doc.request.response_meta.clone());
+        self.sync_meta_desc_inputs(false, window, cx);
+
+        self.dirty = true;
+        self.refresh_yaml_preview(window, cx);
+        self.refresh_code_preview(window, cx);
+        cx.emit(RequestTabEvent::DirtyChanged);
+        cx.notify();
     }
 
     pub(crate) fn method(&self) -> HttpMethod {
@@ -975,12 +1095,42 @@ impl RequestTabView {
                             request_id: this.request_id.clone(),
                             snapshot: Box::new(snapshot.clone()),
                         });
+                        cx.emit(RequestTabEvent::RequestExecuted {
+                            project_id: if this.ephemeral || this.project_id.is_empty() {
+                                None
+                            } else {
+                                Some(this.project_id.clone())
+                            },
+                            request_id: if this.ephemeral {
+                                None
+                            } else {
+                                Some(this.request_id.clone())
+                            },
+                            doc: Box::new(doc.clone()),
+                            status_code: Some(snapshot.status_code),
+                            duration_ms: Some(snapshot.duration_ms),
+                        });
                         this.execution = RequestExecutionState::Completed(Box::new(snapshot));
                     }
                     Ok(Err(HttpError::Cancelled)) => {
                         this.execution = RequestExecutionState::Cancelled;
                     }
                     Ok(Err(err)) => {
+                        cx.emit(RequestTabEvent::RequestExecuted {
+                            project_id: if this.ephemeral || this.project_id.is_empty() {
+                                None
+                            } else {
+                                Some(this.project_id.clone())
+                            },
+                            request_id: if this.ephemeral {
+                                None
+                            } else {
+                                Some(this.request_id.clone())
+                            },
+                            doc: Box::new(doc.clone()),
+                            status_code: None,
+                            duration_ms: None,
+                        });
                         this.execution = RequestExecutionState::Failed {
                             message: err.to_string(),
                         };

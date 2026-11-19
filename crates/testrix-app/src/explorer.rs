@@ -20,8 +20,8 @@ use gpui_kit::{
     px,
 };
 use testrix_core::{
-    ExplorerNode, FilteredFolder, FilteredProject, HttpMethod, RequestNode, WorkspaceTree,
-    filter_workspace,
+    ExplorerNode, FilteredFolder, FilteredProject, HttpMethod, HttpRequestDoc, RequestNode,
+    WorkspaceTree, filter_workspace,
 };
 
 use crate::theme_helpers::method_badge;
@@ -65,18 +65,34 @@ pub(crate) enum ExplorerEvent {
         target_project_id: String,
         target_folder_id: Option<String>,
     },
+    CreateRequestFromDoc {
+        target_project_id: String,
+        target_folder_id: Option<String>,
+        doc: HttpRequestDoc,
+    },
     ExpandedStateChanged(Vec<String>),
     ReloadWorkspace,
 }
 
-#[derive(Clone)]
-struct DraggedRequest {
-    project_id: String,
-    request_id: String,
-    name: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DragSourceKind {
+    Explorer,
+    History,
+    Set { set_id: String, item_id: String },
 }
 
-struct DragPreview(String);
+#[derive(Clone)]
+pub(crate) struct DraggedRequest {
+    pub source: DragSourceKind,
+    pub project_id: Option<String>,
+    pub request_id: Option<String>,
+    pub name: String,
+    pub method: HttpMethod,
+    pub url: String,
+    pub snapshot_doc: Option<HttpRequestDoc>,
+}
+
+pub(crate) struct DragPreview(pub String);
 
 impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -238,37 +254,6 @@ impl ExplorerPanel {
         cx.notify();
     }
 
-    fn selected_creation_target(&self, cx: &App) -> Option<(String, Option<String>)> {
-        if let Some(entry) = self.tree_state.read(cx).selected_entry()
-            && let Some(meta) = self.meta.get(entry.item().id.as_ref())
-        {
-            match meta {
-                NodeMeta::Project { project_id, .. } => return Some((project_id.clone(), None)),
-                NodeMeta::Folder {
-                    project_id,
-                    folder_id,
-                    ..
-                } => return Some((project_id.clone(), Some(folder_id.clone()))),
-                NodeMeta::Request {
-                    project_id,
-                    request_id,
-                    ..
-                } => {
-                    if let Some((proj, ancestors, _)) =
-                        self.workspace_snapshot.find_request(request_id)
-                    {
-                        let folder_id = ancestors.last().map(|f| f.doc.id.clone());
-                        return Some((proj.doc.id.clone(), folder_id));
-                    }
-                    return Some((project_id.clone(), None));
-                }
-            }
-        }
-        self.workspace_snapshot
-            .active_project()
-            .map(|p| (p.doc.id.clone(), None))
-    }
-
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -277,10 +262,85 @@ impl ExplorerPanel {
     }
 }
 
+impl ExplorerPanel {
+    pub(crate) fn total_requests(&self) -> usize {
+        self.workspace_snapshot.total_request_count()
+    }
+
+    pub(crate) fn render_header_actions(
+        &self,
+        id_suffix: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let view = cx.entity();
+        h_flex()
+            .gap_0p5()
+            .child(
+                Button::new(SharedString::from(format!("explorer-new-project-{id_suffix}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .tooltip(crate::i18n::t("new_project"))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(ExplorerEvent::NewProject);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("explorer-import-menu-{id_suffix}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(LucideIcon::Upload)
+                    .tooltip(crate::i18n::t("import_menu"))
+                    .dropdown_menu(move |menu, _, _| {
+                        let v1 = view.clone();
+                        let v2 = view.clone();
+                        let v3 = view.clone();
+                        menu.item(
+                            PopupMenuItem::new(crate::i18n::t("import_openapi"))
+                                .icon(LucideIcon::FileUp)
+                                .on_click(move |_, _, cx| {
+                                    v1.update(cx, |_, cx| {
+                                        cx.emit(ExplorerEvent::ImportOpenApi);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(crate::i18n::t("import_postman_zip"))
+                                .icon(LucideIcon::FolderArchive)
+                                .on_click(move |_, _, cx| {
+                                    v2.update(cx, |_, cx| {
+                                        cx.emit(ExplorerEvent::ImportPostmanZip);
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(crate::i18n::t("import_apifox"))
+                                .icon(LucideIcon::Braces)
+                                .on_click(move |_, _, cx| {
+                                    v3.update(cx, |_, cx| {
+                                        cx.emit(ExplorerEvent::ImportApifox);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("explorer-reload-{id_suffix}")))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::RefreshCw)
+                    .tooltip(crate::i18n::t("reload_disk"))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(ExplorerEvent::ReloadWorkspace);
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for ExplorerPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
-        let total_requests = self.workspace_snapshot.total_request_count();
         let search_active = !self.search_query.trim().is_empty();
         let has_tree_items = self.tree_state.read(cx).entry(0).is_some();
 
@@ -291,127 +351,6 @@ impl Render for ExplorerPanel {
             .min_h_0()
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
-            // Explorer header
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_3()
-                    .py_2()
-                    .justify_between()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().sidebar_border)
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .child(Icon::new(LucideIcon::FolderTree).small())
-                            .child(div().text_sm().font_semibold().child(crate::i18n::t("explorer")))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("({total_requests})")),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Button::new("explorer-new-request")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(LucideIcon::FilePlus)
-                                    .tooltip(crate::i18n::t("new_request"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some((project_id, folder_id)) =
-                                            this.selected_creation_target(cx)
-                                        {
-                                            cx.emit(ExplorerEvent::NewRequestIn {
-                                                project_id,
-                                                folder_id,
-                                            });
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("explorer-new-folder")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(LucideIcon::FolderPlus)
-                                    .tooltip(crate::i18n::t("new_folder"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some((project_id, folder_id)) =
-                                            this.selected_creation_target(cx)
-                                        {
-                                            cx.emit(ExplorerEvent::NewFolderIn {
-                                                project_id,
-                                                parent_folder_id: folder_id,
-                                            });
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("explorer-new-project")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Plus)
-                                    .tooltip(crate::i18n::t("new_project"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExplorerEvent::NewProject);
-                                    })),
-                            )
-                            .child({
-                                let view = cx.entity();
-                                Button::new("explorer-import-menu")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(LucideIcon::Upload)
-                                    .tooltip(crate::i18n::t("import_menu"))
-                                    .dropdown_menu(move |menu, _, _| {
-                                        let v1 = view.clone();
-                                        let v2 = view.clone();
-                                        let v3 = view.clone();
-                                        menu.item(
-                                            PopupMenuItem::new(crate::i18n::t("import_openapi"))
-                                                .icon(LucideIcon::FileUp)
-                                                .on_click(move |_, _, cx| {
-                                                    v1.update(cx, |_, cx| {
-                                                        cx.emit(ExplorerEvent::ImportOpenApi);
-                                                    });
-                                                }),
-                                        )
-                                        .item(
-                                            PopupMenuItem::new(crate::i18n::t("import_postman_zip"))
-                                                .icon(LucideIcon::FolderArchive)
-                                                .on_click(move |_, _, cx| {
-                                                    v2.update(cx, |_, cx| {
-                                                        cx.emit(ExplorerEvent::ImportPostmanZip);
-                                                    });
-                                                }),
-                                        )
-                                        .item(
-                                            PopupMenuItem::new(crate::i18n::t("import_apifox"))
-                                                .icon(LucideIcon::Braces)
-                                                .on_click(move |_, _, cx| {
-                                                    v3.update(cx, |_, cx| {
-                                                        cx.emit(ExplorerEvent::ImportApifox);
-                                                    });
-                                                }),
-                                        )
-                                    })
-                            })
-                            .child(
-                                Button::new("explorer-reload")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::RefreshCw)
-                                    .tooltip(crate::i18n::t("reload_disk"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ExplorerEvent::ReloadWorkspace);
-                                    })),
-                            ),
-                    ),
-            )
             // Quick search field
             .child(
                 div()
@@ -747,12 +686,16 @@ fn render_tree_row(
             project_id,
             request_id,
             name,
-            ..
+            method,
         }) => item.on_drag(
             DraggedRequest {
-                project_id,
-                request_id,
+                source: DragSourceKind::Explorer,
+                project_id: Some(project_id),
+                request_id: Some(request_id),
                 name,
+                method,
+                url: String::new(),
+                snapshot_doc: None,
             },
             |drag, _, _, cx| cx.new(|_| DragPreview(drag.name.clone())),
         ),
@@ -772,12 +715,7 @@ fn render_tree_row(
                     cx.emit(ExplorerEvent::ExpandedStateChanged(
                         panel.sorted_expanded_ids(),
                     ));
-                    cx.emit(ExplorerEvent::MoveRequest {
-                        source_project_id: drag.project_id.clone(),
-                        request_id: drag.request_id.clone(),
-                        target_project_id: target_pid,
-                        target_folder_id: None,
-                    });
+                    emit_drop_into_explorer(drag, target_pid, None, cx);
                 });
             })
         }
@@ -802,16 +740,42 @@ fn render_tree_row(
                     cx.emit(ExplorerEvent::ExpandedStateChanged(
                         panel.sorted_expanded_ids(),
                     ));
-                    cx.emit(ExplorerEvent::MoveRequest {
-                        source_project_id: drag.project_id.clone(),
-                        request_id: drag.request_id.clone(),
-                        target_project_id: target_pid,
-                        target_folder_id: Some(target_fid),
-                    });
+                    emit_drop_into_explorer(drag, target_pid, Some(target_fid), cx);
                 });
             })
         }
         None => item,
+    }
+}
+
+fn emit_drop_into_explorer(
+    drag: &DraggedRequest,
+    target_project_id: String,
+    target_folder_id: Option<String>,
+    cx: &mut Context<ExplorerPanel>,
+) {
+    match drag.source {
+        DragSourceKind::History => {
+            if let Some(doc) = drag.snapshot_doc.clone() {
+                cx.emit(ExplorerEvent::CreateRequestFromDoc {
+                    target_project_id,
+                    target_folder_id,
+                    doc,
+                });
+            }
+        }
+        DragSourceKind::Explorer | DragSourceKind::Set { .. } => {
+            if let (Some(source_project_id), Some(request_id)) =
+                (drag.project_id.clone(), drag.request_id.clone())
+            {
+                cx.emit(ExplorerEvent::MoveRequest {
+                    source_project_id,
+                    request_id,
+                    target_project_id,
+                    target_folder_id,
+                });
+            }
+        }
     }
 }
 

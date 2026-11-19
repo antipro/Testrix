@@ -559,6 +559,64 @@ impl HttpRequestDoc {
     }
 }
 
+/// A recorded HTTP request execution entry shown in the History view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestHistoryEntry {
+    pub id: String,
+    pub executed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_id: Option<String>,
+    pub doc: HttpRequestDoc,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// A reference to an existing HTTP request stored inside a [`RequestSet`] or [`RequestSetFolder`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestSetItem {
+    pub id: String,
+    pub project_id: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub method: HttpMethod,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// A folder inside a [`RequestSet`] that can contain subfolders and request references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestSetFolder {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<RequestSetFolder>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<RequestSetItem>,
+}
+
+/// A named group of HTTP request references with nested folders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestSet {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<RequestSetFolder>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<RequestSetItem>,
+}
+
 /// Top-level YAML document for a folder (`_folder.yaml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

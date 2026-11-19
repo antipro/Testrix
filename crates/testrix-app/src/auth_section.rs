@@ -77,6 +77,7 @@ pub(crate) enum AuthEditorEvent {
 /// Reusable stateful authentication editor + inheritance chain display.
 pub(crate) struct AuthEditor {
     id_prefix: SharedString,
+    allow_inherit: bool,
     mode: AuthModeChoice,
     mode_select: Entity<SelectState<Vec<AuthModeOption>>>,
     bearer_token: Entity<InputState>,
@@ -203,6 +204,7 @@ impl AuthEditor {
 
         Self {
             id_prefix: id_prefix.into(),
+            allow_inherit,
             mode: initial_mode,
             mode_select,
             bearer_token,
@@ -254,6 +256,66 @@ impl AuthEditor {
             cx.notify();
         }
         changed
+    }
+
+    pub(crate) fn set_auth(
+        &mut self,
+        auth: &AuthConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next_mode = if !self.allow_inherit && matches!(auth, AuthConfig::Inherit) {
+            AuthModeChoice::None
+        } else {
+            AuthModeChoice::from_config(auth)
+        };
+        self.mode = next_mode;
+        let mut choices = Vec::new();
+        if self.allow_inherit {
+            choices.push(AuthModeChoice::Inherit);
+        }
+        choices.extend([
+            AuthModeChoice::None,
+            AuthModeChoice::Bearer,
+            AuthModeChoice::Basic,
+            AuthModeChoice::ApiKey,
+        ]);
+        if let Some(row) = choices.iter().position(|c| *c == next_mode) {
+            self.mode_select.update(cx, |sel, cx| {
+                sel.set_selected_index(
+                    Some(gpui_kit::component::IndexPath::default().row(row)),
+                    window,
+                    cx,
+                );
+            });
+        }
+        match auth {
+            AuthConfig::Bearer { token, prefix } => {
+                self.bearer_token
+                    .update(cx, |s, cx| s.set_value(token.clone(), window, cx));
+                self.bearer_prefix
+                    .update(cx, |s, cx| s.set_value(prefix.clone(), window, cx));
+            }
+            AuthConfig::Basic { username, password } => {
+                self.basic_username
+                    .update(cx, |s, cx| s.set_value(username.clone(), window, cx));
+                self.basic_password
+                    .update(cx, |s, cx| s.set_value(password.clone(), window, cx));
+            }
+            AuthConfig::ApiKey {
+                key,
+                value,
+                location,
+            } => {
+                self.api_key_name
+                    .update(cx, |s, cx| s.set_value(key.clone(), window, cx));
+                self.api_key_value
+                    .update(cx, |s, cx| s.set_value(value.clone(), window, cx));
+                self.api_key_location = *location;
+            }
+            AuthConfig::Inherit | AuthConfig::None => {}
+        }
+        cx.notify();
     }
 
     pub(crate) fn snapshot(&self, cx: &App) -> AuthConfig {

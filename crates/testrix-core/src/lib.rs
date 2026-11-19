@@ -29,8 +29,9 @@ pub use model::{
     API_VERSION, ApiKeyLocation, AuthConfig, DocumentKind, EffectiveAuth, EnvVariable,
     EnvironmentDoc, EnvironmentNode, ExplorerNode, FolderDoc, FolderNode, HttpMethod,
     HttpRequestDoc, HttpRequestSpec, KeyValueRow, MultipartField, MultipartFieldType, ProjectDoc,
-    ProjectNode, RawBodyFormat, RequestBody, RequestNode, RequestSettings, WorkspaceTree,
-    compare_env_var_keys, generate_id, sort_env_variables,
+    ProjectNode, RawBodyFormat, RequestBody, RequestHistoryEntry, RequestNode, RequestSet,
+    RequestSetFolder, RequestSetItem, RequestSettings, WorkspaceTree, compare_env_var_keys,
+    generate_id, sort_env_variables,
 };
 pub use openapi::{
     ImportedFolder, ImportedProjectBundle, export_openapi_3_0, merge_environments_into_bundle,

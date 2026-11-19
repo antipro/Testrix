@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use testrix_core::{
     DocumentKind, EnvironmentDoc, EnvironmentNode, FolderDoc, FolderNode, HttpMethod,
     HttpRequestDoc, HttpResponseSnapshot, ImportedProjectBundle, ProjectDoc, ProjectNode,
-    RequestNode, WorkspaceTree, generate_id,
+    RequestHistoryEntry, RequestNode, RequestSet, WorkspaceTree, generate_id,
 };
 use tracing::{debug, warn};
 
@@ -23,6 +23,8 @@ const ENVIRONMENTS_DIR: &str = "environments";
 const REQUEST_EXTENSION: &str = ".request.yaml";
 const ENV_EXTENSION: &str = ".env.yaml";
 const WORKSPACE_STATE_FILE: &str = ".testrix-state.yaml";
+const WORKSPACE_HISTORY_FILE: &str = ".testrix-history.yaml";
+const WORKSPACE_SETS_FILE: &str = ".testrix-sets.yaml";
 const RESPONSES_CACHE_DIR: &str = ".testrix-responses";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -293,6 +295,66 @@ pub fn save_workspace_tabs(
     state.open_tabs = open_tabs.to_vec();
     state.active_tab_key = active_tab_key.map(str::to_string);
     write_yaml_atomic(&state_path, &state)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceHistoryFile {
+    #[serde(default)]
+    entries: Vec<RequestHistoryEntry>,
+}
+
+/// Loads persisted HTTP request execution history from `.testrix-history.yaml`.
+pub fn load_workspace_history(workspace_root: &Path) -> Vec<RequestHistoryEntry> {
+    let path = workspace_root.join(WORKSPACE_HISTORY_FILE);
+    if !path.is_file() {
+        return Vec::new();
+    }
+    read_yaml_file::<WorkspaceHistoryFile>(&path)
+        .map(|f| f.entries)
+        .unwrap_or_default()
+}
+
+/// Persists HTTP request execution history into `.testrix-history.yaml`.
+pub fn save_workspace_history(
+    workspace_root: &Path,
+    entries: &[RequestHistoryEntry],
+) -> Result<(), StorageError> {
+    let path = workspace_root.join(WORKSPACE_HISTORY_FILE);
+    let file = WorkspaceHistoryFile {
+        entries: entries.to_vec(),
+    };
+    write_yaml_atomic(&path, &file)
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSetsFile {
+    #[serde(default)]
+    sets: Vec<RequestSet>,
+}
+
+/// Loads persisted request sets from `.testrix-sets.yaml`.
+pub fn load_workspace_sets(workspace_root: &Path) -> Vec<RequestSet> {
+    let path = workspace_root.join(WORKSPACE_SETS_FILE);
+    if !path.is_file() {
+        return Vec::new();
+    }
+    read_yaml_file::<WorkspaceSetsFile>(&path)
+        .map(|f| f.sets)
+        .unwrap_or_default()
+}
+
+/// Persists request sets into `.testrix-sets.yaml`.
+pub fn save_workspace_sets(
+    workspace_root: &Path,
+    sets: &[RequestSet],
+) -> Result<(), StorageError> {
+    let path = workspace_root.join(WORKSPACE_SETS_FILE);
+    let file = WorkspaceSetsFile {
+        sets: sets.to_vec(),
+    };
+    write_yaml_atomic(&path, &file)
 }
 
 fn response_cache_path(workspace_root: &Path, request_id: &str) -> PathBuf {

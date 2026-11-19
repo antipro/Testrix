@@ -15,11 +15,12 @@ pub use workspace::{
     duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
     init_or_load_config, init_or_load_config_at, load_project, load_request_response,
     load_workspace, load_workspace_environments, load_workspace_explorer_state,
-    load_workspace_tabs, merge_environments_into_dir, move_request, save_config_preferences,
-    save_config_preferences_at, save_config_share_settings, save_config_share_settings_at,
-    save_config_shared_projects, save_config_shared_projects_at, save_config_workspace_dir,
-    save_config_workspace_dir_at, save_environment, save_folder, save_project, save_request,
-    save_request_response, save_workspace_explorer_state, save_workspace_state, save_workspace_tabs,
+    load_workspace_history, load_workspace_sets, load_workspace_tabs, merge_environments_into_dir,
+    move_request, save_config_preferences, save_config_preferences_at, save_config_share_settings,
+    save_config_share_settings_at, save_config_shared_projects, save_config_shared_projects_at,
+    save_config_workspace_dir, save_config_workspace_dir_at, save_environment, save_folder,
+    save_project, save_request, save_request_response, save_workspace_explorer_state,
+    save_workspace_history, save_workspace_sets, save_workspace_state, save_workspace_tabs,
     to_yaml_pretty, validate_yaml_file, write_yaml_atomic,
 };
 
@@ -260,5 +261,49 @@ mod tests {
         assert!(reloaded_a.requests.is_empty());
         assert_eq!(reloaded_b.requests.len(), 1);
         assert_eq!(reloaded_b.requests[0].doc.id, req.doc.id);
+    }
+
+    #[test]
+    fn persists_workspace_history_and_sets() {
+        use testrix_core::{
+            HttpRequestDoc, RequestHistoryEntry, RequestSet, RequestSetFolder, RequestSetItem,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let history = vec![RequestHistoryEntry {
+            id: "hist-1".to_string(),
+            executed_at: "2026-11-19T17:00:00+08:00".to_string(),
+            project_id: Some("proj-1".to_string()),
+            request_id: Some("req-1".to_string()),
+            env_id: None,
+            doc: HttpRequestDoc::new("req-1", "Get Users", HttpMethod::Get, "/users"),
+            status_code: Some(200),
+            duration_ms: Some(42),
+        }];
+        save_workspace_history(dir.path(), &history).unwrap();
+        let loaded_history = load_workspace_history(dir.path());
+        assert_eq!(loaded_history, history);
+
+        let sets = vec![RequestSet {
+            id: "set-1".to_string(),
+            name: "Smoke Suite".to_string(),
+            folders: vec![RequestSetFolder {
+                id: "sfolder-1".to_string(),
+                name: "Auth".to_string(),
+                folders: Vec::new(),
+                requests: vec![RequestSetItem {
+                    id: "sitem-1".to_string(),
+                    project_id: "proj-1".to_string(),
+                    request_id: "req-1".to_string(),
+                    name: "Get Users".to_string(),
+                    method: HttpMethod::Get,
+                    url: "/users".to_string(),
+                }],
+            }],
+            requests: Vec::new(),
+        }];
+        save_workspace_sets(dir.path(), &sets).unwrap();
+        let loaded_sets = load_workspace_sets(dir.path());
+        assert_eq!(loaded_sets, sets);
     }
 }
