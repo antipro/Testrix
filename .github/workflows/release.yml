@@ -284,7 +284,10 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libwayland-dev \
-            libvulkan-dev
+            libvulkan-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
 
       # Automatically reads rust-toolchain.toml (1.100.0)
       - name: Install Rust toolchain
