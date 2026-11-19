@@ -30,7 +30,7 @@ pub use model::{
     EnvironmentDoc, EnvironmentNode, ExplorerNode, FolderDoc, FolderNode, HttpMethod,
     HttpRequestDoc, HttpRequestSpec, KeyValueRow, MultipartField, MultipartFieldType, ProjectDoc,
     ProjectNode, RawBodyFormat, RequestBody, RequestNode, RequestSettings, WorkspaceTree,
-    generate_id,
+    compare_env_var_keys, generate_id, sort_env_variables,
 };
 pub use openapi::{
     ImportedFolder, ImportedProjectBundle, export_openapi_3_0, merge_environments_into_bundle,
@@ -262,6 +262,33 @@ mod tests {
         assert_eq!(
             filtered[0].folders[0].folders[0].requests[0].doc.id,
             "req-inherited"
+        );
+    }
+
+    #[test]
+    fn sorts_env_variables_by_special_symbol_number_then_alphabet() {
+        let mut vars = vec![
+            EnvVariable::new("zebra", "1"),
+            EnvVariable::new("BaseUrl", "2"),
+            EnvVariable::new("2_second", "3"),
+            EnvVariable::new("_secret", "4"),
+            EnvVariable::new("api_key", "5"),
+            EnvVariable::new("1_first", "6"),
+            EnvVariable::new("$env", "7"),
+        ];
+        sort_env_variables(&mut vars);
+        let keys: Vec<&str> = vars.iter().map(|v| v.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "$env",
+                "_secret",
+                "1_first",
+                "2_second",
+                "api_key",
+                "BaseUrl",
+                "zebra",
+            ]
         );
     }
 }

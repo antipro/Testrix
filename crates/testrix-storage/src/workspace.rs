@@ -405,8 +405,9 @@ fn load_environments(env_dir: &Path) -> Result<Vec<EnvironmentNode>, StorageErro
             .and_then(|n| n.to_str())
             .is_some_and(|name| name.ends_with(ENV_EXTENSION))
         {
-            let doc: EnvironmentDoc = read_yaml_file(&path)?;
+            let mut doc: EnvironmentDoc = read_yaml_file(&path)?;
             doc.validate()?;
+            testrix_core::sort_env_variables(&mut doc.variables);
             envs.push(EnvironmentNode {
                 doc,
                 file_path: path,
@@ -900,7 +901,9 @@ pub fn delete_project(root_dir: &Path) -> Result<(), StorageError> {
 /// Saves an environment profile YAML document (`*.env.yaml`).
 pub fn save_environment(env: &EnvironmentNode) -> Result<(), StorageError> {
     env.doc.validate()?;
-    write_yaml_atomic(&env.file_path, &env.doc)
+    let mut sorted = env.doc.clone();
+    testrix_core::sort_env_variables(&mut sorted.variables);
+    write_yaml_atomic(&env.file_path, &sorted)
 }
 
 /// Creates a new environment profile under `<project_root>/environments/`.

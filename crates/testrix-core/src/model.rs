@@ -679,6 +679,53 @@ impl EnvVariable {
     }
 }
 
+/// Character category rank for sorting environment variable keys:
+/// `0` = special symbol, `1` = number, `2` = alphabet.
+fn env_key_char_rank(c: char) -> u8 {
+    if c.is_ascii_digit() || c.is_numeric() {
+        1
+    } else if c.is_alphabetic() {
+        2
+    } else {
+        0
+    }
+}
+
+/// Compares two environment variable keys by: special symbol -> number -> alphabet.
+pub fn compare_env_var_keys(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut chars_a = a.trim().chars();
+    let mut chars_b = b.trim().chars();
+    loop {
+        match (chars_a.next(), chars_b.next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                let ra = env_key_char_rank(ca);
+                let rb = env_key_char_rank(cb);
+                if ra != rb {
+                    return ra.cmp(&rb);
+                }
+                let ord = if ra == 2 {
+                    ca.to_lowercase()
+                        .cmp(cb.to_lowercase())
+                        .then_with(|| ca.cmp(&cb))
+                } else {
+                    ca.cmp(&cb)
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// Sorts environment variables in-place by key: special symbol, number, then alphabet.
+pub fn sort_env_variables(vars: &mut [EnvVariable]) {
+    vars.sort_by(|a, b| compare_env_var_keys(&a.key, &b.key));
+}
+
 impl Default for EnvVariable {
     fn default() -> Self {
         Self::new("", "")

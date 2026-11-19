@@ -19,7 +19,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px,
 };
-use testrix_core::{EnvVariable, EnvironmentDoc, EnvironmentNode};
+use testrix_core::{EnvVariable, EnvironmentDoc, EnvironmentNode, sort_env_variables};
 
 struct EnvVarRowState {
     id: u64,
@@ -168,7 +168,8 @@ impl EnvEditorView {
 
         if let Some(profile) = env_id.and_then(|id| self.profiles.iter().find(|p| p.doc.id == id)) {
             let name = profile.doc.name.clone();
-            let vars = profile.doc.variables.clone();
+            let mut vars = profile.doc.variables.clone();
+            sort_env_variables(&mut vars);
             self.profile_name_input
                 .update(cx, |state, cx| state.set_value(name, window, cx));
             for var in &vars {
@@ -366,6 +367,7 @@ impl EnvEditorView {
                 v
             })
             .collect();
+        sort_env_variables(&mut updated.variables);
 
         self.dirty = false;
         cx.emit(EnvEditorEvent::Save {
