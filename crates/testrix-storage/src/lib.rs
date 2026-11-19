@@ -103,12 +103,14 @@ mod tests {
         assert_eq!(reloaded.workspace_dir, custom_ws);
         assert!(reloaded.remember_open_tabs);
         assert!(reloaded.remember_responses);
+        assert_eq!(reloaded.close_behavior, None);
 
-        save_config_preferences_at(&cfg_path, false, false, "zh-CN").unwrap();
+        save_config_preferences_at(&cfg_path, false, false, "zh-CN", Some("tray")).unwrap();
         let prefs_reloaded = init_or_load_config_at(&cfg_path).unwrap();
         assert!(!prefs_reloaded.remember_open_tabs);
         assert!(!prefs_reloaded.remember_responses);
         assert_eq!(prefs_reloaded.language, "zh-CN");
+        assert_eq!(prefs_reloaded.close_behavior.as_deref(), Some("tray"));
     }
 
     #[test]

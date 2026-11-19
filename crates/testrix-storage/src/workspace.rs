@@ -1029,6 +1029,8 @@ pub struct TestrixConfig {
     pub share_access_token: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_projects: Vec<PersistedShareRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_behavior: Option<String>,
 }
 
 /// Persisted remote share record stored in `~/.testrix/config.yaml`.
@@ -1079,6 +1081,7 @@ impl Default for TestrixConfig {
             cloudflare_pages_url: String::new(),
             share_access_token: String::new(),
             shared_projects: Vec::new(),
+            close_behavior: None,
         }
     }
 }
@@ -1122,26 +1125,29 @@ pub fn save_config_workspace_dir_at(
     write_yaml_atomic(config_path, &cfg)
 }
 
-/// Persists preference toggles and language into `~/.testrix/config.yaml`.
+/// Persists preference toggles, language, and close behavior into `~/.testrix/config.yaml`.
 pub fn save_config_preferences(
     remember_open_tabs: bool,
     remember_responses: bool,
     language: &str,
+    close_behavior: Option<&str>,
 ) -> Result<(), StorageError> {
     save_config_preferences_at(
         &config_file_path(),
         remember_open_tabs,
         remember_responses,
         language,
+        close_behavior,
     )
 }
 
-/// Persists preference toggles and language into `config_path`.
+/// Persists preference toggles, language, and close behavior into `config_path`.
 pub fn save_config_preferences_at(
     config_path: &Path,
     remember_open_tabs: bool,
     remember_responses: bool,
     language: &str,
+    close_behavior: Option<&str>,
 ) -> Result<(), StorageError> {
     let mut cfg = if config_path.is_file() {
         read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
@@ -1153,6 +1159,10 @@ pub fn save_config_preferences_at(
     if !language.trim().is_empty() {
         cfg.language = language.trim().to_string();
     }
+    cfg.close_behavior = close_behavior
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     write_yaml_atomic(config_path, &cfg)
 }
 

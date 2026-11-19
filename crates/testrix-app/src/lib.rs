@@ -13,5 +13,7 @@ mod kv_editor;
 mod post_script;
 mod request_editor;
 mod theme_helpers;
+mod tray;
 
 pub use app_view::{TestrixApp, init_app, open_main_window};
+pub use tray::init_system_tray;

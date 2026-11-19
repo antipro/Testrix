@@ -17,6 +17,7 @@ use gpui_kit::{
         ActiveTheme as _, Icon, IconName, IndexPath, Placement, Selectable as _, Sizable as _,
         StyledExt as _, Theme, ThemeMode, TitleBar, WindowExt as _,
         button::{Button, ButtonVariant, ButtonVariants as _},
+        checkbox::Checkbox,
         dialog::{DialogClose, DialogFooter},
         empty::{
             Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant,
@@ -74,6 +75,19 @@ use crate::{
     theme_helpers::method_badge,
 };
 
+fn hide_window_to_tray(window: &Window, cx: &App) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        cx.hide();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cx;
+        window.minimize_window();
+    }
+}
+
 fn app_titlebar_icon() -> Arc<Image> {
     static ICON: OnceLock<Arc<Image>> = OnceLock::new();
     ICON.get_or_init(|| {
@@ -101,6 +115,25 @@ impl SelectItem for ProfileOption {
 
     fn value(&self) -> &Self::Value {
         &self.env_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseBehaviorOption(Option<&'static str>);
+
+impl SelectItem for CloseBehaviorOption {
+    type Value = Option<&'static str>;
+
+    fn title(&self) -> SharedString {
+        match self.0 {
+            Some("tray") => crate::i18n::t("close_behavior_tray").into(),
+            Some("quit") => crate::i18n::t("close_behavior_quit").into(),
+            _ => crate::i18n::t("close_behavior_ask").into(),
+        }
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
     }
 }
 
@@ -158,11 +191,13 @@ pub struct TestrixApp {
     env_editor: Entity<EnvEditorView>,
     profile_select: Entity<SelectState<Vec<ProfileOption>>>,
     language_select: Entity<SelectState<Vec<LanguageOption>>>,
+    close_behavior_select: Entity<SelectState<Vec<CloseBehaviorOption>>>,
     tabs: Vec<WorkbenchTab>,
     active_tab_ix: Option<usize>,
     context_tab_ix: Option<usize>,
     remember_open_tabs: bool,
     remember_responses: bool,
+    close_behavior: Option<String>,
     share_settings: ShareSettings,
     active_shares: Vec<ActiveShareRecord>,
     share_sync_count: usize,
@@ -218,6 +253,24 @@ impl TestrixApp {
                 cx,
             )
         });
+        let close_behavior_items = vec![
+            CloseBehaviorOption(None),
+            CloseBehaviorOption(Some("tray")),
+            CloseBehaviorOption(Some("quit")),
+        ];
+        let close_behavior_ix = match cfg.close_behavior.as_deref() {
+            Some("tray") => 1,
+            Some("quit") => 2,
+            _ => 0,
+        };
+        let close_behavior_select = cx.new(|cx| {
+            SelectState::new(
+                close_behavior_items,
+                Some(IndexPath::default().row(close_behavior_ix)),
+                window,
+                cx,
+            )
+        });
 
         let restored_shares: Vec<ActiveShareRecord> = cfg
             .shared_projects
@@ -255,11 +308,13 @@ impl TestrixApp {
             env_editor,
             profile_select,
             language_select,
+            close_behavior_select,
             tabs: Vec::new(),
             active_tab_ix: None,
             context_tab_ix: None,
             remember_open_tabs: cfg.remember_open_tabs,
             remember_responses: cfg.remember_responses,
+            close_behavior: cfg.close_behavior.clone(),
             share_settings: ShareSettings::from(&cfg),
             active_shares: restored_shares,
             share_sync_count: 0,
@@ -274,23 +329,53 @@ impl TestrixApp {
             let Some(app_entity) = app_weak.upgrade() else {
                 return true;
             };
-            let (force_quit, syncing, prompt_open) = {
+            let (force_quit, syncing, prompt_open, close_behavior) = {
                 let app = app_entity.read(cx);
                 (
                     app.force_quit,
                     app.share_sync_count > 0,
                     app.exit_prompt_open,
+                    app.close_behavior.clone(),
                 )
             };
-            if force_quit || !syncing {
+            if force_quit {
+                if syncing {
+                    if !prompt_open {
+                        app_entity.update(cx, |this, cx| {
+                            this.open_exit_sync_dialog(window, cx);
+                        });
+                    }
+                    return false;
+                }
                 return true;
             }
-            if !prompt_open {
-                app_entity.update(cx, |this, cx| {
-                    this.open_exit_sync_dialog(window, cx);
-                });
+
+            match close_behavior.as_deref() {
+                Some("tray") => {
+                    hide_window_to_tray(window, cx);
+                    false
+                }
+                Some("quit") => {
+                    if syncing {
+                        if !prompt_open {
+                            app_entity.update(cx, |this, cx| {
+                                this.open_exit_sync_dialog(window, cx);
+                            });
+                        }
+                        return false;
+                    }
+                    cx.quit();
+                    true
+                }
+                _ => {
+                    if !prompt_open {
+                        app_entity.update(cx, |this, cx| {
+                            this.open_close_behavior_dialog(window, cx);
+                        });
+                    }
+                    false
+                }
             }
-            false
         });
 
         app.wire_subscriptions(window, cx);
@@ -306,6 +391,10 @@ impl TestrixApp {
 
     pub fn workspace_dir(&self) -> &PathBuf {
         &self.workspace_dir
+    }
+
+    pub fn set_force_quit(&mut self) {
+        self.force_quit = true;
     }
 
     pub fn workspace(&self) -> &WorkspaceTree {
@@ -359,6 +448,25 @@ impl TestrixApp {
                         this.remember_open_tabs,
                         this.remember_responses,
                         lang.code(),
+                        this.close_behavior.as_deref(),
+                    );
+                    cx.notify();
+                    window.refresh();
+                }
+            },
+        ));
+
+        subs.push(cx.subscribe_in(
+            &self.close_behavior_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<CloseBehaviorOption>>, window, cx| {
+                if let SelectEvent::Confirm(Some(choice)) = event {
+                    this.close_behavior = choice.map(str::to_string);
+                    let _ = save_config_preferences(
+                        this.remember_open_tabs,
+                        this.remember_responses,
+                        crate::i18n::current_language().code(),
+                        this.close_behavior.as_deref(),
                     );
                     cx.notify();
                     window.refresh();
@@ -1138,6 +1246,128 @@ impl TestrixApp {
         } else if !self.exit_prompt_open {
             self.open_exit_sync_dialog(window, cx);
         }
+    }
+
+    fn open_close_behavior_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_prompt_open = true;
+        let app_entity = cx.entity();
+        let remember_state = std::rc::Rc::new(Cell::new(true));
+
+        window.open_dialog(cx, move |dialog, _, _cx| {
+            let app_cancel = app_entity.clone();
+            let app_tray = app_entity.clone();
+            let app_quit = app_entity.clone();
+            let rem_toggle = remember_state.clone();
+            let rem_tray = remember_state.clone();
+            let rem_quit = remember_state.clone();
+            let checked = remember_state.get();
+
+            dialog
+                .title(crate::i18n::t("close_prompt_title"))
+                .width(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().child(crate::i18n::t("close_prompt_desc")))
+                        .child(
+                            Checkbox::new("close-remember-choice")
+                                .checked(checked)
+                                .label(crate::i18n::t("remember_choice"))
+                                .on_click(move |next, window, _| {
+                                    rem_toggle.set(*next);
+                                    window.refresh();
+                                }),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("close-prompt-cancel")
+                                    .outline()
+                                    .label(crate::i18n::t("cancel"))
+                                    .on_click(move |_, _, cx| {
+                                        app_cancel.update(cx, |this, cx| {
+                                            this.exit_prompt_open = false;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("close-prompt-tray")
+                                    .outline()
+                                    .label(crate::i18n::t("minimize_to_tray"))
+                                    .on_click(move |_, window, cx| {
+                                        let remember = rem_tray.get();
+                                        app_tray.update(cx, |this, cx| {
+                                            this.exit_prompt_open = false;
+                                            if remember {
+                                                this.set_close_behavior(
+                                                    Some("tray"),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            cx.notify();
+                                        });
+                                        hide_window_to_tray(window, cx);
+                                    }),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("close-prompt-quit")
+                                    .primary()
+                                    .label(crate::i18n::t("quit_app"))
+                                    .on_click(move |_, window, cx| {
+                                        let remember = rem_quit.get();
+                                        app_quit.update(cx, |this, cx| {
+                                            this.exit_prompt_open = false;
+                                            if remember {
+                                                this.set_close_behavior(
+                                                    Some("quit"),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            if this.share_sync_count > 0 {
+                                                this.open_exit_sync_dialog(window, cx);
+                                            } else {
+                                                this.force_quit = true;
+                                                cx.quit();
+                                            }
+                                        });
+                                    }),
+                            ),
+                        ),
+                )
+        });
+    }
+
+    fn set_close_behavior(
+        &mut self,
+        behavior: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_behavior = behavior.map(str::to_string);
+        let ix = match behavior {
+            Some("tray") => 1,
+            Some("quit") => 2,
+            _ => 0,
+        };
+        self.close_behavior_select.update(cx, |sel, cx| {
+            sel.set_selected_index(Some(IndexPath::default().row(ix)), window, cx);
+        });
+        let _ = save_config_preferences(
+            self.remember_open_tabs,
+            self.remember_responses,
+            crate::i18n::current_language().code(),
+            self.close_behavior.as_deref(),
+        );
     }
 
     fn open_exit_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2114,6 +2344,7 @@ impl TestrixApp {
             let remember_tabs = app_entity.read(cx).remember_open_tabs;
             let remember_responses = app_entity.read(cx).remember_responses;
             let language_select = app_entity.read(cx).language_select.clone();
+            let close_behavior_select = app_entity.read(cx).close_behavior_select.clone();
             let share_state = app_entity.read(cx).share_settings.clone();
             let is_logged_in = !share_state.share_token.trim().is_empty();
 
@@ -2205,6 +2436,7 @@ impl TestrixApp {
                                                     this.remember_open_tabs,
                                                     this.remember_responses,
                                                     crate::i18n::current_language().code(),
+                                                    this.close_behavior.as_deref(),
                                                 );
                                                 if *next {
                                                     this.persist_open_tabs(cx);
@@ -2253,6 +2485,7 @@ impl TestrixApp {
                                                     this.remember_open_tabs,
                                                     this.remember_responses,
                                                     crate::i18n::current_language().code(),
+                                                    this.close_behavior.as_deref(),
                                                 );
                                                 if !*next {
                                                     let _ = clear_saved_responses(
@@ -2263,6 +2496,36 @@ impl TestrixApp {
                                             });
                                             window.refresh();
                                         }),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_medium()
+                                                .child(crate::i18n::t("close_behavior")),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(crate::i18n::t("close_behavior_desc")),
+                                        ),
+                                )
+                                .child(
+                                    div().w(px(196.)).flex_none().child(
+                                        Select::new(&close_behavior_select)
+                                            .id("pref-close-behavior-select")
+                                            .small(),
+                                    ),
                                 ),
                         )
                         .child(

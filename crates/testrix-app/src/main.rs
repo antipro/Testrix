@@ -11,7 +11,7 @@ use std::{
 use gpui_kit::assets::AllAssets;
 use testrix_app::{
     cli_api::{execute_cli_api, format_api_error, is_api_resource},
-    init_app, open_main_window,
+    init_app, init_system_tray, open_main_window,
 };
 use testrix_storage::{
     default_workspace_dir, init_or_load_config, load_project, load_workspace, validate_yaml_file,
@@ -191,7 +191,9 @@ fn main() -> ExitCode {
         .with_assets(AllAssets)
         .run(move |cx| {
             init_app(cx);
-            open_main_window(workspace_dir, cx).expect("failed to open Testrix window");
+            let (window_handle, app_entity) =
+                open_main_window(workspace_dir, cx).expect("failed to open Testrix window");
+            init_system_tray(window_handle, app_entity, cx);
             cx.activate(true);
         });
 
