@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui_kit::{
-    App, Hsla, IntoElement, ParentElement as _, Styled as _,
+    Anchor, App, Hsla, IntoElement, ParentElement as _, Styled as _,
     assets::IconName as LucideIcon,
     component::{
         ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
@@ -193,7 +193,9 @@ pub(crate) fn configure_syntax_highlighting(cx: &mut App) {
     {
         highlight.style.syntax.punctuation_delimiter = Some(style);
     }
-    Theme::global_mut(cx).highlight_theme = Arc::new(highlight);
+    let theme = Theme::global_mut(cx);
+    theme.highlight_theme = Arc::new(highlight);
+    theme.notification.placement = Anchor::BottomRight;
 }
 
 #[cfg(test)]
