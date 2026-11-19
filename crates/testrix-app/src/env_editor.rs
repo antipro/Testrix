@@ -1,6 +1,7 @@
 use gpui_kit::{
-    AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Window,
     assets::IconName as LucideIcon,
     component::{
         ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
@@ -69,6 +70,7 @@ impl SelectItem for MergeProfileOption {
 
 /// Persistent editor view rendered inside the Environment Profiles sheet.
 pub(crate) struct EnvEditorView {
+    focus_handle: FocusHandle,
     profiles: Vec<EnvironmentNode>,
     editing_env_id: Option<String>,
     active_env_id: Option<String>,
@@ -84,6 +86,12 @@ pub(crate) struct EnvEditorView {
 }
 
 impl EventEmitter<EnvEditorEvent> for EnvEditorView {}
+
+impl Focusable for EnvEditorView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl EnvEditorView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -102,6 +110,7 @@ impl EnvEditorView {
         });
 
         Self {
+            focus_handle: cx.focus_handle(),
             profiles: Vec::new(),
             editing_env_id: None,
             active_env_id: None,
@@ -382,6 +391,7 @@ impl Render for EnvEditorView {
         let editing_id = self.editing_env_id.clone();
 
         v_flex()
+            .track_focus(&self.focus_handle)
             .size_full()
             .min_h_0()
             .gap_3()

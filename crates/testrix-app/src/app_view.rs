@@ -547,6 +547,9 @@ impl TestrixApp {
                         self.rename_variables_in_open_tabs(&renamed_keys, window, cx);
                     }
                     self.sync_all_tabs(window, cx);
+                    self.env_editor.update(cx, |editor, cx| {
+                        window.focus(&editor.focus_handle(cx), cx);
+                    });
                     window.push_notification("Profile saved.", cx);
                 }
             }
@@ -2543,11 +2546,22 @@ impl TestrixApp {
     fn open_env_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_env_editor(window, cx);
         let env_editor = self.env_editor.clone();
+        env_editor.update(cx, |editor, cx| {
+            window.focus(&editor.focus_handle(cx), cx);
+        });
         window.open_sheet_at(Placement::Right, cx, move |sheet, _, _| {
             sheet
                 .title("Profiles & Environment Variables")
                 .size(px(580.))
                 .child(div().size_full().p_4().child(env_editor.clone()))
+                .footer(
+                    Button::new("env-sheet-done-btn")
+                        .primary()
+                        .label(crate::i18n::t("done"))
+                        .on_click(|_, window, cx| {
+                            window.close_sheet(cx);
+                        }),
+                )
         });
     }
 
