@@ -178,4 +178,49 @@ mod tests {
         assert!(resp_text.contains("Local Share Test"));
         handle.stop();
     }
+
+    #[test]
+    #[ignore = "requires live Cloudflare R2 credentials via TESTRIX_R2_* env vars"]
+    fn live_cloudflare_r2_sync_and_revoke() {
+        let account_id = std::env::var("TESTRIX_R2_ACCOUNT").expect("TESTRIX_R2_ACCOUNT");
+        let bucket = std::env::var("TESTRIX_R2_BUCKET").expect("TESTRIX_R2_BUCKET");
+        let api_token = std::env::var("TESTRIX_R2_TOKEN").expect("TESTRIX_R2_TOKEN");
+
+        let slug = "_testrix-sync-smoke";
+        let files = vec![
+            ShareFile {
+                path: "testrix.project.yaml".to_string(),
+                content: "apiVersion: testrix.io/v1\nkind: Project\nid: proj-smoke\nname: Smoke\n".to_string(),
+            },
+            ShareFile {
+                path: "get-orders.request.yaml".to_string(),
+                content: "apiVersion: testrix.io/v1\nkind: HttpRequest\nid: req-smoke\nname: Get Orders\nrequest:\n  method: GET\n  url: https://example.com/orders\n".to_string(),
+            },
+        ];
+
+        let rx = dispatch_share_future(upload_to_cloudflare_r2(
+            account_id.clone(),
+            bucket.clone(),
+            api_token.clone(),
+            String::new(),
+            slug.to_string(),
+            String::new(),
+            files,
+        ));
+        let upload_res = rx.blocking_recv().expect("channel").expect("upload ok");
+        assert_eq!(upload_res.channel, ShareChannel::CloudflareR2);
+        assert_eq!(upload_res.files_uploaded, 2);
+
+        let rx_rev = dispatch_share_future(revoke_cloudflare_r2_share(
+            account_id,
+            bucket,
+            api_token,
+            slug.to_string(),
+            vec![
+                "testrix.project.yaml".to_string(),
+                "get-orders.request.yaml".to_string(),
+            ],
+        ));
+        rx_rev.blocking_recv().expect("channel").expect("revoke ok");
+    }
 }
