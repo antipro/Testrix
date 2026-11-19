@@ -7,7 +7,19 @@ description: Safely create, edit, and validate Testrix YAML workspace files (`te
 
 Testrix stores projects, folders, HTTP requests, and environments as `testrix.io/v1` YAML documents on disk. Whenever you create or modify Testrix YAML files, follow this schema and **always validate your changes with `--check`**.
 
-## 1. Required Workflow
+## 1. Preferred Workflow: Validated CLI CRUD API
+
+Whenever possible, use the `testrix` CLI CRUD API instead of editing YAML files directly. Every command performs schema & legal checks and returns structured JSON (`{ "ok": true, "data": ... }` or `{ "ok": false, "error": ... }`):
+
+```bash
+testrix [--workspace <DIR>] project  <list|get|create|update|delete> [--project <id-or-name>] [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
+testrix [--workspace <DIR>] folder   <list|create|update|delete>     --project <id-or-name> [--folder <id-or-name>] [--parent <id-or-name>] [--name <name>] [--order <n>]
+testrix [--workspace <DIR>] item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
+testrix [--workspace <DIR>] profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
+testrix [--workspace <DIR>] var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
+```
+
+If you do edit YAML files manually, follow the workflow below:
 
 1. **Read the target file** (and nearby `testrix.project.yaml`, `_folder.yaml`, or `environments/*.env.yaml` if inheritance or variables matter).
 2. **Edit or create the YAML file** following the rules below. Preserve existing `id` values on existing files so open tabs, saved responses, and references do not break.
@@ -151,6 +163,8 @@ Key field rules:
 - `request.params` / `request.headers`: list of `{ name, value, enabled, description }` (`enabled` defaults to `true`).
 - `request.settings.timeoutMs`: must be `>= 1` (default `30000`).
 - `request.postScript`: optional QuickJS script with `environment`, `request`, and `response` globals (see [post-script.md](./post-script.md)).
+- `request.responseExamples`: optional list of saved response snapshots (`{ id, name, statusCode, reason, contentType, headers, body }`).
+- `request.responseMeta`: optional extracted JSON/XML schema tree (`{ name, type, example, description, children }`) with editable field descriptions.
 
 #### `request.body` Variants (Tagged by `type`)
 

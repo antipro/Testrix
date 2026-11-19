@@ -3,8 +3,8 @@
 A zero-dependency **Cloudflare Pages + Pages Functions + R2** private API documentation viewer for Testrix YAML projects.
 
 - No Node.js build step, no webpack, no `package.json`, and no `node_modules` required.
-- Renders projects with a left navigation tree (folders, HTTP method badges, search filter) and a right content pane (resolved URLs with environment selector, query params, headers, auth, body, and Copy cURL).
-- Does **not** expose public registration or upload endpoints — projects are uploaded directly from **Testrix App** to your R2 bucket.
+- Renders projects with a left navigation tree (folders, HTTP method badges, search filter) and a right content pane (resolved URLs with environment selector, query params, headers, auth, body, **Code Snippets** for `cURL` / `cURL (Win)` / `wget` / `PowerShell`, **Response Meta Info** tree table, **Response Examples**, and direct request links `?project=<slug>&request=<relPath>` with **Copy Link**).
+- Does **not** expose public registration or upload endpoints — projects are uploaded directly from **Testrix App** to your R2 bucket (and auto-sync changed YAML files in the background on save).
 
 ## Structure
 
