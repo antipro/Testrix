@@ -43,9 +43,14 @@ jobs:
       msi_version: ${{ steps.meta.outputs.msi_version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
       should_release: ${{ steps.meta.outputs.should_release }}
+      build_time: ${{ steps.meta.outputs.build_time }}
+      branch: ${{ steps.meta.outputs.branch }}
+      commit: ${{ steps.meta.outputs.commit }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Compute version and release flags
         id: meta
@@ -69,10 +74,20 @@ jobs:
           # Windows MSI requires strictly numeric major.minor.patch (strip any -prerelease suffix)
           MSI_VERSION="${VERSION%%-*}"
 
+          BUILD_TIME=$(date -u "+%Y-%m-%d %H:%M:%S UTC (+00:00)")
+          BRANCH=$(git branch -r --contains HEAD --format='%(refname:short)' | sed 's|^origin/||' | grep -v '^HEAD$' | head -n1 || true)
+          if [ -z "$BRANCH" ]; then
+            BRANCH="${{ github.ref_name }}"
+          fi
+          COMMIT=$(git rev-parse --short=12 HEAD)
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "msi_version=${MSI_VERSION}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # 2. macOS Build (Universal .dmg: Apple Silicon arm64 + Intel x86_64)
@@ -94,6 +109,22 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Write build_info.json resource
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.release_tag }}
+          BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+          BUILD_BRANCH: ${{ needs.prepare.outputs.branch }}
+          BUILD_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          cat > crates/testrix-app/assets/build_info.json <<EOF
+          {
+            "version": "${BUILD_VERSION}",
+            "buildTime": "${BUILD_TIME}",
+            "branch": "${BUILD_BRANCH}",
+            "commit": "${BUILD_COMMIT}"
+          }
+          EOF
 
       - name: Build release binaries (arm64 + x86_64)
         run: |
@@ -168,6 +199,23 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Write build_info.json resource
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.release_tag }}
+          BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+          BUILD_BRANCH: ${{ needs.prepare.outputs.branch }}
+          BUILD_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          cat > crates/testrix-app/assets/build_info.json <<EOF
+          {
+            "version": "${BUILD_VERSION}",
+            "buildTime": "${BUILD_TIME}",
+            "branch": "${BUILD_BRANCH}",
+            "commit": "${BUILD_COMMIT}"
+          }
+          EOF
 
       # build.rs embeds assets/icon.ico and sets the 8 MB main-thread stack size
       - name: Build release binary
@@ -252,6 +300,22 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb,cargo-generate-rpm
+
+      - name: Write build_info.json resource
+        env:
+          BUILD_VERSION: ${{ needs.prepare.outputs.release_tag }}
+          BUILD_TIME: ${{ needs.prepare.outputs.build_time }}
+          BUILD_BRANCH: ${{ needs.prepare.outputs.branch }}
+          BUILD_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          cat > crates/testrix-app/assets/build_info.json <<EOF
+          {
+            "version": "${BUILD_VERSION}",
+            "buildTime": "${BUILD_TIME}",
+            "branch": "${BUILD_BRANCH}",
+            "commit": "${BUILD_COMMIT}"
+          }
+          EOF
 
       - name: Build release binary
         run: cargo build --release -p testrix-app

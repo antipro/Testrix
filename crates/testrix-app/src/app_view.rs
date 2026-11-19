@@ -99,6 +99,56 @@ fn app_titlebar_icon() -> Arc<Image> {
     .clone()
 }
 
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawBuildInfo {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    build_time: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    commit: String,
+}
+
+#[derive(Debug, Clone)]
+struct BuildInfo {
+    version: String,
+    build_time: String,
+    branch: String,
+    commit: String,
+}
+
+fn current_build_info() -> BuildInfo {
+    let raw: RawBuildInfo =
+        serde_json::from_str(include_str!("../assets/build_info.json")).unwrap_or_default();
+    let pick = |val: String, fallback: Option<&str>, default: &str| -> String {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else if let Some(fb) = fallback.map(str::trim).filter(|s| !s.is_empty()) {
+            fb.to_string()
+        } else {
+            default.to_string()
+        }
+    };
+    BuildInfo {
+        version: pick(
+            raw.version,
+            Some(concat!("v", env!("CARGO_PKG_VERSION"))),
+            concat!("v", env!("CARGO_PKG_VERSION")),
+        ),
+        build_time: pick(
+            raw.build_time,
+            option_env!("TESTRIX_LOCAL_BUILD_TIME"),
+            "dev",
+        ),
+        branch: pick(raw.branch, option_env!("TESTRIX_LOCAL_BRANCH"), "unknown"),
+        commit: pick(raw.commit, option_env!("TESTRIX_LOCAL_COMMIT"), "unknown"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileOption {
     env_id: Option<String>,
@@ -2739,6 +2789,129 @@ impl TestrixApp {
         });
     }
 
+    fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let info = current_build_info();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let row = |label: &'static str, value: String| {
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .child(value),
+                    )
+            };
+
+            dialog
+                .title(crate::i18n::t("about"))
+                .width(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(
+                                    img(ImageSource::Image(app_titlebar_icon()))
+                                        .size(px(48.))
+                                        .rounded(px(10.)),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(div().text_base().font_bold().child("Testrix"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("YAML-First Desktop API Workbench"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .p_3()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(row(crate::i18n::t("about_version"), info.version.clone()))
+                                .child(row(
+                                    crate::i18n::t("about_build_time"),
+                                    info.build_time.clone(),
+                                ))
+                                .child(row(crate::i18n::t("about_branch"), info.branch.clone()))
+                                .child(row(crate::i18n::t("about_commit"), info.commit.clone()))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(crate::i18n::t("about_email")),
+                                        )
+                                        .child(
+                                            Button::new("about-email-btn")
+                                                .link()
+                                                .xsmall()
+                                                .label("support@bitifyware.com")
+                                                .on_click(|_, _, cx| {
+                                                    cx.open_url("mailto:support@bitifyware.com");
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_between()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(crate::i18n::t("about_website")),
+                                        )
+                                        .child(
+                                            Button::new("about-website-btn")
+                                                .link()
+                                                .xsmall()
+                                                .label("https://bitifyware.com")
+                                                .on_click(|_, _, cx| {
+                                                    cx.open_url("https://bitifyware.com");
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        DialogClose::new().child(
+                            Button::new("about-done-btn")
+                                .primary()
+                                .label(crate::i18n::t("done")),
+                        ),
+                    ),
+                )
+        });
+    }
+
     fn switch_workspace_dir(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match ensure_seeded_workspace(&dir) {
             Ok(tree) => {
@@ -3638,6 +3811,16 @@ impl Render for TestrixApp {
                                         .tooltip(crate::i18n::t("preferences"))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_preferences_dialog(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("about-btn")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(LucideIcon::Info)
+                                        .tooltip(crate::i18n::t("about"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_about_dialog(window, cx);
                                         })),
                                 ),
                         )
