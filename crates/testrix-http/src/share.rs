@@ -23,6 +23,18 @@ impl ShareChannel {
             Self::LocalNetwork => "Local Network",
         }
     }
+
+    /// Parses a persisted or display channel label back into a [`ShareChannel`].
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Testrix Share Server" | "Testrix Server" | "TestrixServer" => {
+                Some(Self::TestrixServer)
+            }
+            "Cloudflare R2 Storage" | "Cloudflare R2" | "CloudflareR2" => Some(Self::CloudflareR2),
+            "Local Network" | "LocalNetwork" => Some(Self::LocalNetwork),
+            _ => None,
+        }
+    }
 }
 
 /// A single YAML file (relative path + UTF-8 contents) collected from a project directory.

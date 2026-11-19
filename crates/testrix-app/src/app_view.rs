@@ -222,11 +222,10 @@ impl TestrixApp {
             .shared_projects
             .iter()
             .filter_map(|p| {
-                let channel = match p.channel.as_str() {
-                    "Testrix Server" => ShareChannel::TestrixServer,
-                    "Cloudflare R2" => ShareChannel::CloudflareR2,
-                    _ => return None,
-                };
+                let channel = ShareChannel::from_label(&p.channel)?;
+                if channel == ShareChannel::LocalNetwork {
+                    return None;
+                }
                 Some(ActiveShareRecord {
                     id: p.id.clone(),
                     project_id: p.project_id.clone(),
