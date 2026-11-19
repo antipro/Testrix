@@ -29,7 +29,6 @@ pub(crate) fn init_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-q", Quit, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-s", SaveActive, Some(APP_KEY_CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-s", SaveActive, Some(APP_KEY_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-enter", SendRequest, Some(APP_KEY_CONTEXT)),
