@@ -759,11 +759,12 @@ pub struct ProjectNode {
     pub environments: Vec<EnvironmentNode>,
 }
 
-/// Complete loaded workspace containing projects and active UI selection.
+/// Complete loaded workspace containing projects, shared environments, and active UI selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceTree {
     pub root_dir: PathBuf,
     pub projects: Vec<ProjectNode>,
+    pub environments: Vec<EnvironmentNode>,
     pub active_project_id: Option<String>,
     pub active_environment_id: Option<String>,
 }
@@ -808,13 +809,18 @@ impl WorkspaceTree {
         self.projects.iter_mut().find(|p| p.doc.id == id)
     }
 
-    /// Returns the currently active environment document for the active project.
+    /// Returns the currently active workspace-wide environment document.
     pub fn active_environment(&self) -> Option<&EnvironmentNode> {
         let env_id = self.active_environment_id.as_deref()?;
-        self.active_project()?
-            .environments
+        self.environments
             .iter()
             .find(|env| env.doc.id == env_id)
+            .or_else(|| {
+                self.active_project()?
+                    .environments
+                    .iter()
+                    .find(|env| env.doc.id == env_id)
+            })
     }
 
     /// Finds a project by ID.

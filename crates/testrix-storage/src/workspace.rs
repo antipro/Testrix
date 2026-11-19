@@ -104,11 +104,11 @@ pub fn ensure_seeded_workspace(workspace_root: &Path) -> Result<WorkspaceTree, S
         tree = load_workspace(workspace_root)?;
         if let Some(first_project) = tree.projects.first() {
             tree.active_project_id = Some(first_project.doc.id.clone());
-            tree.active_environment_id = first_project
+            tree.active_environment_id = tree
                 .environments
                 .iter()
                 .find(|env| env.doc.name.eq_ignore_ascii_case("Development"))
-                .or_else(|| first_project.environments.first())
+                .or_else(|| tree.environments.first())
                 .map(|env| env.doc.id.clone());
             let _ = save_workspace_state(
                 workspace_root,
@@ -121,12 +121,13 @@ pub fn ensure_seeded_workspace(workspace_root: &Path) -> Result<WorkspaceTree, S
     Ok(tree)
 }
 
-/// Loads all projects, folders, HTTP requests, and environments from `workspace_root`.
+/// Loads all projects, folders, HTTP requests, and shared environments from `workspace_root`.
 pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageError> {
     if !workspace_root.exists() {
         return Ok(WorkspaceTree {
             root_dir: workspace_root.to_path_buf(),
             projects: Vec::new(),
+            environments: Vec::new(),
             active_project_id: None,
             active_environment_id: None,
         });
@@ -158,6 +159,40 @@ pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageErr
 
     projects.sort_by_key(|a| a.doc.name.to_lowercase());
 
+    // Load workspace-wide shared profiles from `<workspace_root>/environments/*.env.yaml`.
+    let ws_env_dir = workspace_root.join(ENVIRONMENTS_DIR);
+    let mut environments = if ws_env_dir.is_dir() {
+        load_environments(&ws_env_dir)?
+    } else {
+        Vec::new()
+    };
+
+    // Migrate any legacy per-project `<project_dir>/environments/*.env.yaml` into workspace root.
+    if !root_manifest.is_file() {
+        let mut migrated_any = false;
+        for proj in &mut projects {
+            if proj.environments.is_empty() {
+                continue;
+            }
+            let docs: Vec<EnvironmentDoc> =
+                proj.environments.iter().map(|e| e.doc.clone()).collect();
+            merge_environments_into_dir(&ws_env_dir, &docs)?;
+            for legacy in proj.environments.drain(..) {
+                let _ = std::fs::remove_file(&legacy.file_path);
+            }
+            let legacy_dir = proj.root_dir.join(ENVIRONMENTS_DIR);
+            if legacy_dir.is_dir() {
+                let _ = std::fs::remove_dir(&legacy_dir);
+            }
+            migrated_any = true;
+        }
+        if migrated_any && ws_env_dir.is_dir() {
+            environments = load_environments(&ws_env_dir)?;
+        }
+    }
+
+    environments.sort_by_key(|a| a.doc.name.to_lowercase());
+
     let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
     let state = if state_path.is_file() {
         read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
@@ -170,16 +205,14 @@ pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageErr
         .filter(|id| projects.iter().any(|p| &p.doc.id == id))
         .or_else(|| projects.first().map(|p| p.doc.id.clone()));
 
-    let active_environment_id = state.active_environment_id.filter(|env_id| {
-        active_project_id
-            .as_deref()
-            .and_then(|proj_id| projects.iter().find(|p| p.doc.id == proj_id))
-            .is_some_and(|proj| proj.environments.iter().any(|e| &e.doc.id == env_id))
-    });
+    let active_environment_id = state
+        .active_environment_id
+        .filter(|env_id| environments.iter().any(|e| &e.doc.id == env_id));
 
     Ok(WorkspaceTree {
         root_dir: workspace_root.to_path_buf(),
         projects,
+        environments,
         active_project_id,
         active_environment_id,
     })
@@ -483,9 +516,8 @@ pub fn create_project(
     };
     let project_id = generate_id("proj");
     let root_dir = unique_dir_path(workspace_root, &project_id);
-    let env_dir = root_dir.join(ENVIRONMENTS_DIR);
-    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
-        path: env_dir.clone(),
+    std::fs::create_dir_all(&root_dir).map_err(|source| StorageError::Io {
+        path: root_dir.clone(),
         source,
     })?;
 
@@ -493,9 +525,6 @@ pub fn create_project(
     project.base_url = base_url.to_string();
     let manifest_path = root_dir.join(PROJECT_MANIFEST_FILE);
     write_yaml_atomic(&manifest_path, &project)?;
-
-    let env = EnvironmentDoc::new(generate_id("env"), "Development");
-    write_yaml_atomic(&env_dir.join("development.env.yaml"), &env)?;
 
     load_project(&root_dir)
 }
@@ -551,26 +580,90 @@ fn merge_imported_folder(
     Ok(())
 }
 
+/// Merges incoming [`EnvironmentDoc`] profiles into `env_dir` as standalone `*.env.yaml` files
+/// without deleting or overwriting any existing profiles or their variables.
+pub fn merge_environments_into_dir(
+    env_dir: &Path,
+    incoming_envs: &[EnvironmentDoc],
+) -> Result<(), StorageError> {
+    if incoming_envs.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(env_dir).map_err(|source| StorageError::Io {
+        path: env_dir.to_path_buf(),
+        source,
+    })?;
+
+    let mut existing = if env_dir.is_dir() {
+        load_environments(env_dir)?
+    } else {
+        Vec::new()
+    };
+
+    for incoming_env in incoming_envs {
+        incoming_env.validate()?;
+        if let Some(existing_env) = existing
+            .iter_mut()
+            .find(|e| e.doc.name.eq_ignore_ascii_case(&incoming_env.name))
+        {
+            let mut changed = false;
+            for var in &incoming_env.variables {
+                if !existing_env
+                    .doc
+                    .variables
+                    .iter()
+                    .any(|v| v.key.trim() == var.key.trim())
+                {
+                    existing_env.doc.variables.push(var.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                save_environment(existing_env)?;
+            }
+        } else {
+            let env_path = unique_file_path(env_dir, &incoming_env.name, ENV_EXTENSION);
+            write_yaml_atomic(&env_path, incoming_env)?;
+            existing.push(EnvironmentNode {
+                file_path: env_path,
+                doc: incoming_env.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Loads all shared environment profiles from `<workspace_root>/environments/*.env.yaml`.
+pub fn load_workspace_environments(
+    workspace_root: &Path,
+) -> Result<Vec<EnvironmentNode>, StorageError> {
+    let env_dir = workspace_root.join(ENVIRONMENTS_DIR);
+    if !env_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut envs = load_environments(&env_dir)?;
+    envs.sort_by_key(|a| a.doc.name.to_lowercase());
+    Ok(envs)
+}
+
 /// Persists an [`ImportedProjectBundle`] (such as an OpenAPI 3.0 or Postman import) into `workspace_root`.
+/// Imported environment profiles are merged into `<workspace_root>/environments/*.env.yaml`.
 pub fn import_project_bundle(
     workspace_root: &Path,
     bundle: &ImportedProjectBundle,
 ) -> Result<ProjectNode, StorageError> {
     bundle.project.validate()?;
     let root_dir = unique_dir_path(workspace_root, &bundle.project.id);
-    let env_dir = root_dir.join(ENVIRONMENTS_DIR);
-    std::fs::create_dir_all(&env_dir).map_err(|source| StorageError::Io {
-        path: env_dir.clone(),
+    std::fs::create_dir_all(&root_dir).map_err(|source| StorageError::Io {
+        path: root_dir.clone(),
         source,
     })?;
 
     write_yaml_atomic(&root_dir.join(PROJECT_MANIFEST_FILE), &bundle.project)?;
 
-    for env in &bundle.environments {
-        env.validate()?;
-        let env_path = unique_file_path(&env_dir, &env.name, ENV_EXTENSION);
-        write_yaml_atomic(&env_path, env)?;
-    }
+    let ws_env_dir = workspace_root.join(ENVIRONMENTS_DIR);
+    merge_environments_into_dir(&ws_env_dir, &bundle.environments)?;
 
     for req in &bundle.root_requests {
         req.validate()?;

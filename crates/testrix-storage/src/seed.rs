@@ -10,7 +10,7 @@ use crate::{error::StorageError, workspace::write_yaml_atomic};
 /// Populates `workspace_root` with an example multi-folder API project conforming to `testrix.io/v1`.
 pub fn seed_starter_workspace(workspace_root: &Path) -> Result<(), StorageError> {
     let project_dir = workspace_root.join("starter-api");
-    let env_dir = project_dir.join("environments");
+    let env_dir = workspace_root.join("environments");
     let users_dir = project_dir.join("users");
     let admin_dir = project_dir.join("admin");
     let security_dir = admin_dir.join("security");

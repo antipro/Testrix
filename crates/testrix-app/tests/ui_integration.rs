@@ -253,7 +253,7 @@ async fn env_sheet_creates_profile_and_persists_variables(cx: &mut TestAppContex
     });
 
     let reloaded = load_workspace(dir.path()).unwrap();
-    let qa_env = reloaded.projects[0]
+    let qa_env = reloaded
         .environments
         .iter()
         .find(|e| e.doc.name == "Local QA")
@@ -323,7 +323,7 @@ async fn executes_http_request_with_inherited_folder_auth_and_env_interpolation(
     let dir = TempDir::new().unwrap();
     let mut tree = ensure_seeded_workspace(dir.path()).unwrap();
     {
-        let dev_env = &mut tree.projects[0].environments[0];
+        let dev_env = &mut tree.environments[0];
         let base_var = dev_env
             .doc
             .variables

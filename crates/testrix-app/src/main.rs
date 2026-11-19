@@ -234,7 +234,7 @@ mod tests {
         assert!(check_target(dir.path()).is_ok());
         assert!(check_target(&project.root_dir).is_ok());
         assert!(check_target(&project.manifest_path).is_ok());
-        assert!(check_target(&project.environments[0].file_path).is_ok());
+        assert!(check_target(&tree.environments[0].file_path).is_ok());
         assert!(check_target(&project.requests[0].file_path).is_ok());
 
         let bad_req = dir.path().join("bad.request.yaml");

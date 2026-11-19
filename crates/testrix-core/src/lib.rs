@@ -247,6 +247,7 @@ mod tests {
         let workspace = WorkspaceTree {
             root_dir: PathBuf::from("."),
             projects: vec![project],
+            environments: Vec::new(),
             active_project_id: None,
             active_environment_id: None,
         };

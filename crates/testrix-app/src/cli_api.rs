@@ -314,19 +314,17 @@ fn find_request_mut_in_project<'a>(
         .ok_or_else(|| format!("Request item `{id_or_name}` not found"))
 }
 
-fn find_env<'a>(proj: &'a ProjectNode, id_or_name: &str) -> Result<&'a EnvironmentNode, String> {
-    proj.environments
-        .iter()
+fn find_env<'a>(envs: &'a [EnvironmentNode], id_or_name: &str) -> Result<&'a EnvironmentNode, String> {
+    envs.iter()
         .find(|e| e.doc.id == id_or_name || e.doc.name == id_or_name)
         .ok_or_else(|| format!("Profile `{id_or_name}` not found"))
 }
 
 fn find_env_mut<'a>(
-    proj: &'a mut ProjectNode,
+    envs: &'a mut [EnvironmentNode],
     id_or_name: &str,
 ) -> Result<&'a mut EnvironmentNode, String> {
-    proj.environments
-        .iter_mut()
+    envs.iter_mut()
         .find(|e| e.doc.id == id_or_name || e.doc.name == id_or_name)
         .ok_or_else(|| format!("Profile `{id_or_name}` not found"))
 }
@@ -614,13 +612,11 @@ fn handle_item(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String
 }
 
 fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
-    let project_ref = req_flag(cmd, "project")?;
     let mut tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
-    let proj = find_project_mut(&mut tree.projects, project_ref)?;
 
     match cmd.action.as_str() {
         "list" => {
-            let list: Vec<Value> = proj
+            let list: Vec<Value> = tree
                 .environments
                 .iter()
                 .map(|e| {
@@ -636,19 +632,19 @@ fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
         }
         "get" => {
             let prof_ref = req_flag(cmd, "profile")?;
-            let env = find_env(proj, prof_ref)?;
+            let env = find_env(&tree.environments, prof_ref)?;
             serde_json::to_value(&env.doc).map_err(|e| e.to_string())
         }
         "create" => {
             let name = validate_non_empty_name(req_flag(cmd, "name")?, "Profile")?;
-            if proj
+            if tree
                 .environments
                 .iter()
                 .any(|e| e.doc.name.eq_ignore_ascii_case(&name))
             {
-                return Err(format!("Profile `{name}` already exists in project"));
+                return Err(format!("Profile `{name}` already exists in workspace"));
             }
-            let mut env = create_environment(&proj.root_dir, &name).map_err(|e| e.to_string())?;
+            let mut env = create_environment(workspace_dir, &name).map_err(|e| e.to_string())?;
             if let Some(desc) = opt_flag(cmd, "description") {
                 env.doc.description = desc.to_string();
                 env.doc.validate().map_err(|e| e.to_string())?;
@@ -659,7 +655,7 @@ fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
         }
         "update" => {
             let prof_ref = req_flag(cmd, "profile")?;
-            let env = find_env_mut(proj, prof_ref)?;
+            let env = find_env_mut(&mut tree.environments, prof_ref)?;
             if let Some(name) = opt_flag(cmd, "name") {
                 env.doc.name = validate_non_empty_name(name, "Profile")?;
             }
@@ -673,7 +669,7 @@ fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
         }
         "delete" => {
             let prof_ref = req_flag(cmd, "profile")?;
-            let env = find_env(proj, prof_ref)?;
+            let env = find_env(&tree.environments, prof_ref)?;
             let id = env.doc.id.clone();
             delete_environment(&env.file_path).map_err(|e| e.to_string())?;
             Ok(json!({ "deleted": id }))
@@ -684,14 +680,14 @@ fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
             let overwrite = cmd.bool_flags.contains("overwrite");
 
             let source_vars = {
-                let src = find_env(proj, source_ref)?;
-                if src.doc.id == find_env(proj, target_ref)?.doc.id {
+                let src = find_env(&tree.environments, source_ref)?;
+                if src.doc.id == find_env(&tree.environments, target_ref)?.doc.id {
                     return Err("Cannot merge a profile into itself".to_string());
                 }
                 src.doc.variables.clone()
             };
 
-            let target = find_env_mut(proj, target_ref)?;
+            let target = find_env_mut(&mut tree.environments, target_ref)?;
             let mut added = 0usize;
             let mut updated = 0usize;
             for sv in source_vars {
@@ -719,11 +715,9 @@ fn handle_profile(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
 }
 
 fn handle_var(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
-    let project_ref = req_flag(cmd, "project")?;
     let prof_ref = req_flag(cmd, "profile")?;
     let mut tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
-    let proj = find_project_mut(&mut tree.projects, project_ref)?;
-    let env = find_env_mut(proj, prof_ref)?;
+    let env = find_env_mut(&mut tree.environments, prof_ref)?;
 
     match cmd.action.as_str() {
         "list" => serde_json::to_value(&env.doc.variables).map_err(|e| e.to_string()),

@@ -40,11 +40,10 @@ use gpui_kit::{
     px, size,
 };
 use testrix_core::{
-    AuthConfig, AuthNodeRef, EnvironmentDoc, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
+    AuthConfig, AuthNodeRef, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
     HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody, WorkspaceTree,
-    export_openapi_3_0, merge_environments_into_bundle, parse_apifox, parse_openapi_3_0,
-    parse_postman_collection, parse_postman_zip, parse_request_script, rename_template_variables,
-    resolve_request_auth,
+    export_openapi_3_0, parse_apifox, parse_openapi_3_0, parse_postman_collection,
+    parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
 };
 use testrix_http::{
     HttpRunner, ShareChannel, ShareFile, collect_project_yaml_files, dispatch_share_future,
@@ -55,8 +54,8 @@ use testrix_storage::{
     PersistedShareRecord, ShareSettings, clear_saved_responses, create_environment, create_folder,
     create_project, create_request, delete_environment, delete_folder, delete_project,
     delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
-    init_or_load_config, load_request_response, load_workspace, load_workspace_tabs,
-    save_config_preferences, save_config_share_settings, save_config_shared_projects,
+    init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
+    load_workspace_tabs, save_config_preferences, save_config_share_settings, save_config_shared_projects,
     save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
     save_request_response, save_workspace_state, save_workspace_tabs,
 };
@@ -528,18 +527,24 @@ impl TestrixApp {
             } => {
                 let is_active =
                     self.workspace.active_environment_id.as_deref() == Some(&env_id);
-                if let Some(proj) = self.workspace.active_project_mut()
-                    && let Some(env_node) =
-                        proj.environments.iter_mut().find(|e| e.doc.id == env_id)
+                if let Some(env_node) = self
+                    .workspace
+                    .environments
+                    .iter_mut()
+                    .find(|e| e.doc.id == env_id)
                 {
                     env_node.doc = updated;
                     if let Err(err) = save_environment(env_node) {
                         window.push_notification(format!("Failed saving profile: {err}"), cx);
                         return;
                     }
-                    proj.environments.sort_by_key(|a| a.doc.name.to_lowercase());
+                    self.workspace
+                        .environments
+                        .sort_by_key(|a| a.doc.name.to_lowercase());
                     if is_active && !renamed_keys.is_empty() {
-                        propagate_variable_renames_in_project(proj, &renamed_keys);
+                        for proj in &mut self.workspace.projects {
+                            propagate_variable_renames_in_project(proj, &renamed_keys);
+                        }
                     }
                     self.refresh_profile_selector(window, cx);
                     self.sync_env_editor(window, cx);
@@ -554,18 +559,13 @@ impl TestrixApp {
                 }
             }
             EnvEditorEvent::Create { name } => {
-                let Some(project_root) =
-                    self.workspace.active_project().map(|p| p.root_dir.clone())
-                else {
-                    return;
-                };
-                match create_environment(&project_root, &name) {
+                match create_environment(&self.workspace.root_dir, &name) {
                     Ok(env_node) => {
                         let new_id = env_node.doc.id.clone();
-                        if let Some(proj) = self.workspace.active_project_mut() {
-                            proj.environments.push(env_node);
-                            proj.environments.sort_by_key(|a| a.doc.name.to_lowercase());
-                        }
+                        self.workspace.environments.push(env_node);
+                        self.workspace
+                            .environments
+                            .sort_by_key(|a| a.doc.name.to_lowercase());
                         self.select_environment(Some(new_id.clone()), window, cx);
                         self.sync_env_editor(window, cx);
                         self.env_editor.update(cx, |editor, cx| {
@@ -578,23 +578,25 @@ impl TestrixApp {
                 }
             }
             EnvEditorEvent::Delete { env_id } => {
-                let Some(proj) = self.workspace.active_project_mut() else {
+                let Some(pos) = self
+                    .workspace
+                    .environments
+                    .iter()
+                    .position(|e| e.doc.id == env_id)
+                else {
                     return;
                 };
-                let Some(pos) = proj.environments.iter().position(|e| e.doc.id == env_id) else {
-                    return;
-                };
-                let removed = proj.environments.remove(pos);
+                let removed = self.workspace.environments.remove(pos);
                 if let Err(err) = delete_environment(&removed.file_path) {
                     window.push_notification(format!("Failed deleting profile: {err}"), cx);
-                    proj.environments.insert(pos, removed);
+                    self.workspace.environments.insert(pos, removed);
                     return;
                 }
                 if self.workspace.active_environment_id.as_deref() == Some(&env_id) {
                     self.workspace.active_environment_id = self
                         .workspace
-                        .active_project()
-                        .and_then(|p| p.environments.first())
+                        .environments
+                        .first()
                         .map(|e| e.doc.id.clone());
                     let _ = save_workspace_state(
                         &self.workspace_dir,
@@ -639,47 +641,27 @@ impl TestrixApp {
     }
 
     fn sync_env_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let profiles = self
-            .workspace
-            .active_project()
-            .map(|p| p.environments.clone())
-            .unwrap_or_default();
+        let profiles = self.workspace.environments.clone();
         let active_id = self.workspace.active_environment_id.clone();
         self.env_editor.update(cx, |editor, cx| {
             editor.sync_profiles(profiles, active_id, window, cx);
         });
     }
 
-    fn set_active_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_active_project(&mut self, project_id: &str, _window: &mut Window, _cx: &mut Context<Self>) {
         if self.workspace.active_project_id.as_deref() == Some(project_id) {
             return;
         }
-        let Some(proj) = self.workspace.find_project(project_id) else {
+        if self.workspace.find_project(project_id).is_none() {
             return;
-        };
-        let current_env_name = self
-            .workspace
-            .active_environment()
-            .map(|e| e.doc.name.clone());
-        let next_env_id = current_env_name
-            .as_deref()
-            .and_then(|name| {
-                proj.environments
-                    .iter()
-                    .find(|e| e.doc.name.eq_ignore_ascii_case(name))
-                    .map(|e| e.doc.id.clone())
-            })
-            .or_else(|| proj.environments.first().map(|e| e.doc.id.clone()));
+        }
 
         self.workspace.active_project_id = Some(project_id.to_string());
-        self.workspace.active_environment_id = next_env_id;
         let _ = save_workspace_state(
             &self.workspace.root_dir,
             self.workspace.active_project_id.as_deref(),
             self.workspace.active_environment_id.as_deref(),
         );
-        self.refresh_profile_selector(window, cx);
-        self.sync_env_editor(window, cx);
     }
 
     pub fn open_node(&mut self, node: ExplorerNode, window: &mut Window, cx: &mut Context<Self>) {
@@ -844,13 +826,15 @@ impl TestrixApp {
                 self.refresh_dirty_indicators(cx);
             }
             RequestTabEvent::ApplyPostScriptEnv {
-                project_id,
+                project_id: _,
                 env_id,
                 vars,
             } => {
-                if let Some(proj) = self.workspace.find_project_mut(&project_id)
-                    && let Some(env_node) =
-                        proj.environments.iter_mut().find(|e| e.doc.id == env_id)
+                if let Some(env_node) = self
+                    .workspace
+                    .environments
+                    .iter_mut()
+                    .find(|e| e.doc.id == env_id)
                 {
                     let changed =
                         crate::post_script::apply_vars_to_environment(&mut env_node.doc, &vars);
@@ -1566,41 +1550,26 @@ impl TestrixApp {
             window
                 .update(|window, cx| {
                     entity.update(cx, |this, cx| match parsed {
-                        Ok(mut bundle) => {
-                            let active_env_name = this
-                                .workspace
-                                .active_environment()
-                                .map(|e| e.doc.name.clone());
-                            if let Some(active_proj) = this.workspace.active_project() {
-                                let existing_envs: Vec<EnvironmentDoc> = active_proj
-                                    .environments
-                                    .iter()
-                                    .map(|e| e.doc.clone())
-                                    .collect();
-                                merge_environments_into_bundle(&mut bundle, &existing_envs);
-                            }
-
+                        Ok(bundle) => {
                             match import_project_bundle(&workspace_root, &bundle) {
                                 Ok(proj) => {
                                     let proj_id = proj.doc.id.clone();
                                     let proj_name = proj.doc.name.clone();
-                                    let matched_env_id = active_env_name
-                                        .as_deref()
-                                        .and_then(|name| {
-                                            proj.environments
-                                                .iter()
-                                                .find(|e| e.doc.name.eq_ignore_ascii_case(name))
-                                                .map(|e| e.doc.id.clone())
-                                        })
-                                        .or_else(|| {
-                                            proj.environments.first().map(|e| e.doc.id.clone())
-                                        });
+                                    if let Ok(envs) = load_workspace_environments(&workspace_root) {
+                                        this.workspace.environments = envs;
+                                    }
+                                    if this.workspace.active_environment_id.is_none() {
+                                        this.workspace.active_environment_id = this
+                                            .workspace
+                                            .environments
+                                            .first()
+                                            .map(|e| e.doc.id.clone());
+                                    }
                                     this.workspace.projects.push(proj);
                                     this.workspace
                                         .projects
                                         .sort_by_key(|p| p.doc.name.to_lowercase());
                                     this.workspace.active_project_id = Some(proj_id.clone());
-                                    this.workspace.active_environment_id = matched_env_id;
                                     let _ = save_workspace_state(
                                         &this.workspace.root_dir,
                                         this.workspace.active_project_id.as_deref(),
@@ -1672,43 +1641,17 @@ impl TestrixApp {
                 .update(|window, cx| {
                     entity.update(cx, |this, cx| match parsed {
                         Ok(bundles) => {
-                            let active_env_name = this
-                                .workspace
-                                .active_environment()
-                                .map(|e| e.doc.name.clone());
-                            let existing_envs: Vec<EnvironmentDoc> = this
-                                .workspace
-                                .active_project()
-                                .map(|p| p.environments.iter().map(|e| e.doc.clone()).collect())
-                                .unwrap_or_default();
-
                             let mut imported_names = Vec::new();
                             let mut last_proj_id = None;
-                            let mut last_env_id = None;
 
-                            for mut bundle in bundles {
-                                if !existing_envs.is_empty() {
-                                    merge_environments_into_bundle(&mut bundle, &existing_envs);
-                                }
+                            for bundle in bundles {
                                 match import_project_bundle(&workspace_root, &bundle) {
                                     Ok(proj) => {
                                         let proj_id = proj.doc.id.clone();
                                         let proj_name = proj.doc.name.clone();
-                                        let matched_env_id = active_env_name
-                                            .as_deref()
-                                            .and_then(|name| {
-                                                proj.environments
-                                                    .iter()
-                                                    .find(|e| e.doc.name.eq_ignore_ascii_case(name))
-                                                    .map(|e| e.doc.id.clone())
-                                            })
-                                            .or_else(|| {
-                                                proj.environments.first().map(|e| e.doc.id.clone())
-                                            });
                                         this.workspace.projects.push(proj);
                                         imported_names.push(proj_name);
                                         last_proj_id = Some(proj_id);
-                                        last_env_id = matched_env_id;
                                     }
                                     Err(err) => {
                                         window.push_notification(
@@ -1720,11 +1663,20 @@ impl TestrixApp {
                             }
 
                             if let Some(proj_id) = last_proj_id {
+                                if let Ok(envs) = load_workspace_environments(&workspace_root) {
+                                    this.workspace.environments = envs;
+                                }
+                                if this.workspace.active_environment_id.is_none() {
+                                    this.workspace.active_environment_id = this
+                                        .workspace
+                                        .environments
+                                        .first()
+                                        .map(|e| e.doc.id.clone());
+                                }
                                 this.workspace
                                     .projects
                                     .sort_by_key(|p| p.doc.name.to_lowercase());
                                 this.workspace.active_project_id = Some(proj_id.clone());
-                                this.workspace.active_environment_id = last_env_id;
                                 let _ = save_workspace_state(
                                     &this.workspace.root_dir,
                                     this.workspace.active_project_id.as_deref(),
@@ -3003,10 +2955,8 @@ impl TestrixApp {
         match create_project(&self.workspace_dir, name, base_url) {
             Ok(proj_node) => {
                 let pid = proj_node.doc.id.clone();
-                let first_env = proj_node.environments.first().map(|e| e.doc.id.clone());
                 self.workspace.projects.push(proj_node);
                 self.workspace.active_project_id = Some(pid.clone());
-                self.workspace.active_environment_id = first_env;
                 let _ = save_workspace_state(
                     &self.workspace_dir,
                     self.workspace.active_project_id.as_deref(),
@@ -3727,15 +3677,13 @@ fn build_profile_options(workspace: &WorkspaceTree) -> (Vec<ProfileOption>, Opti
         var_count: 0,
     }];
 
-    if let Some(project) = workspace.active_project() {
-        for env in &project.environments {
-            let enabled = env.doc.variables.iter().filter(|v| v.enabled).count();
-            items.push(ProfileOption {
-                env_id: Some(env.doc.id.clone()),
-                label: SharedString::from(format!("{} ({enabled})", env.doc.name)),
-                var_count: enabled,
-            });
-        }
+    for env in &workspace.environments {
+        let enabled = env.doc.variables.iter().filter(|v| v.enabled).count();
+        items.push(ProfileOption {
+            env_id: Some(env.doc.id.clone()),
+            label: SharedString::from(format!("{} ({enabled})", env.doc.name)),
+            var_count: enabled,
+        });
     }
 
     let selected_row = workspace
