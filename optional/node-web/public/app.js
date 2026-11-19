@@ -362,7 +362,10 @@ function renderRightContent() {
   return `
     <div class="doc-header">
       <h1 class="doc-title">${esc(d.name || req.relPath)}</h1>
-      <button class="btn btn-sm" id="copyCurlBtn">Copy cURL</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm" id="copyReqLinkBtn">Copy Link</button>
+        <button class="btn btn-sm" id="copyCurlBtn">Copy cURL</button>
+      </div>
     </div>
     ${d.description ? `<p class="doc-desc">${esc(d.description)}</p>` : ''}
     <div class="url-bar">
@@ -710,6 +713,37 @@ function findRequestByPath(proj, relPath) {
   return walk(proj.folders);
 }
 
+function findRequestByTarget(proj, target) {
+  if (!proj || !target) return null;
+  const normalized = String(target).replace(/^\/+/, '');
+  const byPath = findRequestByPath(proj, normalized);
+  if (byPath) return byPath;
+
+  for (const r of proj.requests || []) {
+    if (r.doc?.id === normalized) return r;
+  }
+  function walk(folders) {
+    for (const f of folders || []) {
+      for (const r of f.requests || []) {
+        if (r.doc?.id === normalized) return r;
+      }
+      const sub = walk(f.folders);
+      if (sub) return sub;
+    }
+    return null;
+  }
+  return walk(proj.folders);
+}
+
+function buildRequestSharePath(slug, relPath) {
+  const encodedRel = String(relPath || '')
+    .split('/')
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join('/');
+  return `/s/${encodeURIComponent(slug)}/${encodedRel}`;
+}
+
 function renderViewerLayout() {
   const root = document.getElementById('appRoot');
   if (!state.currentProject) {
@@ -735,6 +769,9 @@ function renderViewerLayout() {
   root.querySelectorAll('[data-select-project]').forEach((el) => {
     el.onclick = () => {
       state.selectedNode = { type: 'project', data: state.currentProject };
+      if (state.currentProject?.slug) {
+        history.pushState({}, '', `/s/${encodeURIComponent(state.currentProject.slug)}`);
+      }
       renderViewerLayout();
     };
   });
@@ -754,10 +791,23 @@ function renderViewerLayout() {
       const r = findRequestByPath(state.currentProject, el.getAttribute('data-select-request'));
       if (r) {
         state.selectedNode = { type: 'request', data: r };
+        if (state.currentProject?.slug) {
+          history.pushState({}, '', buildRequestSharePath(state.currentProject.slug, r.relPath));
+        }
         renderViewerLayout();
       }
     };
   });
+
+  const copyReqLinkBtn = document.getElementById('copyReqLinkBtn');
+  if (copyReqLinkBtn && state.selectedNode?.type === 'request' && state.currentProject?.slug) {
+    copyReqLinkBtn.onclick = () => {
+      const url = `${location.origin}${buildRequestSharePath(state.currentProject.slug, state.selectedNode.data.relPath)}`;
+      navigator.clipboard?.writeText(url);
+      copyReqLinkBtn.textContent = 'Copied!';
+      setTimeout(() => (copyReqLinkBtn.textContent = 'Copy Link'), 1500);
+    };
+  }
 
   const copyShareBtn = document.getElementById('copyShareLinkBtn');
   if (copyShareBtn) {
@@ -805,7 +855,7 @@ function renderViewerLayout() {
   }
 }
 
-function renderAccessTokenPrompt(slug) {
+function renderAccessTokenPrompt(slug, reqTarget = null) {
   const root = document.getElementById('appRoot');
   root.innerHTML = `
     <div class="card-container">
@@ -833,7 +883,7 @@ function renderAccessTokenPrompt(slug) {
         method: 'POST',
         body: JSON.stringify({ accessToken: form.get('accessToken') }),
       });
-      await loadProject(slug);
+      await loadProject(slug, reqTarget);
     } catch (err) {
       errEl.textContent = err.message;
       errEl.style.display = 'block';
@@ -841,19 +891,22 @@ function renderAccessTokenPrompt(slug) {
   };
 }
 
-async function loadProject(slug) {
+async function loadProject(slug, reqTarget = null) {
   let data;
   try {
     data = await api(`/api/public/projects/${encodeURIComponent(slug)}`);
   } catch (err) {
     if (err.accessTokenRequired) {
-      renderAccessTokenPrompt(slug);
+      renderAccessTokenPrompt(slug, reqTarget);
       return;
     }
     throw err;
   }
   state.currentProject = data.project;
-  state.selectedNode = { type: 'project', data: data.project };
+  const matchedReq = reqTarget ? findRequestByTarget(data.project, reqTarget) : null;
+  state.selectedNode = matchedReq
+    ? { type: 'request', data: matchedReq }
+    : { type: 'project', data: data.project };
   state.selectedEnvIndex = 0;
 
   const envSel = document.getElementById('envSelect');
@@ -871,7 +924,7 @@ async function loadProject(slug) {
   renderViewerLayout();
 }
 
-async function loadProjectsList(preferredSlug = null) {
+async function loadProjectsList(preferredSlug = null, reqTarget = null) {
   const data = await api('/api/public/projects');
   state.projects = data.projects || [];
 
@@ -883,7 +936,7 @@ async function loadProjectsList(preferredSlug = null) {
   const targetSlug = preferredSlug || state.projects[0]?.slug;
   if (targetSlug) {
     projSel.value = targetSlug;
-    await loadProject(targetSlug);
+    await loadProject(targetSlug, reqTarget);
   } else {
     state.currentProject = null;
     renderViewerLayout();
@@ -1126,9 +1179,13 @@ async function renderRoute() {
   if (p === '/register') return renderAuthForm('register');
   if (p === '/dashboard') return renderDashboard();
 
-  const match = p.match(/^\/s\/([^/]+)/);
+  const match = p.match(/^\/s\/([^/]+)(?:\/(.+))?$/);
   const slug = match ? decodeURIComponent(match[1]) : null;
-  await loadProjectsList(slug);
+  const reqTarget =
+    match && match[2]
+      ? match[2].split('/').map(decodeURIComponent).join('/')
+      : new URLSearchParams(location.search).get('request');
+  await loadProjectsList(slug, reqTarget);
 }
 
 document.getElementById('searchInput').addEventListener('input', (e) => {

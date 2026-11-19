@@ -284,7 +284,10 @@ function renderRightContent() {
   return `
     <div class="doc-header">
       <h1 class="doc-title">${esc(d.name || req.relPath)}</h1>
-      <button class="btn btn-sm" id="copyCurlBtn">Copy cURL</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm" id="copyReqLinkBtn">Copy Link</button>
+        <button class="btn btn-sm" id="copyCurlBtn">Copy cURL</button>
+      </div>
     </div>
     ${d.description ? `<p class="doc-desc">${esc(d.description)}</p>` : ''}
     <div class="url-bar">${methodBadge(r.method)}<span class="url-text">${esc(resolvedUrl)}</span></div>
@@ -620,6 +623,35 @@ function findRequestByPath(proj, relPath) {
   return walk(proj.folders);
 }
 
+function findRequestByTarget(proj, target) {
+  if (!proj || !target) return null;
+  const normalized = String(target).replace(/^\/+/, '');
+  const byPath = findRequestByPath(proj, normalized);
+  if (byPath) return byPath;
+
+  for (const r of proj.requests || []) {
+    if (r.doc?.id === normalized) return r;
+  }
+  function walk(folders) {
+    for (const f of folders || []) {
+      for (const r of f.requests || []) {
+        if (r.doc?.id === normalized) return r;
+      }
+      const sub = walk(f.folders);
+      if (sub) return sub;
+    }
+    return null;
+  }
+  return walk(proj.folders);
+}
+
+function buildRequestQueryUrl(slug, relPath) {
+  const params = new URLSearchParams();
+  if (slug) params.set('project', slug);
+  if (relPath) params.set('request', relPath);
+  return `${location.pathname}?${params.toString()}`;
+}
+
 function renderViewerLayout() {
   const root = document.getElementById('appRoot');
   if (!state.currentProject) {
@@ -644,6 +676,9 @@ function renderViewerLayout() {
   root.querySelectorAll('[data-select-project]').forEach((el) => {
     el.onclick = () => {
       state.selectedNode = { type: 'project', data: state.currentProject };
+      if (state.currentProject?.slug) {
+        history.pushState({}, '', buildRequestQueryUrl(state.currentProject.slug, null));
+      }
       renderViewerLayout();
     };
   });
@@ -663,10 +698,23 @@ function renderViewerLayout() {
       const r = findRequestByPath(state.currentProject, el.getAttribute('data-select-request'));
       if (r) {
         state.selectedNode = { type: 'request', data: r };
+        if (state.currentProject?.slug) {
+          history.pushState({}, '', buildRequestQueryUrl(state.currentProject.slug, r.relPath));
+        }
         renderViewerLayout();
       }
     };
   });
+
+  const copyReqLinkBtn = document.getElementById('copyReqLinkBtn');
+  if (copyReqLinkBtn && state.selectedNode?.type === 'request' && state.currentProject?.slug) {
+    copyReqLinkBtn.onclick = () => {
+      const url = `${location.origin}${buildRequestQueryUrl(state.currentProject.slug, state.selectedNode.data.relPath)}`;
+      navigator.clipboard?.writeText(url);
+      copyReqLinkBtn.textContent = 'Copied!';
+      setTimeout(() => (copyReqLinkBtn.textContent = 'Copy Link'), 1500);
+    };
+  }
 
   const copyCurlBtn = document.getElementById('copyCurlBtn');
   if (copyCurlBtn && state.selectedNode?.type === 'request') {
@@ -732,7 +780,16 @@ function renderPasscodePrompt() {
         method: 'POST',
         body: JSON.stringify({ passcode: form.get('passcode') }),
       });
-      await init();
+      await window.addEventListener('popstate', () => {
+  const searchParams = new URLSearchParams(location.search);
+  const targetSlug = searchParams.get('project') || state.currentProject?.slug;
+  const reqTarget = searchParams.get('request');
+  if (targetSlug) {
+    loadProject(targetSlug, reqTarget);
+  }
+});
+
+init();
     } catch (err) {
       errEl.textContent = err.message;
       errEl.style.display = 'block';
@@ -740,7 +797,7 @@ function renderPasscodePrompt() {
   };
 }
 
-function renderAccessTokenPrompt(slug) {
+function renderAccessTokenPrompt(slug, reqTarget = null) {
   const root = document.getElementById('appRoot');
   root.innerHTML = `
     <div class="card-container">
@@ -768,7 +825,7 @@ function renderAccessTokenPrompt(slug) {
         method: 'POST',
         body: JSON.stringify({ accessToken: form.get('accessToken') }),
       });
-      await loadProject(slug);
+      await loadProject(slug, reqTarget);
     } catch (err) {
       errEl.textContent = err.message;
       errEl.style.display = 'block';
@@ -776,19 +833,22 @@ function renderAccessTokenPrompt(slug) {
   };
 }
 
-async function loadProject(slug) {
+async function loadProject(slug, reqTarget = null) {
   let data;
   try {
     data = await api(`/api/projects/${encodeURIComponent(slug)}`);
   } catch (err) {
     if (err.accessTokenRequired) {
-      renderAccessTokenPrompt(slug);
+      renderAccessTokenPrompt(slug, reqTarget);
       return;
     }
     throw err;
   }
   state.currentProject = data.project;
-  state.selectedNode = { type: 'project', data: data.project };
+  const matchedReq = reqTarget ? findRequestByTarget(data.project, reqTarget) : null;
+  state.selectedNode = matchedReq
+    ? { type: 'request', data: matchedReq }
+    : { type: 'project', data: data.project };
   state.selectedEnvIndex = 0;
 
   const envSel = document.getElementById('envSelect');
@@ -815,17 +875,25 @@ async function init() {
       ? state.projects.map((p) => `<option value="${esc(p.slug)}">${esc(p.name)}</option>`).join('')
       : '<option value="">No projects</option>';
 
-    const urlSlug = new URLSearchParams(location.search).get('project');
+    const searchParams = new URLSearchParams(location.search);
+    const pathMatch = location.pathname.match(/^\/s\/([^/]+)(?:\/(.+))?$/);
+    const urlSlug = searchParams.get('project') || (pathMatch ? decodeURIComponent(pathMatch[1]) : null);
+    const reqTarget =
+      searchParams.get('request') ||
+      (pathMatch && pathMatch[2] ? pathMatch[2].split('/').map(decodeURIComponent).join('/') : null);
     const targetSlug = urlSlug || state.projects[0]?.slug;
     if (targetSlug) {
       projSel.value = targetSlug;
-      await loadProject(targetSlug);
+      await loadProject(targetSlug, reqTarget);
     } else {
       state.currentProject = null;
       renderViewerLayout();
     }
     projSel.onchange = () => {
-      if (projSel.value) loadProject(projSel.value);
+      if (projSel.value) {
+        history.pushState({}, '', buildRequestQueryUrl(projSel.value, null));
+        loadProject(projSel.value);
+      }
     };
   } catch (err) {
     if (err.authRequired) {
@@ -839,6 +907,15 @@ async function init() {
 document.getElementById('searchInput').addEventListener('input', (e) => {
   state.searchQuery = e.target.value;
   renderViewerLayout();
+});
+
+window.addEventListener('popstate', () => {
+  const searchParams = new URLSearchParams(location.search);
+  const targetSlug = searchParams.get('project') || state.currentProject?.slug;
+  const reqTarget = searchParams.get('request');
+  if (targetSlug) {
+    loadProject(targetSlug, reqTarget);
+  }
 });
 
 init();

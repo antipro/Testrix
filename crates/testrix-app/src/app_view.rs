@@ -51,12 +51,13 @@ use testrix_http::{
     upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
-    ShareSettings, clear_saved_responses, create_environment, create_folder, create_project,
-    create_request, delete_environment, delete_folder, delete_project, delete_request,
-    duplicate_request, ensure_seeded_workspace, import_project_bundle, init_or_load_config,
-    load_request_response, load_workspace, load_workspace_tabs, save_config_preferences,
-    save_config_share_settings, save_config_workspace_dir, save_environment, save_folder,
-    save_project, save_request, save_request_response, save_workspace_state, save_workspace_tabs,
+    PersistedShareRecord, ShareSettings, clear_saved_responses, create_environment, create_folder,
+    create_project, create_request, delete_environment, delete_folder, delete_project,
+    delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
+    init_or_load_config, load_request_response, load_workspace, load_workspace_tabs,
+    save_config_preferences, save_config_share_settings, save_config_shared_projects,
+    save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
+    save_request_response, save_workspace_state, save_workspace_tabs,
 };
 use tracing::{error, info};
 
@@ -217,6 +218,29 @@ impl TestrixApp {
             )
         });
 
+        let restored_shares: Vec<ActiveShareRecord> = cfg
+            .shared_projects
+            .iter()
+            .filter_map(|p| {
+                let channel = match p.channel.as_str() {
+                    "Testrix Server" => ShareChannel::TestrixServer,
+                    "Cloudflare R2" => ShareChannel::CloudflareR2,
+                    _ => return None,
+                };
+                Some(ActiveShareRecord {
+                    id: p.id.clone(),
+                    project_id: p.project_id.clone(),
+                    project_name: p.project_name.clone(),
+                    project_slug: p.project_slug.clone(),
+                    channel,
+                    share_url: p.share_url.clone(),
+                    target_info: p.target_info.clone(),
+                    file_paths: Vec::new(),
+                    local_handle: None,
+                })
+            })
+            .collect();
+
         let mut app = Self {
             focus_handle: cx.focus_handle(),
             workspace_dir,
@@ -232,7 +256,7 @@ impl TestrixApp {
             remember_open_tabs: cfg.remember_open_tabs,
             remember_responses: cfg.remember_responses,
             share_settings: ShareSettings::from(&cfg),
-            active_shares: Vec::new(),
+            active_shares: restored_shares,
             share_sync_count: 0,
             quit_after_sync: false,
             force_quit: false,
@@ -924,8 +948,29 @@ impl TestrixApp {
                 }
                 self.active_shares.retain(|s| s.id != record.id);
                 self.active_shares.push(record);
+                self.persist_remote_shares();
                 cx.notify();
             }
+        }
+    }
+
+    fn persist_remote_shares(&self) {
+        let persisted: Vec<PersistedShareRecord> = self
+            .active_shares
+            .iter()
+            .filter(|s| s.channel != ShareChannel::LocalNetwork)
+            .map(|s| PersistedShareRecord {
+                id: s.id.clone(),
+                project_id: s.project_id.clone(),
+                project_name: s.project_name.clone(),
+                project_slug: s.project_slug.clone(),
+                channel: s.channel.label().to_string(),
+                share_url: s.share_url.clone(),
+                target_info: s.target_info.clone(),
+            })
+            .collect();
+        if let Err(err) = save_config_shared_projects(&persisted) {
+            tracing::warn!(error = %err, "failed persisting remote share records");
         }
     }
 
@@ -1746,6 +1791,7 @@ impl TestrixApp {
             return;
         };
         let record = self.active_shares.remove(pos);
+        self.persist_remote_shares();
         cx.notify();
 
         match record.channel {

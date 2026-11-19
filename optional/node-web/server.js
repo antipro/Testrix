@@ -501,7 +501,7 @@ app.patch('/api/my/projects/:id/items/:itemId', requireAuth, (req, res) => {
 });
 
 // Page routes (no webpack, plain HTML)
-app.get(['/s/:slug', '/login', '/register', '/dashboard'], (_req, res) => {
+app.get(['/s/:slug', '/s/:slug/*', '/login', '/register', '/dashboard'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 

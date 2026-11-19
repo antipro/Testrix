@@ -905,6 +905,23 @@ pub struct TestrixConfig {
     pub cloudflare_pages_url: String,
     #[serde(default)]
     pub share_access_token: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_projects: Vec<PersistedShareRecord>,
+}
+
+/// Persisted remote share record stored in `~/.testrix/config.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedShareRecord {
+    pub id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_slug: String,
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub share_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_info: String,
 }
 
 fn default_config_api_version() -> String {
@@ -939,6 +956,7 @@ impl Default for TestrixConfig {
             cloudflare_api_token: String::new(),
             cloudflare_pages_url: String::new(),
             share_access_token: String::new(),
+            shared_projects: Vec::new(),
         }
     }
 }
@@ -1069,5 +1087,20 @@ pub fn save_config_share_settings_at(
     cfg.cloudflare_api_token = settings.cloudflare_api_token.trim().to_string();
     cfg.cloudflare_pages_url = settings.cloudflare_pages_url.trim().to_string();
     cfg.share_access_token = settings.share_access_token.trim().to_string();
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Persists active remote share records in `~/.testrix/config.yaml`.
+pub fn save_config_shared_projects(shares: &[PersistedShareRecord]) -> Result<(), StorageError> {
+    save_config_shared_projects_at(&config_file_path(), shares)
+}
+
+/// Persists active remote share records at `config_path`.
+pub fn save_config_shared_projects_at(
+    config_path: &Path,
+    shares: &[PersistedShareRecord],
+) -> Result<(), StorageError> {
+    let mut cfg = init_or_load_config_at(config_path)?;
+    cfg.shared_projects = shares.to_vec();
     write_yaml_atomic(config_path, &cfg)
 }
