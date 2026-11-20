@@ -149,7 +149,8 @@ CLI API Resources (validated JSON CRUD):
   folder   <list|create|update|delete>
   item     <list|get|create|update|delete>
   profile  <list|get|create|update|delete|merge>
-  var      <list|get|create|update|set|delete>"
+  var      <list|get|create|update|set|delete>
+  share    <list|status|config-set|login|publish|revoke>"
     );
 }
 

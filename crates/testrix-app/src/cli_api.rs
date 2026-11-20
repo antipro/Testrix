@@ -4,12 +4,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use testrix_core::{
     AuthConfig, EnvVariable, EnvironmentNode, FolderNode, HttpMethod, HttpRequestSpec,
-    ProjectNode, RequestNode, parse_request_script,
+    ProjectNode, RequestNode, generate_id, parse_request_script,
+};
+use testrix_http::{
+    ShareChannel, collect_project_yaml_files, dispatch_share_future, login_testrix_server,
+    revoke_cloudflare_r2_share, revoke_testrix_server_share, upload_to_cloudflare_r2,
+    upload_to_testrix_server,
 };
 use testrix_storage::{
-    create_environment, create_folder, create_project, create_request, delete_environment,
-    delete_folder, delete_project, delete_request, load_workspace, save_environment, save_folder,
-    save_project, save_request, validate_yaml_file,
+    PersistedShareRecord, ShareSettings, create_environment, create_folder, create_project,
+    create_request, delete_environment, delete_folder, delete_project, delete_request,
+    init_or_load_config, load_workspace, save_config_share_settings, save_config_shared_projects,
+    save_environment, save_folder, save_project, save_request, validate_yaml_file,
 };
 
 #[derive(Debug, Serialize)]
@@ -44,6 +50,8 @@ pub fn is_api_resource(arg: &str) -> bool {
             | "vars"
             | "variable"
             | "variables"
+            | "share"
+            | "shares"
     )
 }
 
@@ -338,6 +346,7 @@ fn dispatch_api(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Strin
             handle_profile(workspace_dir, cmd)
         }
         "var" | "vars" | "variable" | "variables" => handle_var(workspace_dir, cmd),
+        "share" | "shares" => handle_share(workspace_dir, cmd),
         other => Err(format!("Unknown resource `{other}`")),
     }
 }
@@ -856,6 +865,331 @@ fn handle_var(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String>
     }
 }
 
+fn parse_share_channel(raw: &str) -> Result<ShareChannel, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "server" | "testrix" | "testrix-server" | "testrix_server" | "testrix share server" => {
+            Ok(ShareChannel::TestrixServer)
+        }
+        "r2" | "cloudflare" | "cloudflare-r2" | "cloudflare_r2" | "cloudflare r2 storage" => {
+            Ok(ShareChannel::CloudflareR2)
+        }
+        "local" | "local-network" | "local_network" | "local network" => Err(
+            "Local Network sharing runs inside the GUI desktop app; use `server` or `r2` in CLI mode."
+                .to_string(),
+        ),
+        _ => ShareChannel::from_label(raw)
+            .filter(|ch| *ch != ShareChannel::LocalNetwork)
+            .ok_or_else(|| {
+                format!("Unsupported share channel `{raw}` (expected `server` or `r2`)")
+            }),
+    }
+}
+
+fn project_slug_from_node(project: &ProjectNode) -> String {
+    project
+        .root_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| project.doc.id.clone())
+}
+
+fn resolve_default_share_channel(settings: &ShareSettings) -> ShareChannel {
+    if !settings.share_token.trim().is_empty() {
+        ShareChannel::TestrixServer
+    } else if !settings.cloudflare_r2_bucket.trim().is_empty()
+        && !settings.cloudflare_api_token.trim().is_empty()
+    {
+        ShareChannel::CloudflareR2
+    } else {
+        ShareChannel::TestrixServer
+    }
+}
+
+fn handle_share(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
+    match cmd.action.as_str() {
+        "list" => {
+            let cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            let project_filter = opt_flag(cmd, "project").map(str::trim);
+            let channel_filter = opt_flag(cmd, "channel")
+                .map(parse_share_channel)
+                .transpose()?;
+            let records: Vec<Value> = cfg
+                .shared_projects
+                .iter()
+                .filter(|r| {
+                    project_filter.is_none_or(|f| {
+                        r.project_id == f || r.project_name == f || r.project_slug == f
+                    })
+                })
+                .filter(|r| {
+                    channel_filter
+                        .is_none_or(|ch| ShareChannel::from_label(&r.channel) == Some(ch))
+                })
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "project_id": r.project_id,
+                        "project_name": r.project_name,
+                        "project_slug": r.project_slug,
+                        "channel": r.channel,
+                        "share_url": r.share_url,
+                        "target_info": r.target_info,
+                    })
+                })
+                .collect();
+            Ok(json!(records))
+        }
+        "status" | "config" => {
+            let cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            Ok(json!({
+                "share_server_url": cfg.share_server_url,
+                "share_email": cfg.share_email,
+                "logged_in": !cfg.share_token.trim().is_empty(),
+                "cloudflare_account_id": cfg.cloudflare_account_id,
+                "cloudflare_r2_bucket": cfg.cloudflare_r2_bucket,
+                "cloudflare_pages_url": cfg.cloudflare_pages_url,
+                "cloudflare_configured": !cfg.cloudflare_r2_bucket.trim().is_empty()
+                    && !cfg.cloudflare_api_token.trim().is_empty(),
+                "has_access_token": !cfg.share_access_token.trim().is_empty(),
+                "active_shares_count": cfg.shared_projects.len(),
+            }))
+        }
+        "config-set" | "configure" => {
+            let cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            let mut settings = ShareSettings::from(&cfg);
+            if let Some(v) = opt_flag(cmd, "server-url") {
+                settings.share_server_url = v.trim().to_string();
+            }
+            if let Some(v) = opt_flag(cmd, "r2-account-id") {
+                settings.cloudflare_account_id = v.trim().to_string();
+            }
+            if let Some(v) = opt_flag(cmd, "r2-bucket") {
+                settings.cloudflare_r2_bucket = v.trim().to_string();
+            }
+            if let Some(v) = opt_flag(cmd, "r2-api-token") {
+                settings.cloudflare_api_token = v.trim().to_string();
+            }
+            if let Some(v) = opt_flag(cmd, "r2-pages-url") {
+                settings.cloudflare_pages_url = v.trim().to_string();
+            }
+            if let Some(v) = opt_flag(cmd, "access-token") {
+                settings.share_access_token = v.trim().to_string();
+            }
+            save_config_share_settings(&settings).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "share_server_url": settings.share_server_url,
+                "cloudflare_account_id": settings.cloudflare_account_id,
+                "cloudflare_r2_bucket": settings.cloudflare_r2_bucket,
+                "cloudflare_pages_url": settings.cloudflare_pages_url,
+                "has_access_token": !settings.share_access_token.trim().is_empty(),
+            }))
+        }
+        "login" => {
+            let mut cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            let server_url = opt_flag(cmd, "server-url")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| cfg.share_server_url.clone());
+            let email = req_flag(cmd, "email")?.trim().to_string();
+            let password = req_flag(cmd, "password")?.to_string();
+
+            let rx = dispatch_share_future(login_testrix_server(
+                server_url.clone(),
+                email,
+                password,
+            ));
+            let res = rx
+                .blocking_recv()
+                .map_err(|_| "Login task cancelled".to_string())??;
+            cfg.share_server_url = server_url.clone();
+            cfg.share_email = res.email.clone();
+            cfg.share_token = res.token;
+            let settings = ShareSettings::from(&cfg);
+            save_config_share_settings(&settings).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "server_url": server_url,
+                "email": res.email,
+                "logged_in": true,
+            }))
+        }
+        "publish" | "create" | "upload" | "sync" => {
+            let project_ref = req_flag(cmd, "project")?;
+            let ws = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
+            let project = find_project(&ws.projects, project_ref)?;
+            let mut cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            let settings = ShareSettings::from(&cfg);
+
+            let channel = match opt_flag(cmd, "channel") {
+                Some(raw) => parse_share_channel(raw)?,
+                None => resolve_default_share_channel(&settings),
+            };
+            let access_token = opt_flag(cmd, "access-token")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| settings.share_access_token.clone());
+
+            let files = collect_project_yaml_files(&project.root_dir)?;
+            let project_slug = project_slug_from_node(project);
+            let project_name = project.doc.name.clone();
+            let project_id = project.doc.id.clone();
+
+            let target_info = match channel {
+                ShareChannel::TestrixServer => settings.share_server_url.clone(),
+                ShareChannel::CloudflareR2 => format!("r2://{}", settings.cloudflare_r2_bucket),
+                ShareChannel::LocalNetwork => String::new(),
+            };
+
+            let rx = match channel {
+                ShareChannel::TestrixServer => dispatch_share_future(upload_to_testrix_server(
+                    settings.share_server_url,
+                    settings.share_token,
+                    project_slug.clone(),
+                    project_name.clone(),
+                    access_token,
+                    files,
+                )),
+                ShareChannel::CloudflareR2 => dispatch_share_future(upload_to_cloudflare_r2(
+                    settings.cloudflare_account_id,
+                    settings.cloudflare_r2_bucket,
+                    settings.cloudflare_api_token,
+                    settings.cloudflare_pages_url,
+                    project_slug.clone(),
+                    access_token,
+                    files,
+                )),
+                ShareChannel::LocalNetwork => unreachable!(),
+            };
+
+            let res = rx
+                .blocking_recv()
+                .map_err(|_| "Share upload task cancelled".to_string())??;
+
+            let channel_label = res.channel.label().to_string();
+            let share_id = if let Some(existing) = cfg.shared_projects.iter_mut().find(|r| {
+                r.project_id == project_id && r.channel == channel_label
+            }) {
+                existing.project_name = project_name.clone();
+                existing.project_slug = project_slug.clone();
+                existing.share_url = res.share_url.clone();
+                existing.target_info = target_info.clone();
+                existing.id.clone()
+            } else {
+                let id = generate_id("share");
+                cfg.shared_projects.push(PersistedShareRecord {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    project_name: project_name.clone(),
+                    project_slug: project_slug.clone(),
+                    channel: channel_label.clone(),
+                    share_url: res.share_url.clone(),
+                    target_info,
+                });
+                id
+            };
+
+            save_config_shared_projects(&cfg.shared_projects).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "id": share_id,
+                "project_id": project_id,
+                "project_name": project_name,
+                "project_slug": project_slug,
+                "channel": channel_label,
+                "share_url": res.share_url,
+                "files_uploaded": res.files_uploaded,
+            }))
+        }
+        "revoke" | "delete" => {
+            let mut cfg = init_or_load_config().map_err(|e| e.to_string())?;
+            let settings = ShareSettings::from(&cfg);
+            let share_id = opt_flag(cmd, "share").map(str::trim);
+            let project_ref = opt_flag(cmd, "project").map(str::trim);
+            let channel_filter = opt_flag(cmd, "channel")
+                .map(parse_share_channel)
+                .transpose()?;
+
+            if share_id.is_none() && project_ref.is_none() {
+                return Err("Specify `--share <id>` or `--project <id-or-name>` to revoke".to_string());
+            }
+
+            let mut to_revoke = Vec::new();
+            let mut remaining = Vec::new();
+            for rec in cfg.shared_projects.drain(..) {
+                let matches_id = share_id.is_some_and(|id| rec.id == id);
+                let matches_proj = project_ref.is_some_and(|p| {
+                    rec.project_id == p || rec.project_name == p || rec.project_slug == p
+                });
+                let matches_channel = channel_filter
+                    .is_none_or(|ch| ShareChannel::from_label(&rec.channel) == Some(ch));
+
+                if (matches_id || matches_proj) && matches_channel {
+                    to_revoke.push(rec);
+                } else {
+                    remaining.push(rec);
+                }
+            }
+
+            if to_revoke.is_empty() {
+                return Err("No matching share record found".to_string());
+            }
+
+            let ws = load_workspace(workspace_dir).ok();
+            let mut revoked_out = Vec::new();
+            for rec in &to_revoke {
+                let channel = ShareChannel::from_label(&rec.channel).ok_or_else(|| {
+                    format!("Unknown share channel `{}` on record `{}`", rec.channel, rec.id)
+                })?;
+                match channel {
+                    ShareChannel::TestrixServer => {
+                        let rx = dispatch_share_future(revoke_testrix_server_share(
+                            settings.share_server_url.clone(),
+                            settings.share_token.clone(),
+                            rec.project_slug.clone(),
+                        ));
+                        rx.blocking_recv()
+                            .map_err(|_| "Revoke task cancelled".to_string())??;
+                    }
+                    ShareChannel::CloudflareR2 => {
+                        let file_paths = ws
+                            .as_ref()
+                            .and_then(|tree| {
+                                tree.projects
+                                    .iter()
+                                    .find(|p| p.doc.id == rec.project_id)
+                                    .and_then(|p| collect_project_yaml_files(&p.root_dir).ok())
+                            })
+                            .map(|files| files.into_iter().map(|f| f.path).collect())
+                            .unwrap_or_default();
+                        let rx = dispatch_share_future(revoke_cloudflare_r2_share(
+                            settings.cloudflare_account_id.clone(),
+                            settings.cloudflare_r2_bucket.clone(),
+                            settings.cloudflare_api_token.clone(),
+                            rec.project_slug.clone(),
+                            file_paths,
+                        ));
+                        rx.blocking_recv()
+                            .map_err(|_| "Revoke task cancelled".to_string())??;
+                    }
+                    ShareChannel::LocalNetwork => {}
+                }
+                revoked_out.push(json!({
+                    "id": rec.id,
+                    "project_id": rec.project_id,
+                    "project_name": rec.project_name,
+                    "channel": rec.channel,
+                }));
+            }
+
+            save_config_shared_projects(&remaining).map_err(|e| e.to_string())?;
+            Ok(json!({ "revoked": revoked_out }))
+        }
+        other => Err(format!(
+            "Unknown share action `{other}` (expected list | status | config-set | login | publish | revoke)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -1007,5 +1341,17 @@ mod tests {
             ]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn share_channel_parsing_and_validation() {
+        assert_eq!(parse_share_channel("server").unwrap(), ShareChannel::TestrixServer);
+        assert_eq!(parse_share_channel("r2").unwrap(), ShareChannel::CloudflareR2);
+        assert!(parse_share_channel("local").is_err());
+        assert!(parse_share_channel("unknown").is_err());
+
+        let dir = TempDir::new().unwrap();
+        let bad = execute_cli_api(dir.path(), &s(&["share", "revoke"]));
+        assert!(bad.is_err());
     }
 }

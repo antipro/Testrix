@@ -35,9 +35,17 @@ testrix folder   <list|create|update|delete>     --project <id-or-name> [--folde
 testrix item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
 testrix profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
 testrix var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
+testrix share    <list|status|config-set|login|publish|revoke> [--project <id-or-name>] [--channel <server|r2>] [--share <id>] [--access-token <token>]
 ```
 
-- Run `testrix <resource> --help` (e.g., `testrix item update --help`) to see all supported flags and JSON payload shapes.
+- Run `testrix <resource> --help` (or `testrix --help`) to see all supported resources and actions.
+- Sharing examples:
+  ```bash
+  testrix share status
+  testrix share list
+  testrix share publish --project <project-id-or-name> [--channel server|r2]
+  testrix share revoke --project <project-id-or-name> [--channel server|r2]
+  ```
 
 ## 3. Fallback: Manual YAML Editing & `--check`
 
