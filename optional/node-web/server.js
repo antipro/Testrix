@@ -1,6 +1,12 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath) && typeof process.loadEnvFile === 'function') {
+  process.loadEnvFile(envPath);
+}
+
 const express = require('express');
 const { initDb } = require('./src/db');
 const { sendVerificationCode } = require('./src/mailer');
