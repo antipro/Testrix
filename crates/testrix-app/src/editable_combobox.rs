@@ -132,14 +132,20 @@ impl EditableCombobox {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let current = self.value(cx);
-        if let Some(updated) = testrix_core::rename_template_variables(&current, renames) {
+        let updated = if wrap_braces {
+            testrix_core::rename_template_variables(&current, pairs)
+        } else {
+            testrix_core::replace_template_variables(&current, pairs)
+        };
+        if let Some(updated) = updated {
             self.input.update(cx, |state, cx| {
                 state.set_value(updated, window, cx);
             });

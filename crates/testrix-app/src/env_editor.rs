@@ -8,6 +8,7 @@ use gpui_kit::{
         WindowExt as _,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
+        dialog::{DialogClose, DialogFooter},
         h_flex,
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
@@ -47,6 +48,10 @@ pub(crate) enum EnvEditorEvent {
     },
     SelectActive {
         env_id: Option<String>,
+    },
+    ReplaceVariable {
+        key: String,
+        value: String,
     },
 }
 
@@ -377,6 +382,101 @@ impl EnvEditorView {
         });
         cx.notify();
     }
+
+    fn confirm_remove_variable(
+        &mut self,
+        row_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.rows.iter().find(|r| r.id == row_id) else {
+            return;
+        };
+        let key = row.key.read(cx).value().trim().to_string();
+        let value = row.value.read(cx).value().to_string();
+        let secret = row.secret;
+
+        if key.is_empty() || value.is_empty() {
+            self.rows.retain(|r| r.id != row_id);
+            self.dirty = true;
+            cx.notify();
+            return;
+        }
+
+        let editor_entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let ed_no = editor_entity.clone();
+            let ed_yes = editor_entity.clone();
+            let key_yes = key.clone();
+            let val_yes = value.clone();
+
+            let mut body = v_flex()
+                .gap_2()
+                .child(div().text_sm().child(format!(
+                    "Variable \"{{{{{key}}}}}\" has a value. Do you want to replace all \"{{{{{key}}}}}\" references with its real value before removing it?"
+                )));
+
+            if !secret {
+                body = body.child(
+                    div()
+                        .p_2()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary)
+                        .text_xs()
+                        .child(format!("Value: {value}")),
+                );
+            }
+
+            dialog
+                .title("Remove Variable")
+                .width(px(460.))
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("env-var-del-cancel")
+                                    .outline()
+                                    .label("Cancel"),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("env-var-del-only")
+                                    .outline()
+                                    .label("No, Remove Only")
+                                    .on_click(move |_, _, cx| {
+                                        ed_no.update(cx, |this, cx| {
+                                            this.rows.retain(|r| r.id != row_id);
+                                            this.dirty = true;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("env-var-del-replace")
+                                    .primary()
+                                    .label("Yes, Replace & Remove")
+                                    .on_click(move |_, window, cx| {
+                                        ed_yes.update(cx, |this, cx| {
+                                            this.rows.retain(|r| r.id != row_id);
+                                            cx.emit(EnvEditorEvent::ReplaceVariable {
+                                                key: key_yes.clone(),
+                                                value: val_yes.clone(),
+                                            });
+                                            this.commit_current_profile(window, cx);
+                                        });
+                                    }),
+                            ),
+                        ),
+                )
+        });
+    }
 }
 
 impl Render for EnvEditorView {
@@ -608,10 +708,8 @@ impl Render for EnvEditorView {
                                     .xsmall()
                                     .icon(IconName::Delete)
                                     .tooltip("Remove variable")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.rows.retain(|r| r.id != row_id);
-                                        this.dirty = true;
-                                        cx.notify();
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.confirm_remove_variable(row_id, window, cx);
                                     })),
                             )
                     })),

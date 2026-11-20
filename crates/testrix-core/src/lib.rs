@@ -52,7 +52,7 @@ pub use response_meta::{
 pub use search::{FilteredFolder, FilteredProject, filter_workspace};
 pub use template::{
     TemplateResult, env_variable_map, interpolate_template, interpolate_with_map,
-    rename_template_variables,
+    rename_template_variables, replace_template_variables,
 };
 
 #[cfg(test)]

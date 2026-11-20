@@ -17,7 +17,7 @@ use gpui_kit::{
 };
 use testrix_core::{
     ApiKeyLocation, AuthConfig, AuthNodeRef, EffectiveAuth, EnvironmentDoc, ResolvedAuth,
-    interpolate_template, rename_template_variables,
+    interpolate_template, rename_template_variables, replace_template_variables,
 };
 
 use crate::theme_helpers::{apply_unresolved_var_border, auth_icon, effective_auth_icon};
@@ -231,9 +231,10 @@ impl AuthEditor {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -247,7 +248,12 @@ impl AuthEditor {
             &self.api_key_value,
         ] {
             let current = input.read(cx).value().to_string();
-            if let Some(updated) = rename_template_variables(&current, renames) {
+            let updated = if wrap_braces {
+                rename_template_variables(&current, pairs)
+            } else {
+                replace_template_variables(&current, pairs)
+            };
+            if let Some(updated) = updated {
                 input.update(cx, |state, cx| state.set_value(updated, window, cx));
                 changed = true;
             }

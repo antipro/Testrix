@@ -23,7 +23,8 @@ use gpui_kit::{
 };
 use testrix_core::{
     AuthNodeRef, EnvironmentDoc, FolderDoc, FolderNode, ProjectDoc, ProjectNode,
-    rename_template_variables, resolve_folder_chain_auth, resolve_project_auth,
+    rename_template_variables, replace_template_variables, resolve_folder_chain_auth,
+    resolve_project_auth,
 };
 use testrix_http::{
     LocalShareHandle, NetworkAdapterIp, ShareChannel, ShareUploadResult,
@@ -650,26 +651,32 @@ impl ContainerTabView {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let mut changed = false;
         if let Some(base_url) = &self.base_url_input {
             let current = base_url.read(cx).value().to_string();
-            if let Some(updated) = rename_template_variables(&current, renames) {
+            let updated = if wrap_braces {
+                rename_template_variables(&current, pairs)
+            } else {
+                replace_template_variables(&current, pairs)
+            };
+            if let Some(updated) = updated {
                 base_url.update(cx, |state, cx| state.set_value(updated, window, cx));
                 changed = true;
             }
         }
         if let Some(headers) = &self.default_headers {
-            changed |= headers.update(cx, |t, cx| t.rename_variables(renames, window, cx));
+            changed |= headers.update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         }
         changed |= self
             .auth_editor
-            .update(cx, |e, cx| e.rename_variables(renames, window, cx));
+            .update(cx, |e, cx| e.rewrite_variables(pairs, wrap_braces, window, cx));
 
         if changed {
             if !self.dirty {

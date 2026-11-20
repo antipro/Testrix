@@ -33,7 +33,7 @@ use testrix_core::{
     RequestExecutionState, RequestNode, RequestSettings, ResponseExample, ResponseMetaField,
     detect_body_language, extract_and_merge_request_body_meta, extract_and_merge_response_meta,
     extract_url_query_params, generate_id, generate_request_code, materialize_request_doc,
-    rename_template_variables, resolve_request_doc_auth,
+    rename_template_variables, replace_template_variables, resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -903,18 +903,26 @@ impl RequestTabView {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let rewrite = |s: &str| {
+            if wrap_braces {
+                rename_template_variables(s, pairs)
+            } else {
+                replace_template_variables(s, pairs)
+            }
+        };
         let mut changed = self
             .url_prefix_combo
-            .update(cx, |combo, cx| combo.rename_variables(renames, window, cx));
+            .update(cx, |combo, cx| combo.rewrite_variables(pairs, wrap_braces, window, cx));
 
         let url_val = self.url_input.read(cx).value().to_string();
-        if let Some(updated) = rename_template_variables(&url_val, renames) {
+        if let Some(updated) = rewrite(&url_val) {
             self.url_input
                 .update(cx, |state, cx| state.set_value(updated, window, cx));
             changed = true;
@@ -922,23 +930,23 @@ impl RequestTabView {
 
         changed |= self
             .params_table
-            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+            .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         changed |= self
             .headers_table
-            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+            .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         changed |= self
             .form_table
-            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+            .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         changed |= self
             .multipart_table
-            .update(cx, |t, cx| t.rename_variables(renames, window, cx));
+            .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         changed |= self
             .auth_editor
-            .update(cx, |e, cx| e.rename_variables(renames, window, cx));
+            .update(cx, |e, cx| e.rewrite_variables(pairs, wrap_braces, window, cx));
 
         for editor in [&self.json_editor, &self.raw_editor] {
             let current = editor.read(cx).value().to_string();
-            if let Some(updated) = rename_template_variables(&current, renames) {
+            if let Some(updated) = rewrite(&current) {
                 editor.update(cx, |state, cx| state.set_value(updated, window, cx));
                 changed = true;
             }

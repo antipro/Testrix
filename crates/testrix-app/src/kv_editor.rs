@@ -17,6 +17,7 @@ use gpui_kit::{
 };
 use testrix_core::{
     EnvironmentDoc, KeyValueRow, MultipartField, MultipartFieldType, rename_template_variables,
+    replace_template_variables,
 };
 
 use crate::{
@@ -159,30 +160,39 @@ impl KeyValueTable {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let mut changed = false;
+        let rewrite = |s: &str| {
+            if wrap_braces {
+                rename_template_variables(s, pairs)
+            } else {
+                replace_template_variables(s, pairs)
+            }
+        };
         for row in &self.rows {
             match &row.name {
                 NameField::Input(input) => {
                     let current = input.read(cx).value().to_string();
-                    if let Some(updated) = rename_template_variables(&current, renames) {
+                    if let Some(updated) = rewrite(&current) {
                         input.update(cx, |state, cx| state.set_value(updated, window, cx));
                         changed = true;
                     }
                 }
                 NameField::Combobox(combo) => {
-                    if combo.update(cx, |c, cx| c.rename_variables(renames, window, cx)) {
+                    if combo.update(cx, |c, cx| c.rewrite_variables(pairs, wrap_braces, window, cx))
+                    {
                         changed = true;
                     }
                 }
             }
             let current_val = row.value.read(cx).value().to_string();
-            if let Some(updated) = rename_template_variables(&current_val, renames) {
+            if let Some(updated) = rewrite(&current_val) {
                 row.value
                     .update(cx, |state, cx| state.set_value(updated, window, cx));
                 changed = true;
@@ -500,9 +510,10 @@ impl MultipartTable {
         cx.notify();
     }
 
-    pub(crate) fn rename_variables(
+    pub(crate) fn rewrite_variables(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -510,7 +521,12 @@ impl MultipartTable {
         for row in &self.rows {
             for input in [&row.name, &row.value] {
                 let current = input.read(cx).value().to_string();
-                if let Some(updated) = rename_template_variables(&current, renames) {
+                let updated = if wrap_braces {
+                    rename_template_variables(&current, pairs)
+                } else {
+                    replace_template_variables(&current, pairs)
+                };
+                if let Some(updated) = updated {
                     input.update(cx, |state, cx| state.set_value(updated, window, cx));
                     changed = true;
                 }

@@ -46,7 +46,8 @@ use testrix_core::{
     HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody,
     RequestHistoryEntry, RequestSet, RequestSetFolder, RequestSetItem, WorkspaceTree,
     export_openapi_3_0, generate_id, parse_apifox, parse_openapi_3_0, parse_postman_collection,
-    parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
+    parse_postman_zip, parse_request_script, rename_template_variables, replace_template_variables,
+    resolve_request_auth,
 };
 use testrix_http::{
     DownloadProgressState, HttpRunner, OneshotTryRecvError, ReleaseInfo, ShareChannel, ShareFile,
@@ -1301,13 +1302,13 @@ impl TestrixApp {
                         .sort_by_key(|a| a.doc.name.to_lowercase());
                     if is_active && !renamed_keys.is_empty() {
                         for proj in &mut self.workspace.projects {
-                            propagate_variable_renames_in_project(proj, &renamed_keys);
+                            propagate_variable_rewrites_in_project(proj, &renamed_keys, true);
                         }
                     }
                     self.refresh_profile_selector(window, cx);
                     self.sync_env_editor(window, cx);
                     if is_active && !renamed_keys.is_empty() {
-                        self.rename_variables_in_open_tabs(&renamed_keys, window, cx);
+                        self.rewrite_variables_in_open_tabs(&renamed_keys, true, window, cx);
                     }
                     self.sync_all_tabs(window, cx);
                     self.env_editor.update(cx, |editor, cx| {
@@ -1369,6 +1370,18 @@ impl TestrixApp {
             EnvEditorEvent::SelectActive { env_id } => {
                 self.select_environment(env_id, window, cx);
                 self.sync_env_editor(window, cx);
+            }
+            EnvEditorEvent::ReplaceVariable { key, value } => {
+                let pairs = [(key.clone(), value)];
+                for proj in &mut self.workspace.projects {
+                    propagate_variable_rewrites_in_project(proj, &pairs, false);
+                }
+                self.rewrite_variables_in_open_tabs(&pairs, false, window, cx);
+                self.sync_all_tabs(window, cx);
+                window.push_notification(
+                    format!("Replaced \"{{{{{key}}}}}\" with its real value."),
+                    cx,
+                );
             }
         }
     }
@@ -2178,9 +2191,10 @@ impl TestrixApp {
         }
     }
 
-    fn rename_variables_in_open_tabs(
+    fn rewrite_variables_in_open_tabs(
         &mut self,
-        renames: &[(String, String)],
+        pairs: &[(String, String)],
+        wrap_braces: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2191,18 +2205,19 @@ impl TestrixApp {
         for tab in &self.tabs {
             match tab {
                 WorkbenchTab::Request(view) => {
-                    let belongs_to_active = active_project_id
-                        .as_deref()
-                        .is_some_and(|pid| pid == view.read(cx).project_id());
+                    let belongs_to_active = !wrap_braces
+                        || active_project_id
+                            .as_deref()
+                            .is_some_and(|pid| pid == view.read(cx).project_id());
                     if belongs_to_active {
                         view.update(cx, |v, cx| {
-                            v.rename_variables(renames, window, cx);
+                            v.rewrite_variables(pairs, wrap_braces, window, cx);
                         });
                     }
                 }
                 WorkbenchTab::Container(view) => {
                     view.update(cx, |v, cx| {
-                        v.rename_variables(renames, window, cx);
+                        v.rewrite_variables(pairs, wrap_braces, window, cx);
                     });
                 }
             }
@@ -5696,8 +5711,17 @@ fn insert_item_into_set(set: &mut RequestSet, folder_id: Option<&str>, item: Req
     }
 }
 
-fn rewrite_string_in_place(target: &mut String, renames: &[(String, String)]) -> bool {
-    if let Some(updated) = rename_template_variables(target, renames) {
+fn rewrite_string_in_place(
+    target: &mut String,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) -> bool {
+    let updated = if wrap_braces {
+        rename_template_variables(target, pairs)
+    } else {
+        replace_template_variables(target, pairs)
+    };
+    if let Some(updated) = updated {
         *target = updated;
         true
     } else {
@@ -5705,87 +5729,107 @@ fn rewrite_string_in_place(target: &mut String, renames: &[(String, String)]) ->
     }
 }
 
-fn rewrite_kv_rows(rows: &mut [KeyValueRow], renames: &[(String, String)]) -> bool {
+fn rewrite_kv_rows(
+    rows: &mut [KeyValueRow],
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) -> bool {
     let mut changed = false;
     for row in rows {
-        changed |= rewrite_string_in_place(&mut row.name, renames);
-        changed |= rewrite_string_in_place(&mut row.value, renames);
+        changed |= rewrite_string_in_place(&mut row.name, pairs, wrap_braces);
+        changed |= rewrite_string_in_place(&mut row.value, pairs, wrap_braces);
     }
     changed
 }
 
-fn rewrite_auth_config(auth: &mut AuthConfig, renames: &[(String, String)]) -> bool {
+fn rewrite_auth_config(
+    auth: &mut AuthConfig,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) -> bool {
     match auth {
         AuthConfig::Inherit | AuthConfig::None => false,
         AuthConfig::Bearer { token, prefix } => {
-            let mut changed = rewrite_string_in_place(token, renames);
-            changed |= rewrite_string_in_place(prefix, renames);
+            let mut changed = rewrite_string_in_place(token, pairs, wrap_braces);
+            changed |= rewrite_string_in_place(prefix, pairs, wrap_braces);
             changed
         }
         AuthConfig::Basic { username, password } => {
-            let mut changed = rewrite_string_in_place(username, renames);
-            changed |= rewrite_string_in_place(password, renames);
+            let mut changed = rewrite_string_in_place(username, pairs, wrap_braces);
+            changed |= rewrite_string_in_place(password, pairs, wrap_braces);
             changed
         }
         AuthConfig::ApiKey { key, value, .. } => {
-            let mut changed = rewrite_string_in_place(key, renames);
-            changed |= rewrite_string_in_place(value, renames);
+            let mut changed = rewrite_string_in_place(key, pairs, wrap_braces);
+            changed |= rewrite_string_in_place(value, pairs, wrap_braces);
             changed
         }
     }
 }
 
-fn rewrite_request_doc(doc: &mut HttpRequestDoc, renames: &[(String, String)]) -> bool {
-    let mut changed = rewrite_string_in_place(&mut doc.request.url, renames);
-    changed |= rewrite_kv_rows(&mut doc.request.params, renames);
-    changed |= rewrite_kv_rows(&mut doc.request.headers, renames);
-    changed |= rewrite_auth_config(&mut doc.request.auth, renames);
+fn rewrite_request_doc(
+    doc: &mut HttpRequestDoc,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) -> bool {
+    let mut changed = rewrite_string_in_place(&mut doc.request.url, pairs, wrap_braces);
+    changed |= rewrite_kv_rows(&mut doc.request.params, pairs, wrap_braces);
+    changed |= rewrite_kv_rows(&mut doc.request.headers, pairs, wrap_braces);
+    changed |= rewrite_auth_config(&mut doc.request.auth, pairs, wrap_braces);
     match &mut doc.request.body {
         RequestBody::None | RequestBody::Binary { .. } => {}
         RequestBody::Json { content } | RequestBody::Raw { content, .. } => {
-            changed |= rewrite_string_in_place(content, renames);
+            changed |= rewrite_string_in_place(content, pairs, wrap_braces);
         }
         RequestBody::FormUrlEncoded { fields } => {
-            changed |= rewrite_kv_rows(fields, renames);
+            changed |= rewrite_kv_rows(fields, pairs, wrap_braces);
         }
         RequestBody::Multipart { fields } => {
             for field in fields {
-                changed |= rewrite_string_in_place(&mut field.name, renames);
-                changed |= rewrite_string_in_place(&mut field.value, renames);
+                changed |= rewrite_string_in_place(&mut field.name, pairs, wrap_braces);
+                changed |= rewrite_string_in_place(&mut field.value, pairs, wrap_braces);
             }
         }
     }
     changed
 }
 
-fn propagate_variable_renames_in_folder(folder: &mut FolderNode, renames: &[(String, String)]) {
-    if rewrite_auth_config(&mut folder.doc.auth, renames) {
+fn propagate_variable_rewrites_in_folder(
+    folder: &mut FolderNode,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) {
+    if rewrite_auth_config(&mut folder.doc.auth, pairs, wrap_braces) {
         let _ = save_folder(folder);
     }
     for req in &mut folder.requests {
-        if rewrite_request_doc(&mut req.doc, renames) {
+        if rewrite_request_doc(&mut req.doc, pairs, wrap_braces) {
             let _ = save_request(req);
         }
     }
     for sub in &mut folder.folders {
-        propagate_variable_renames_in_folder(sub, renames);
+        propagate_variable_rewrites_in_folder(sub, pairs, wrap_braces);
     }
 }
 
-fn propagate_variable_renames_in_project(proj: &mut ProjectNode, renames: &[(String, String)]) {
-    let mut proj_changed = rewrite_string_in_place(&mut proj.doc.base_url, renames);
-    proj_changed |= rewrite_kv_rows(&mut proj.doc.default_headers, renames);
-    proj_changed |= rewrite_auth_config(&mut proj.doc.auth, renames);
+fn propagate_variable_rewrites_in_project(
+    proj: &mut ProjectNode,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) {
+    let mut proj_changed = rewrite_string_in_place(&mut proj.doc.base_url, pairs, wrap_braces);
+    proj_changed |= rewrite_kv_rows(&mut proj.doc.default_headers, pairs, wrap_braces);
+    proj_changed |= rewrite_auth_config(&mut proj.doc.auth, pairs, wrap_braces);
     if proj_changed {
         let _ = save_project(proj);
     }
     for req in &mut proj.requests {
-        if rewrite_request_doc(&mut req.doc, renames) {
+        if rewrite_request_doc(&mut req.doc, pairs, wrap_braces) {
             let _ = save_request(req);
         }
     }
     for folder in &mut proj.folders {
-        propagate_variable_renames_in_folder(folder, renames);
+        propagate_variable_rewrites_in_folder(folder, pairs, wrap_braces);
     }
 }
 

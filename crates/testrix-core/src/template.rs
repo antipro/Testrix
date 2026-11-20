@@ -67,11 +67,12 @@ pub fn interpolate_with_map(input: &str, vars: &BTreeMap<String, String>) -> Tem
     }
 }
 
-/// Rewrites `{{old_name}}` placeholders according to `(old_name, new_name)` pairs.
-///
-/// Returns `Some(updated)` only when at least one placeholder was rewritten.
-pub fn rename_template_variables(input: &str, renames: &[(String, String)]) -> Option<String> {
-    if renames.is_empty() || !input.contains("{{") {
+fn rewrite_template_placeholders(
+    input: &str,
+    pairs: &[(String, String)],
+    wrap_braces: bool,
+) -> Option<String> {
+    if pairs.is_empty() || !input.contains("{{") {
         return None;
     }
 
@@ -85,11 +86,16 @@ pub fn rename_template_variables(input: &str, renames: &[(String, String)]) -> O
         if let Some(end) = after_open.find("}}") {
             let raw_name = &after_open[..end];
             let name = raw_name.trim();
-            if let Some((_, next_name)) = renames.iter().find(|(old, _)| old == name) {
-                rendered.push_str("{{");
-                rendered.push_str(next_name);
-                rendered.push_str("}}");
-                if next_name != raw_name {
+            if let Some((_, replacement)) = pairs.iter().find(|(old, _)| old == name) {
+                if wrap_braces {
+                    rendered.push_str("{{");
+                    rendered.push_str(replacement);
+                    rendered.push_str("}}");
+                    if replacement != raw_name {
+                        changed = true;
+                    }
+                } else {
+                    rendered.push_str(replacement);
                     changed = true;
                 }
             } else {
@@ -107,6 +113,23 @@ pub fn rename_template_variables(input: &str, renames: &[(String, String)]) -> O
     }
     rendered.push_str(rest);
     Some(rendered)
+}
+
+/// Rewrites `{{old_name}}` placeholders according to `(old_name, new_name)` pairs.
+///
+/// Returns `Some(updated)` only when at least one placeholder was rewritten.
+pub fn rename_template_variables(input: &str, renames: &[(String, String)]) -> Option<String> {
+    rewrite_template_placeholders(input, renames, true)
+}
+
+/// Replaces `{{var_name}}` placeholders with their literal values according to `(var_name, value)` pairs.
+///
+/// Returns `Some(updated)` only when at least one placeholder was replaced.
+pub fn replace_template_variables(
+    input: &str,
+    replacements: &[(String, String)],
+) -> Option<String> {
+    rewrite_template_placeholders(input, replacements, false)
 }
 
 #[cfg(test)]
@@ -127,6 +150,22 @@ mod tests {
         );
         assert_eq!(
             rename_template_variables("https://example.com/{{other}}", &renames),
+            None
+        );
+    }
+
+    #[test]
+    fn replaces_template_variables_with_literal_values() {
+        let replacements = vec![
+            ("base_url".to_string(), "https://api.example.com".to_string()),
+            ("token".to_string(), "secret-123".to_string()),
+        ];
+        assert_eq!(
+            replace_template_variables("{{base_url}}/v1/users?auth={{ token }}", &replacements),
+            Some("https://api.example.com/v1/users?auth=secret-123".to_string())
+        );
+        assert_eq!(
+            replace_template_variables("https://example.com/{{other}}", &replacements),
             None
         );
     }
