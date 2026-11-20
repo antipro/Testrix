@@ -81,16 +81,22 @@ function extractToken(req) {
 }
 
 function attachUser(db) {
-  return (req, _res, next) => {
-    const token = extractToken(req);
-    const payload = verifyToken(token);
-    if (payload && payload.userId) {
-      const user = db.prepare('SELECT id, email, created_at FROM users WHERE id = ?').get(payload.userId);
-      if (user) {
-        req.user = user;
+  return async (req, _res, next) => {
+    try {
+      const token = extractToken(req);
+      const payload = verifyToken(token);
+      if (payload && payload.userId) {
+        const user = await db.get('SELECT id, email, created_at FROM users WHERE id = ?', [
+          payload.userId,
+        ]);
+        if (user) {
+          req.user = user;
+        }
       }
+      next();
+    } catch (err) {
+      next(err);
     }
-    next();
   };
 }
 
