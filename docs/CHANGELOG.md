@@ -4,6 +4,21 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-11-20
+
+### Added
+- Add GitHub Releases self-upgrade check, download, and installer launch.
+- Add CLI share management commands and document them in `SKILL.md`.
+- Prompt to replace variable references with their real values when deleting environment variables.
+- Add a **Path** tab next to **Params** for editing URL path variables (`:param` and `{param}`).
+
+### Changed
+- Skip auto-update checks in dev mode and enforce using the installed CLI in `SKILL.md`.
+
+### Fixed
+- Close the variable removal confirmation dialog after completing an action.
+- Treat `{{...}}` strictly as environment variables while keeping `:param` and `{param}` for URL path variables, and prevent URL variable hint clipping.
+
 ## [v0.5.0] - 2026-11-20
 
 ### Added
