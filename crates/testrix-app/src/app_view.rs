@@ -3432,7 +3432,7 @@ impl TestrixApp {
                                                         .into_iter()
                                                         .collect();
                                                     for project_id in remote_project_ids {
-                                                        this.sync_active_shares(&project_id, None, window, cx);
+                                                        this.sync_shared_project_after_save(&project_id, None, window, cx);
                                                     }
                                                     cx.notify();
                                                 });
