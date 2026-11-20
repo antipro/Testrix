@@ -444,35 +444,33 @@ impl EnvEditorView {
                             ),
                         )
                         .child(
-                            DialogClose::new().child(
-                                Button::new("env-var-del-only")
-                                    .outline()
-                                    .label("No, Remove Only")
-                                    .on_click(move |_, _, cx| {
-                                        ed_no.update(cx, |this, cx| {
-                                            this.rows.retain(|r| r.id != row_id);
-                                            this.dirty = true;
-                                            cx.notify();
-                                        });
-                                    }),
-                            ),
+                            Button::new("env-var-del-only")
+                                .outline()
+                                .label("No, Remove Only")
+                                .on_click(move |_, window, cx| {
+                                    ed_no.update(cx, |this, cx| {
+                                        this.rows.retain(|r| r.id != row_id);
+                                        this.dirty = true;
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }),
                         )
                         .child(
-                            DialogClose::new().child(
-                                Button::new("env-var-del-replace")
-                                    .primary()
-                                    .label("Yes, Replace & Remove")
-                                    .on_click(move |_, window, cx| {
-                                        ed_yes.update(cx, |this, cx| {
-                                            this.rows.retain(|r| r.id != row_id);
-                                            cx.emit(EnvEditorEvent::ReplaceVariable {
-                                                key: key_yes.clone(),
-                                                value: val_yes.clone(),
-                                            });
-                                            this.commit_current_profile(window, cx);
+                            Button::new("env-var-del-replace")
+                                .primary()
+                                .label("Yes, Replace & Remove")
+                                .on_click(move |_, window, cx| {
+                                    ed_yes.update(cx, |this, cx| {
+                                        this.rows.retain(|r| r.id != row_id);
+                                        cx.emit(EnvEditorEvent::ReplaceVariable {
+                                            key: key_yes.clone(),
+                                            value: val_yes.clone(),
                                         });
-                                    }),
-                            ),
+                                        this.commit_current_profile(window, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
                         ),
                 )
         });
