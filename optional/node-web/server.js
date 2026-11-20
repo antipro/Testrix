@@ -22,7 +22,6 @@ const {
 const {
   loadProjectFromDir,
   flattenProjectItems,
-  discoverRootProjects,
 } = require('./src/yamlReader');
 
 const PORT = Number(process.env.PORT || 3456);
@@ -196,34 +195,25 @@ function createApp(db) {
     res.json({ user: req.user });
   });
 
-  // Public / Viewer endpoints (reads YAML directly from YAML_DIR)
+  // Public / Viewer endpoints (projects are only viewable via direct share link /s/:slug)
   app.get(
     '/api/public/projects',
     asyncHandler(async (req, res) => {
-      const envProjects = discoverRootProjects(YAML_DIR).map((p) => ({
-        slug: p.slug,
-        name: p.name,
-        description: p.description,
-        source: 'yaml_dir',
-        isPublic: true,
-        ownerEmail: null,
-      }));
+      if (!req.user) {
+        return res.json({ projects: [] });
+      }
 
       const dbRows = await db.all(
         `SELECT sp.id, sp.slug, sp.name, sp.description, sp.is_public, sp.updated_at, u.email AS owner_email
          FROM shared_projects sp
          JOIN users u ON u.id = sp.user_id
-         WHERE sp.is_public = 1 OR sp.user_id = ?
+         WHERE sp.user_id = ?
          ORDER BY sp.updated_at DESC`,
-        [req.user ? req.user.id : -1]
+        [req.user.id]
       );
 
-      const seen = new Set(envProjects.map((p) => p.slug));
-      const merged = [...envProjects];
-      for (const row of dbRows) {
-        if (seen.has(row.slug)) continue;
-        seen.add(row.slug);
-        merged.push({
+      res.json({
+        projects: dbRows.map((row) => ({
           id: row.id,
           slug: row.slug,
           name: row.name,
@@ -232,10 +222,8 @@ function createApp(db) {
           isPublic: Boolean(row.is_public),
           ownerEmail: row.owner_email,
           updatedAt: row.updated_at,
-        });
-      }
-
-      res.json({ projects: merged });
+        })),
+      });
     })
   );
 

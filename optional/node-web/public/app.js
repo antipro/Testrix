@@ -892,7 +892,88 @@ function renderAccessTokenPrompt(slug, reqTarget = null) {
   };
 }
 
+function setTopbarViewerMode(isViewer) {
+  const projSel = document.getElementById('projectSelect');
+  const envSel = document.getElementById('envSelect');
+  const searchInput = document.getElementById('searchInput');
+  if (projSel) projSel.style.display = 'none';
+  if (envSel && !isViewer) envSel.style.display = 'none';
+  if (searchInput) searchInput.style.display = isViewer ? 'block' : 'none';
+}
+
+function renderIndexPage() {
+  setTopbarViewerMode(false);
+  state.currentProject = null;
+  const root = document.getElementById('appRoot');
+  root.innerHTML = `
+    <div class="card-container">
+      <div class="card" style="max-width:560px;margin:48px auto;padding:28px;">
+        <h1 style="margin:0 0 8px;font-size:24px;">Testrix Share</h1>
+        <p style="margin:0 0 22px;color:var(--muted);">
+          Share interactive API documentation from your Testrix YAML projects.
+          Projects are only accessible with a direct share link.
+        </p>
+
+        <form id="openLinkForm" style="display:flex;gap:8px;margin-bottom:20px;">
+          <input
+            class="input"
+            name="shareLink"
+            type="text"
+            placeholder="Paste a share link or slug (e.g. /s/my-api)"
+            style="flex:1;"
+            required
+          />
+          <button type="submit" class="btn btn-primary">Open</button>
+        </form>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;padding-top:16px;border-top:1px solid var(--border);">
+          ${
+            state.user
+              ? `<a href="/dashboard" class="btn btn-primary" data-nav="/dashboard">Go to Dashboard</a>`
+              : `<a href="/login" class="btn btn-primary" data-nav="/login">Sign In</a>
+                 <a href="/register" class="btn" data-nav="/register">Create Account</a>`
+          }
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('openLinkForm').onsubmit = (e) => {
+    e.preventDefault();
+    const raw = String(new FormData(e.target).get('shareLink') || '').trim();
+    if (!raw) return;
+    let targetPath = raw;
+    try {
+      if (/^https?:\/\//i.test(raw)) {
+        const u = new URL(raw);
+        targetPath = u.pathname + u.search;
+      }
+    } catch {}
+    if (!targetPath.startsWith('/s/')) {
+      const cleaned = targetPath.replace(/^\/+/, '');
+      targetPath = `/s/${encodeURIComponent(cleaned)}`;
+    }
+    navigate(targetPath);
+  };
+}
+
+function renderProjectError(message) {
+  setTopbarViewerMode(false);
+  state.currentProject = null;
+  const root = document.getElementById('appRoot');
+  root.innerHTML = `
+    <div class="card-container">
+      <div class="card auth-card" style="text-align:center;">
+        <h2 style="margin-top:0;">Unable to Open Project</h2>
+        <p style="color:var(--muted);margin-bottom:18px;">${esc(message)}</p>
+        <a href="/" class="btn btn-primary" data-nav="/">Back to Home</a>
+      </div>
+    </div>
+  `;
+}
+
 async function loadProject(slug, reqTarget = null) {
+  setTopbarViewerMode(true);
   let data;
   try {
     data = await api(`/api/public/projects/${encodeURIComponent(slug)}`);
@@ -901,7 +982,8 @@ async function loadProject(slug, reqTarget = null) {
       renderAccessTokenPrompt(slug, reqTarget);
       return;
     }
-    throw err;
+    renderProjectError(err.message || 'Project not found');
+    return;
   }
   state.currentProject = data.project;
   const matchedReq = reqTarget ? findRequestByTarget(data.project, reqTarget) : null;
@@ -923,29 +1005,6 @@ async function loadProject(slug, reqTarget = null) {
     envSel.style.display = 'none';
   }
   renderViewerLayout();
-}
-
-async function loadProjectsList(preferredSlug = null, reqTarget = null) {
-  const data = await api('/api/public/projects');
-  state.projects = data.projects || [];
-
-  const projSel = document.getElementById('projectSelect');
-  projSel.innerHTML = state.projects.length
-    ? state.projects.map((p) => `<option value="${esc(p.slug)}">${esc(p.name)}</option>`).join('')
-    : '<option value="">No projects</option>';
-
-  const targetSlug = preferredSlug || state.projects[0]?.slug;
-  if (targetSlug) {
-    projSel.value = targetSlug;
-    await loadProject(targetSlug, reqTarget);
-  } else {
-    state.currentProject = null;
-    renderViewerLayout();
-  }
-
-  projSel.onchange = () => {
-    if (projSel.value) navigate(`/s/${projSel.value}`);
-  };
 }
 
 function renderAuthForm(mode) {
@@ -1176,22 +1235,34 @@ async function renderDashboard() {
 
 async function renderRoute() {
   const p = location.pathname;
-  if (p === '/login') return renderAuthForm('login');
-  if (p === '/register') return renderAuthForm('register');
-  if (p === '/dashboard') return renderDashboard();
+  if (p === '/login') {
+    setTopbarViewerMode(false);
+    return renderAuthForm('login');
+  }
+  if (p === '/register') {
+    setTopbarViewerMode(false);
+    return renderAuthForm('register');
+  }
+  if (p === '/dashboard') {
+    setTopbarViewerMode(false);
+    return renderDashboard();
+  }
 
   const match = p.match(/^\/s\/([^/]+)(?:\/(.+))?$/);
-  const slug = match ? decodeURIComponent(match[1]) : null;
-  const reqTarget =
-    match && match[2]
-      ? match[2].split('/').map(decodeURIComponent).join('/')
-      : new URLSearchParams(location.search).get('request');
-  await loadProjectsList(slug, reqTarget);
+  if (!match) {
+    return renderIndexPage();
+  }
+
+  const slug = decodeURIComponent(match[1]);
+  const reqTarget = match[2]
+    ? match[2].split('/').map(decodeURIComponent).join('/')
+    : new URLSearchParams(location.search).get('request');
+  await loadProject(slug, reqTarget);
 }
 
 document.getElementById('searchInput').addEventListener('input', (e) => {
   state.searchQuery = e.target.value;
-  if (location.pathname === '/' || location.pathname.startsWith('/s/')) {
+  if (location.pathname.startsWith('/s/')) {
     renderViewerLayout();
   }
 });
