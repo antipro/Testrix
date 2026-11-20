@@ -1608,6 +1608,7 @@ impl RequestTabView {
                                 .when(path_param_count == 0, |col| {
                                     col.child(
                                         div()
+                                            .flex_none()
                                             .px_2()
                                             .py_1()
                                             .rounded(cx.theme().radius)

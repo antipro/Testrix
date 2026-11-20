@@ -456,10 +456,26 @@ fn split_url_path_slice(raw_url: &str) -> (&str, &str, &str) {
         return (before_query, "", suffix);
     }
 
+    if before_query.starts_with("{{")
+        && let Some(close_ix) = before_query.find("}}")
+    {
+        let after_prefix = &before_query[close_ix + 2..];
+        if after_prefix.is_empty() {
+            return (before_query, "", suffix);
+        }
+        if after_prefix.starts_with('/') {
+            return (
+                &before_query[..close_ix + 2],
+                after_prefix,
+                suffix,
+            );
+        }
+    }
+
     ("", before_query, suffix)
 }
 
-/// Extracts path variable names (`:name` or `{name}`, ignoring `{{env_var}}`) from a URL.
+/// Extracts path variable names (`:name`, `{name}`, or `{{name}}` in the URL path) from a URL.
 pub fn extract_path_param_names(raw_url: &str) -> Vec<String> {
     let (_, path, _) = split_url_path_slice(raw_url);
     let mut out = Vec::new();
@@ -475,6 +491,10 @@ pub fn extract_path_param_names(raw_url: &str) -> Vec<String> {
         while let Some(open) = rest.find('{') {
             if rest[open..].starts_with("{{") {
                 if let Some(close) = rest[open + 2..].find("}}") {
+                    let name = &rest[open + 2..open + 2 + close];
+                    if !name.contains('{') {
+                        push_unique(name);
+                    }
                     rest = &rest[open + 2 + close + 2..];
                     continue;
                 }
@@ -505,7 +525,7 @@ pub fn extract_path_param_names(raw_url: &str) -> Vec<String> {
     out
 }
 
-/// Substitutes `{name}` and `:name` path variables in `raw_url` with their configured values.
+/// Substitutes `{name}`, `{{name}}`, and `:name` path variables in `raw_url` with their configured values.
 pub fn apply_path_params(raw_url: &str, params: &[(String, String)]) -> String {
     if params.is_empty() {
         return raw_url.to_string();
@@ -528,12 +548,20 @@ pub fn apply_path_params(raw_url: &str, params: &[(String, String)]) -> String {
         let mut rest = segment;
         while let Some(open) = rest.find('{') {
             if rest[open..].starts_with("{{") {
+                seg_out.push_str(&rest[..open]);
                 if let Some(close) = rest[open + 2..].find("}}") {
                     let end = open + 2 + close + 2;
-                    seg_out.push_str(&rest[..end]);
+                    let name = rest[open + 2..open + 2 + close].trim();
+                    if let Some((_, val)) = params.iter().find(|(k, _)| k == name) {
+                        seg_out.push_str(val);
+                    } else {
+                        seg_out.push_str(&rest[open..end]);
+                    }
                     rest = &rest[end..];
                     continue;
                 }
+                seg_out.push_str(&rest[open..]);
+                rest = "";
                 break;
             }
             seg_out.push_str(&rest[..open]);
@@ -570,7 +598,7 @@ mod tests {
         );
         assert_eq!(
             extract_path_param_names("{{base_url}}/items/{{item_id}}/:id"),
-            vec!["id".to_string()]
+            vec!["item_id".to_string(), "id".to_string()]
         );
         assert_eq!(
             apply_path_params(
@@ -581,6 +609,13 @@ mod tests {
                 ],
             ),
             "https://localhost:8080/users/42/orders/ord-9?a=1"
+        );
+        assert_eq!(
+            apply_path_params(
+                "{{base_url}}/items/{{item_id}}",
+                &[("item_id".to_string(), "abc".to_string())],
+            ),
+            "{{base_url}}/items/abc"
         );
     }
 
