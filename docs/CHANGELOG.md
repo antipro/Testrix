@@ -4,10 +4,21 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-11-20
+
 ### Added
 - Support drag-and-drop in the Explorer panel to move HTTP requests across folders and projects, updating disk files and open tabs.
+- Add History & Package sidebar views with vertical split, cross-view drag-and-drop, and Windows 11 icon sizing.
+- Add request body meta info tree table, web share support, and Windows MSI install directory / desktop shortcut options.
+- Add MySQL database support alongside SQLite in `optional/node-web` (configured via `DB_TYPE` and `MYSQL_*` environment variables).
+- Add a landing index page in `optional/node-web` and restrict shared project viewing to direct `/s/<slug>` share links.
+- Add a configurable End User License Agreement (`REQUIRE_EULA`, enabled by default) to the `node-web` registration page.
+
+### Changed
+- Use a normal text field instead of a masked password field for Share Access Token in Preferences, and sync active remote shares when saving the access token.
 
 ### Fixed
+- Load `.env` on `optional/node-web` server startup so environment settings such as `REQUIRE_EMAIL_VERIFICATION` and `DB_TYPE` take effect.
 - Remove unused `project_id` field from `ApplyPostScriptEnv` to eliminate compiler warnings.
 
 ## [v0.4.0] - 2026-11-19
