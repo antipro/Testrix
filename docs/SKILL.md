@@ -1,51 +1,68 @@
 ---
 name: testrix-yaml
-description: Safely create, edit, and validate Testrix YAML workspace files (`testrix.io/v1`) and verify changes with `testrix --check`.
+description: Manage Testrix projects, folders, HTTP requests, environments, and variables using the installed `testrix` CLI (preferred), or validate/edit `testrix.io/v1` YAML workspace files.
 ---
 
-# Editing Testrix YAML Files
+# Working with Testrix Workspaces
 
-Testrix stores projects, folders, HTTP requests, and environments as `testrix.io/v1` YAML documents on disk. Whenever you create or modify Testrix YAML files, follow this schema and **always validate your changes with `--check`**.
+Testrix stores projects, folders, HTTP requests, and environments as `testrix.io/v1` YAML documents in the user's configured workspace (`~/.testrix/config.yaml`).
 
-## 1. Preferred Workflow: Validated CLI CRUD API
+## 1. Strict Rules: Use the Installed `testrix` CLI First
 
-Whenever possible, use the `testrix` CLI CRUD API instead of editing YAML files directly. Every command performs schema & legal checks and returns structured JSON (`{ "ok": true, "data": ... }` or `{ "ok": false, "error": ... }`):
+1. **Always use the installed `testrix` CLI** — do **not** edit `.yaml` files directly unless the CLI does not support a specific field you need.
+2. **Never search the filesystem for `testrix.project.yaml` or `*.yaml` files**, and **never look for or run `cargo run` in a Testrix source code repository**.
+   - Run `testrix` from `PATH`.
+   - If `testrix` is not on `PATH`, use the standard installed binary path:
+     - **Windows**: `C:\Program Files\Testrix\testrix.exe`
+     - **macOS**: `/Applications/Testrix.app/Contents/MacOS/testrix`
+     - **Linux**: `/usr/bin/testrix`
+3. **Omit `--workspace` by default.** `testrix` automatically resolves the user's active workspace from `~/.testrix/config.yaml`. Only pass `--workspace <DIR>` if the user explicitly gives you a workspace path (never pass a source code repo as `--workspace`).
+4. **Discover first via CLI:**
+   ```bash
+   testrix project list
+   testrix folder list --project <project-id-or-name>
+   testrix item list --project <project-id-or-name>
+   testrix item get --project <project-id-or-name> --item <item-id-or-name>
+   ```
+
+## 2. CLI CRUD Reference (Preferred)
+
+Every CLI command performs schema & legal checks and returns structured JSON (`{ "ok": true, "data": ... }` or `{ "ok": false, "error": ... }`):
 
 ```bash
-testrix [--workspace <DIR>] project  <list|get|create|update|delete> [--project <id-or-name>] [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
-testrix [--workspace <DIR>] folder   <list|create|update|delete>     --project <id-or-name> [--folder <id-or-name>] [--parent <id-or-name>] [--name <name>] [--order <n>]
-testrix [--workspace <DIR>] item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
-testrix [--workspace <DIR>] profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
-testrix [--workspace <DIR>] var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
+testrix project  <list|get|create|update|delete> [--project <id-or-name>] [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
+testrix folder   <list|create|update|delete>     --project <id-or-name> [--folder <id-or-name>] [--parent <id-or-name>] [--name <name>] [--order <n>]
+testrix item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
+testrix profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
+testrix var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
 ```
 
-If you do edit YAML files manually, follow the workflow below:
+- Run `testrix <resource> --help` (e.g., `testrix item update --help`) to see all supported flags and JSON payload shapes.
 
-1. **Read the target file** (and nearby `testrix.project.yaml`, `_folder.yaml`, or `environments/*.env.yaml` if inheritance or variables matter).
-2. **Edit or create the YAML file** following the rules below. Preserve existing `id` values on existing files so open tabs, saved responses, and references do not break.
-3. **Validate with `--check`** in the console before finishing:
+## 3. Fallback: Manual YAML Editing & `--check`
+
+Only edit YAML files directly if a specific operation is not covered by the CLI CRUD commands above. If you must edit YAML manually:
+
+1. **Locate the workspace** by reading `~/.testrix/config.yaml` (`workspaceDir`) or inspecting `testrix project list` output — never scan the disk.
+2. **Read the target file** (and nearby `testrix.project.yaml`, `_folder.yaml`, or `environments/*.env.yaml` if inheritance or variables matter).
+3. **Edit or create the YAML file** following the schema below. Preserve existing `id` values on existing files so open tabs, saved responses, and references do not break.
+4. **Validate with `testrix --check`** before finishing:
 
 ```bash
-# Check one or more specific YAML files
-cargo run -p testrix-app -- --check path/to/file.request.yaml path/to/dev.env.yaml
+# Check the configured workspace
+testrix --check
 
-# Check an entire project directory
-cargo run -p testrix-app -- --check path/to/project-dir
-
-# Check an entire workspace directory
-cargo run -p testrix-app -- --check path/to/workspace-dir
-
-# Check the default/configured workspace (or pass --workspace <dir>)
-cargo run -p testrix-app -- --check
+# Check one or more specific YAML files or a project directory
+testrix --check path/to/file.request.yaml path/to/dev.env.yaml
+testrix --check path/to/project-dir
 ```
 
-If a prebuilt `testrix` binary is on `PATH` or in `target/`, you can also run `testrix --check <path>`.
 - Exit code `0` (`OK ...` on stdout) means all checked YAML files parsed and passed schema validation.
-- Non-zero exit code (`ERR ...` on stderr) means one or more files failed; fix every reported error and re-run `--check`.
+- Non-zero exit code (`ERR ...` on stderr) means one or more files failed; fix every reported error and re-run `testrix --check`.
 
 ---
 
-## 2. File Naming & Document Kinds
+## 4. File Naming & Document Kinds
 
 The filename **must** match `kind`:
 
@@ -61,7 +78,7 @@ The filename **must** match `kind`:
 
 ---
 
-## 3. Common Envelope (Required on Every File)
+## 5. Common Envelope (Required on Every File)
 
 Every Testrix YAML document must include:
 
@@ -80,7 +97,7 @@ Validation rules:
 
 ---
 
-## 4. Document Schemas
+## 6. Document Schemas
 
 ### 4.1 `Project` (`testrix.project.yaml`)
 
@@ -250,7 +267,7 @@ variables:
 
 ---
 
-## 5. Common YAML Pitfalls to Avoid
+## 7. Common YAML Pitfalls to Avoid
 
 1. **Always quote `{{variable}}` templates when they start a value.**
    Unquoted `url: {{base_url}}/users` is invalid YAML (parsed as a flow mapping `{...}`). Always write `url: "{{base_url}}/users"`.
@@ -262,7 +279,7 @@ variables:
 
 ---
 
-## 6. Further Reading
+## 8. Further Reading
 
 - Full schema & auth inheritance specification: [yaml-spec.md](./yaml-spec.md)
 - Post-response JavaScript runtime specification: [post-script.md](./post-script.md)

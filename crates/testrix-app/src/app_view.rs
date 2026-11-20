@@ -503,7 +503,9 @@ impl TestrixApp {
         app.sync_sidebars(Some(&saved_expanded), cx);
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
-        app.check_for_updates(false, window, cx);
+        if !cfg!(debug_assertions) {
+            app.check_for_updates(false, window, cx);
+        }
         app
     }
 
