@@ -201,6 +201,8 @@ fn tr_en(key: &str) -> Option<&'static str> {
         "send" => "Send",
         "cancel_req" => "Cancel",
         "params" => "Params",
+        "path_params" => "Path",
+        "path_params_hint" => "Use :param or {param} in the URL path to populate path variables.",
         "headers" => "Headers",
         "body" => "Body",
         "auth" => "Auth",

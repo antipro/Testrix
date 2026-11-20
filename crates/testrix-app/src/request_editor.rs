@@ -32,8 +32,9 @@ use testrix_core::{
     HttpResponseSnapshot, KeyValueRow, ProjectNode, RawBodyFormat, RequestBody,
     RequestExecutionState, RequestNode, RequestSettings, ResponseExample, ResponseMetaField,
     detect_body_language, extract_and_merge_request_body_meta, extract_and_merge_response_meta,
-    extract_url_query_params, generate_id, generate_request_code, materialize_request_doc,
-    rename_template_variables, replace_template_variables, resolve_request_doc_auth,
+    extract_path_param_names, extract_url_query_params, generate_id, generate_request_code,
+    materialize_request_doc, rename_template_variables, replace_template_variables,
+    resolve_request_doc_auth,
 };
 use testrix_http::{CancellationToken, HttpError, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -75,6 +76,7 @@ impl SelectItem for MethodOption {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestSection {
     Params,
+    Path,
     Headers,
     Body,
     Auth,
@@ -227,6 +229,7 @@ pub(crate) struct RequestTabView {
     name_input: Entity<InputState>,
     description_input: Entity<TextareaState>,
     params_table: Entity<KeyValueTable>,
+    path_params_table: Entity<KeyValueTable>,
     headers_table: Entity<KeyValueTable>,
 
     // Body controls
@@ -366,6 +369,19 @@ impl RequestTabView {
                 "Value",
                 "Add Param",
                 &doc.request.params,
+                window,
+                cx,
+            )
+            .with_variable_validation(active_env.clone())
+        });
+        let initial_path_params = merge_path_param_rows(&doc.request.url, &doc.request.path_params);
+        let path_params_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("req-path-params-{}", doc.id),
+                "Path Variable",
+                "Value",
+                "Add Path Variable",
+                &initial_path_params,
                 window,
                 cx,
             )
@@ -511,6 +527,7 @@ impl RequestTabView {
             name_input,
             description_input,
             params_table,
+            path_params_table,
             headers_table,
             body_mode,
             raw_format,
@@ -643,6 +660,11 @@ impl RequestTabView {
             |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
         ));
         subs.push(cx.subscribe_in(
+            &self.path_params_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
+        ));
+        subs.push(cx.subscribe_in(
             &self.headers_table,
             window,
             |this, _, _: &TableChangeEvent, window, cx| this.on_edited(window, cx),
@@ -734,6 +756,10 @@ impl RequestTabView {
         });
         self.params_table.update(cx, |tbl, cx| {
             tbl.set_rows(&doc.request.params, window, cx);
+        });
+        let merged_path_params = merge_path_param_rows(&doc.request.url, &doc.request.path_params);
+        self.path_params_table.update(cx, |tbl, cx| {
+            tbl.set_rows(&merged_path_params, window, cx);
         });
         self.headers_table.update(cx, |tbl, cx| {
             tbl.set_rows(&doc.request.headers, window, cx);
@@ -866,6 +892,8 @@ impl RequestTabView {
         });
         self.params_table
             .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
+        self.path_params_table
+            .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
         self.headers_table
             .update(cx, |table, cx| table.set_active_env(active_env.clone(), cx));
         self.form_table
@@ -930,6 +958,9 @@ impl RequestTabView {
 
         changed |= self
             .params_table
+            .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
+        changed |= self
+            .path_params_table
             .update(cx, |t, cx| t.rewrite_variables(pairs, wrap_braces, window, cx));
         changed |= self
             .headers_table
@@ -1164,7 +1195,7 @@ impl RequestTabView {
 
     fn on_url_input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.url_input.read(cx).value().to_string();
-        if let Some((clean_url, extracted)) = extract_url_query_params(&raw) {
+        let current_url = if let Some((clean_url, extracted)) = extract_url_query_params(&raw) {
             let mut rows = self.params_table.read(cx).snapshot(cx);
             for (key, value) in extracted {
                 if let Some(existing) = rows.iter_mut().find(|r| r.enabled && r.name == key) {
@@ -1176,8 +1207,19 @@ impl RequestTabView {
             self.params_table
                 .update(cx, |table, cx| table.set_rows(&rows, window, cx));
             self.url_input
-                .update(cx, |state, cx| state.set_value(clean_url, window, cx));
+                .update(cx, |state, cx| state.set_value(clean_url.clone(), window, cx));
+            clean_url
+        } else {
+            raw
+        };
+
+        let existing_path_rows = self.path_params_table.read(cx).snapshot(cx);
+        let merged_path_rows = merge_path_param_rows(&current_url, &existing_path_rows);
+        if merged_path_rows != existing_path_rows {
+            self.path_params_table
+                .update(cx, |table, cx| table.set_rows(&merged_path_rows, window, cx));
         }
+
         self.on_edited(window, cx);
     }
 
@@ -1240,6 +1282,7 @@ impl RequestTabView {
             &self.url_input.read(cx).value(),
         );
         doc.request.params = self.params_table.read(cx).snapshot(cx);
+        doc.request.path_params = self.path_params_table.read(cx).snapshot(cx);
         doc.request.headers = self.headers_table.read(cx).snapshot(cx);
         doc.request.auth = self.auth_editor.read(cx).snapshot(cx);
         doc.request.post_script = self.post_script_editor.read(cx).value().to_string();
@@ -1481,11 +1524,13 @@ impl RequestTabView {
     fn render_request_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let doc = self.build_doc(cx);
         let param_count = doc.request.params.iter().filter(|r| r.enabled).count();
+        let path_param_count = doc.request.path_params.iter().filter(|r| r.enabled).count();
         let header_count = doc.request.headers.iter().filter(|r| r.enabled).count();
         let id_base = self.request_id.clone();
 
         let sections = [
             RequestSection::Params,
+            RequestSection::Path,
             RequestSection::Headers,
             RequestSection::Body,
             RequestSection::Auth,
@@ -1521,6 +1566,11 @@ impl RequestTabView {
                     } else {
                         crate::i18n::t("params").to_string()
                     }))
+                    .child(Tab::new().label(if path_param_count > 0 {
+                        format!("{} ({path_param_count})", crate::i18n::t("path_params"))
+                    } else {
+                        crate::i18n::t("path_params").to_string()
+                    }))
                     .child(Tab::new().label(if header_count > 0 {
                         format!("{} ({header_count})", crate::i18n::t("headers"))
                     } else {
@@ -1548,6 +1598,27 @@ impl RequestTabView {
                     .p_3()
                     .when(self.active_request_section == RequestSection::Params, |this| {
                         this.child(self.params_table.clone())
+                    })
+                    .when(self.active_request_section == RequestSection::Path, |this| {
+                        this.child(
+                            v_flex()
+                                .size_full()
+                                .min_h_0()
+                                .gap_2()
+                                .when(path_param_count == 0, |col| {
+                                    col.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(cx.theme().radius)
+                                            .bg(cx.theme().muted)
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(crate::i18n::t("path_params_hint")),
+                                    )
+                                })
+                                .child(div().flex_1().min_h_0().child(self.path_params_table.clone())),
+                        )
                     })
                     .when(self.active_request_section == RequestSection::Headers, |this| {
                         this.child(
@@ -3448,6 +3519,28 @@ fn build_url_prefix_options(
     }
 
     options
+}
+
+fn merge_path_param_rows(url: &str, existing: &[KeyValueRow]) -> Vec<KeyValueRow> {
+    let names = extract_path_param_names(url);
+    let mut merged = Vec::new();
+    for name in &names {
+        if let Some(found) = existing.iter().find(|r| r.name.trim() == name) {
+            merged.push(found.clone());
+        } else {
+            merged.push(KeyValueRow::new(name.clone(), String::new()));
+        }
+    }
+    for row in existing {
+        let trimmed = row.name.trim();
+        if !trimmed.is_empty()
+            && !row.value.trim().is_empty()
+            && !names.iter().any(|n| n == trimmed)
+        {
+            merged.push(row.clone());
+        }
+    }
+    merged
 }
 
 #[cfg(test)]

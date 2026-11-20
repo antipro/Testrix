@@ -139,7 +139,15 @@ pub fn materialize_request_doc(
         res.rendered
     };
 
-    let raw_url = expand(&doc.request.url, &mut unresolved);
+    let path_pairs: Vec<(String, String)> = doc
+        .request
+        .path_params
+        .iter()
+        .filter(|p| p.enabled && !p.name.trim().is_empty())
+        .map(|p| (p.name.trim().to_string(), expand(&p.value, &mut unresolved)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    let raw_url = apply_path_params(&expand(&doc.request.url, &mut unresolved), &path_pairs);
     let base_url = expand(&project.doc.base_url, &mut unresolved);
     let joined_url = join_base_and_path(&base_url, &raw_url);
     if joined_url.trim().is_empty() {
@@ -434,9 +442,147 @@ pub fn extract_url_query_params(raw_url: &str) -> Option<(String, Vec<(String, S
     Some((format!("{base}{fragment}"), params))
 }
 
+fn split_url_path_slice(raw_url: &str) -> (&str, &str, &str) {
+    let end = raw_url.find(['?', '#']).unwrap_or(raw_url.len());
+    let before_query = &raw_url[..end];
+    let suffix = &raw_url[end..];
+
+    if let Some(scheme_ix) = before_query.find("://") {
+        let after_scheme = &before_query[scheme_ix + 3..];
+        if let Some(slash_ix) = after_scheme.find('/') {
+            let path_start = scheme_ix + 3 + slash_ix;
+            return (&before_query[..path_start], &before_query[path_start..], suffix);
+        }
+        return (before_query, "", suffix);
+    }
+
+    ("", before_query, suffix)
+}
+
+/// Extracts path variable names (`:name` or `{name}`, ignoring `{{env_var}}`) from a URL.
+pub fn extract_path_param_names(raw_url: &str) -> Vec<String> {
+    let (_, path, _) = split_url_path_slice(raw_url);
+    let mut out = Vec::new();
+    let mut push_unique = |name: &str| {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+
+    for segment in path.split('/') {
+        let mut rest = segment;
+        while let Some(open) = rest.find('{') {
+            if rest[open..].starts_with("{{") {
+                if let Some(close) = rest[open + 2..].find("}}") {
+                    rest = &rest[open + 2 + close + 2..];
+                    continue;
+                }
+                break;
+            }
+            if let Some(close) = rest[open + 1..].find('}') {
+                let name = &rest[open + 1..open + 1 + close];
+                if !name.contains('{') {
+                    push_unique(name);
+                }
+                rest = &rest[open + 1 + close + 1..];
+            } else {
+                break;
+            }
+        }
+        if let Some(colon_name) = segment.strip_prefix(':') {
+            let valid = !colon_name.is_empty()
+                && !colon_name.starts_with('{')
+                && colon_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if valid {
+                push_unique(colon_name);
+            }
+        }
+    }
+
+    out
+}
+
+/// Substitutes `{name}` and `:name` path variables in `raw_url` with their configured values.
+pub fn apply_path_params(raw_url: &str, params: &[(String, String)]) -> String {
+    if params.is_empty() {
+        return raw_url.to_string();
+    }
+    let (prefix, path, suffix) = split_url_path_slice(raw_url);
+    if path.is_empty() {
+        return raw_url.to_string();
+    }
+
+    let mut replaced_segments = Vec::new();
+    for segment in path.split('/') {
+        if let Some(colon_name) = segment.strip_prefix(':')
+            && let Some((_, val)) = params.iter().find(|(k, _)| k == colon_name)
+        {
+            replaced_segments.push(val.clone());
+            continue;
+        }
+
+        let mut seg_out = String::with_capacity(segment.len());
+        let mut rest = segment;
+        while let Some(open) = rest.find('{') {
+            if rest[open..].starts_with("{{") {
+                if let Some(close) = rest[open + 2..].find("}}") {
+                    let end = open + 2 + close + 2;
+                    seg_out.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                    continue;
+                }
+                break;
+            }
+            seg_out.push_str(&rest[..open]);
+            if let Some(close) = rest[open + 1..].find('}') {
+                let name = rest[open + 1..open + 1 + close].trim();
+                if let Some((_, val)) = params.iter().find(|(k, _)| k == name) {
+                    seg_out.push_str(val);
+                } else {
+                    seg_out.push_str(&rest[open..open + 1 + close + 1]);
+                }
+                rest = &rest[open + 1 + close + 1..];
+            } else {
+                seg_out.push_str(&rest[open..]);
+                rest = "";
+                break;
+            }
+        }
+        seg_out.push_str(rest);
+        replaced_segments.push(seg_out);
+    }
+
+    format!("{prefix}{}{suffix}", replaced_segments.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_and_applies_path_variables() {
+        assert_eq!(
+            extract_path_param_names("https://localhost:8080/users/:userId/orders/{order_id}?a=1"),
+            vec!["userId".to_string(), "order_id".to_string()]
+        );
+        assert_eq!(
+            extract_path_param_names("{{base_url}}/items/{{item_id}}/:id"),
+            vec!["id".to_string()]
+        );
+        assert_eq!(
+            apply_path_params(
+                "https://localhost:8080/users/:userId/orders/{order_id}?a=1",
+                &[
+                    ("userId".to_string(), "42".to_string()),
+                    ("order_id".to_string(), "ord-9".to_string()),
+                ],
+            ),
+            "https://localhost:8080/users/42/orders/ord-9?a=1"
+        );
+    }
 
     #[test]
     fn extracts_query_params_from_pasted_url() {

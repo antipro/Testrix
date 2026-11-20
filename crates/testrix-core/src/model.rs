@@ -467,6 +467,8 @@ pub struct HttpRequestSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<KeyValueRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_params: Vec<KeyValueRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<KeyValueRow>,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -490,6 +492,7 @@ impl Default for HttpRequestSpec {
             method: HttpMethod::Get,
             url: String::new(),
             params: Vec::new(),
+            path_params: Vec::new(),
             headers: Vec::new(),
             auth: AuthConfig::Inherit,
             body: RequestBody::None,

@@ -23,7 +23,8 @@ pub use codegen::{CodegenTarget, generate_request_code, parse_request_script};
 pub use error::CoreError;
 pub use materialize::{
     PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,
-    extract_url_query_params, materialize_request, materialize_request_doc,
+    extract_path_param_names, extract_url_query_params, materialize_request,
+    materialize_request_doc,
 };
 pub use model::{
     API_VERSION, ApiKeyLocation, AuthConfig, DocumentKind, EffectiveAuth, EnvVariable,
