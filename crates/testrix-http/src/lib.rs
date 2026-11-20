@@ -4,6 +4,7 @@ mod error;
 mod local_share;
 mod runner;
 mod share;
+mod upgrade;
 
 pub use error::HttpError;
 pub use local_share::{
@@ -15,7 +16,13 @@ pub use share::{
     dispatch_share_future, login_testrix_server, revoke_cloudflare_r2_share,
     revoke_testrix_server_share, upload_to_cloudflare_r2, upload_to_testrix_server,
 };
+pub use tokio::sync::oneshot::error::TryRecvError as OneshotTryRecvError;
 pub use tokio_util::sync::CancellationToken;
+pub use upgrade::{
+    DownloadProgressState, GITHUB_RELEASES_LATEST_API, GITHUB_RELEASES_PAGE, ReleaseAsset,
+    ReleaseInfo, UpgradeCheckResult, check_for_upgrade, check_for_upgrade_from_url,
+    download_release_asset, is_newer_version, launch_installer, select_platform_asset,
+};
 
 #[cfg(test)]
 mod tests {

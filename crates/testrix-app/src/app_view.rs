@@ -14,7 +14,8 @@ use gpui_kit::{
     assets::IconName as LucideIcon,
     base::TestSupportExt as _,
     component::{
-        ActiveTheme as _, Icon, IconName, IndexPath, Placement, Selectable as _, Sizable as _,
+        ActiveTheme as _, Disableable as _, Icon, IconName, IndexPath, Placement, Selectable as _,
+        Sizable as _,
         StyledExt as _, Theme, ThemeMode, TitleBar, WindowExt as _,
         button::{Button, ButtonVariant, ButtonVariants as _},
         checkbox::Checkbox,
@@ -48,9 +49,10 @@ use testrix_core::{
     parse_postman_zip, parse_request_script, rename_template_variables, resolve_request_auth,
 };
 use testrix_http::{
-    HttpRunner, ShareChannel, ShareFile, collect_project_yaml_files, dispatch_share_future,
-    login_testrix_server, revoke_cloudflare_r2_share, revoke_testrix_server_share,
-    upload_to_cloudflare_r2, upload_to_testrix_server,
+    DownloadProgressState, HttpRunner, OneshotTryRecvError, ReleaseInfo, ShareChannel, ShareFile,
+    check_for_upgrade, collect_project_yaml_files, dispatch_share_future, download_release_asset,
+    launch_installer, login_testrix_server, revoke_cloudflare_r2_share,
+    revoke_testrix_server_share, upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
     PersistedShareRecord, ShareSettings, clear_saved_responses, create_environment, create_folder,
@@ -123,6 +125,22 @@ struct BuildInfo {
     build_time: String,
     branch: String,
     commit: String,
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn current_build_info() -> BuildInfo {
@@ -236,6 +254,40 @@ impl WorkbenchTab {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+enum UpgradeStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseInfo),
+    Downloading {
+        release: ReleaseInfo,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    ReadyToInstall {
+        release: ReleaseInfo,
+        installer_path: PathBuf,
+    },
+    Error {
+        release: Option<ReleaseInfo>,
+        message: String,
+    },
+}
+
+impl UpgradeStatus {
+    fn active_release(&self) -> Option<&ReleaseInfo> {
+        match self {
+            Self::Available(release)
+            | Self::Downloading { release, .. }
+            | Self::ReadyToInstall { release, .. } => Some(release),
+            Self::Error { release, .. } => release.as_ref(),
+            Self::Idle | Self::Checking | Self::UpToDate => None,
+        }
+    }
+}
+
 /// Top-level Testrix desktop workbench window view.
 pub struct TestrixApp {
     focus_handle: FocusHandle,
@@ -262,6 +314,7 @@ pub struct TestrixApp {
     quit_after_sync: bool,
     force_quit: bool,
     exit_prompt_open: bool,
+    upgrade_status: UpgradeStatus,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -387,6 +440,7 @@ impl TestrixApp {
             quit_after_sync: false,
             force_quit: false,
             exit_prompt_open: false,
+            upgrade_status: UpgradeStatus::Idle,
             _subscriptions: Vec::new(),
         };
 
@@ -449,6 +503,7 @@ impl TestrixApp {
         app.sync_sidebars(Some(&saved_expanded), cx);
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
+        app.check_for_updates(false, window, cx);
         app
     }
 
@@ -3457,6 +3512,7 @@ impl TestrixApp {
 
     fn open_about_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let info = current_build_info();
+        let app_entity = cx.entity();
 
         window.open_dialog(cx, move |dialog, _, cx| {
             let row = |label: &'static str, value: String| {
@@ -3566,15 +3622,520 @@ impl TestrixApp {
                                 ),
                         ),
                 )
-                .footer(
-                    DialogFooter::new().child(
-                        DialogClose::new().child(
-                            Button::new("about-done-btn")
-                                .primary()
-                                .label(crate::i18n::t("done")),
+                .footer({
+                    let app_check = app_entity.clone();
+                    let checking = matches!(
+                        app_entity.read(cx).upgrade_status,
+                        UpgradeStatus::Checking
+                    );
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            Button::new("about-check-updates-btn")
+                                .outline()
+                                .disabled(checking)
+                                .label(if checking {
+                                    crate::i18n::t("upgrade_checking")
+                                } else {
+                                    crate::i18n::t("upgrade_check_btn")
+                                })
+                                .on_click(move |_, window, cx| {
+                                    app_check.update(cx, |this, cx| {
+                                        this.check_for_updates(true, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            DialogClose::new().child(
+                                Button::new("about-done-btn")
+                                    .primary()
+                                    .label(crate::i18n::t("done")),
+                            ),
+                        )
+                })
+        });
+    }
+
+    fn check_for_updates(
+        &mut self,
+        interactive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.upgrade_status,
+            UpgradeStatus::Checking | UpgradeStatus::Downloading { .. }
+        ) {
+            return;
+        }
+        let current_version = current_build_info().version;
+        self.upgrade_status = UpgradeStatus::Checking;
+        cx.notify();
+
+        let rx = dispatch_share_future(async move { check_for_upgrade(&current_version).await });
+        cx.spawn_in(window, async move |weak_self, cx| {
+            let outcome = rx.await;
+            _ = weak_self.update_in(cx, |this, window, cx| {
+                match outcome {
+                    Ok(Ok(res)) if res.has_upgrade => {
+                        this.upgrade_status = UpgradeStatus::Available(res.latest);
+                        this.open_upgrade_dialog(window, cx);
+                    }
+                    Ok(Ok(res)) => {
+                        this.upgrade_status = UpgradeStatus::UpToDate;
+                        if interactive {
+                            window.push_notification(
+                                format!(
+                                    "{} ({})",
+                                    crate::i18n::t("upgrade_up_to_date"),
+                                    res.current_version
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if interactive {
+                            this.upgrade_status = UpgradeStatus::Error {
+                                release: None,
+                                message: err.clone(),
+                            };
+                            window.push_notification(
+                                format!("{}: {err}", crate::i18n::t("upgrade_check_failed")),
+                                cx,
+                            );
+                        } else {
+                            this.upgrade_status = UpgradeStatus::Idle;
+                            tracing::debug!(error = %err, "background upgrade check failed");
+                        }
+                    }
+                    Err(_) => {
+                        this.upgrade_status = UpgradeStatus::Idle;
+                    }
+                }
+                cx.notify();
+                window.refresh();
+            });
+        })
+        .detach();
+    }
+
+    fn start_upgrade_download(
+        &mut self,
+        release: ReleaseInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(asset) = release.asset.clone() else {
+            cx.open_url(&release.html_url);
+            return;
+        };
+
+        let progress = Arc::new(DownloadProgressState::new());
+        self.upgrade_status = UpgradeStatus::Downloading {
+            release: release.clone(),
+            downloaded: 0,
+            total: (asset.size > 0).then_some(asset.size),
+        };
+        cx.notify();
+        window.refresh();
+
+        let progress_worker = progress.clone();
+        let url = asset.download_url;
+        let file_name = asset.name;
+        let mut rx =
+            dispatch_share_future(async move { download_release_asset(&url, &file_name, progress_worker).await });
+
+        cx.spawn_in(window, async move |weak_self, cx| {
+            let outcome = loop {
+                match rx.try_recv() {
+                    Ok(res) => break Ok(res),
+                    Err(OneshotTryRecvError::Empty) => {
+                        let (downloaded, total) = progress.snapshot();
+                        let updated = weak_self
+                            .update_in(cx, |this, window, cx| {
+                                if let UpgradeStatus::Downloading {
+                                    downloaded: cur_dl,
+                                    total: cur_tot,
+                                    ..
+                                } = &mut this.upgrade_status
+                                {
+                                    *cur_dl = downloaded;
+                                    if total.is_some() {
+                                        *cur_tot = total;
+                                    }
+                                    cx.notify();
+                                    window.refresh();
+                                }
+                            })
+                            .is_ok();
+                        if !updated {
+                            return;
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(100))
+                            .await;
+                    }
+                    Err(OneshotTryRecvError::Closed) => {
+                        break Err("Download task closed unexpectedly".to_string());
+                    }
+                }
+            };
+
+            _ = weak_self.update_in(cx, |this, window, cx| {
+                match outcome {
+                    Ok(Ok(installer_path)) => {
+                        this.launch_downloaded_installer_and_quit(
+                            release,
+                            &installer_path,
+                            window,
+                            cx,
+                        );
+                    }
+                    Ok(Err(err)) | Err(err) => {
+                        this.upgrade_status = UpgradeStatus::Error {
+                            release: Some(release),
+                            message: err,
+                        };
+                        cx.notify();
+                        window.refresh();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn launch_downloaded_installer_and_quit(
+        &mut self,
+        release: ReleaseInfo,
+        installer_path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.upgrade_status = UpgradeStatus::ReadyToInstall {
+            release: release.clone(),
+            installer_path: installer_path.to_path_buf(),
+        };
+        match launch_installer(installer_path) {
+            Ok(()) => {
+                self.force_quit = true;
+                cx.quit();
+            }
+            Err(err) => {
+                self.upgrade_status = UpgradeStatus::Error {
+                    release: Some(release),
+                    message: err,
+                };
+                cx.notify();
+                window.refresh();
+            }
+        }
+    }
+
+    fn open_upgrade_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app_entity = cx.entity();
+        let current_version = current_build_info().version;
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let status = app_entity.read(cx).upgrade_status.clone();
+            let app_download = app_entity.clone();
+            let app_install = app_entity.clone();
+            let app_retry = app_entity.clone();
+
+            let Some(release) = status.active_release().cloned() else {
+                return dialog
+                    .title(crate::i18n::t("upgrade_available_title"))
+                    .width(px(480.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(crate::i18n::t("upgrade_up_to_date")),
+                    )
+                    .footer(
+                        DialogFooter::new().child(
+                            DialogClose::new().child(
+                                Button::new("upgrade-close-empty")
+                                    .primary()
+                                    .label(crate::i18n::t("done")),
+                            ),
                         ),
-                    ),
+                    );
+            };
+
+            let notes = release.body.trim().to_string();
+            let html_url = release.html_url.clone();
+
+            let mut body = v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::i18n::t("upgrade_available_desc")),
                 )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .p_3()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(crate::i18n::t("upgrade_current_version")),
+                                )
+                                .child(div().text_sm().font_medium().child(current_version.clone())),
+                        )
+                        .child(Icon::new(LucideIcon::ArrowRight).size_4())
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .items_end()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(crate::i18n::t("upgrade_latest_version")),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_bold()
+                                        .text_color(cx.theme().primary)
+                                        .child(release.tag_name.clone()),
+                                ),
+                        ),
+                );
+
+            if !notes.is_empty() {
+                body = body.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::i18n::t("upgrade_release_notes")),
+                        )
+                        .child(
+                            div()
+                                .id("upgrade-release-notes")
+                                .max_h(px(180.))
+                                .overflow_y_scrollbar()
+                                .p_2p5()
+                                .rounded(cx.theme().radius)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .child(notes),
+                        ),
+                );
+            }
+
+            if let Some(asset) = &release.asset {
+                let size_str = if asset.size > 0 {
+                    format!(" ({})", format_bytes(asset.size))
+                } else {
+                    String::new()
+                };
+                body = body.child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .text_xs()
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::i18n::t("upgrade_package")),
+                        )
+                        .child(
+                            div()
+                                .font_medium()
+                                .child(format!("{}{}", asset.name, size_str)),
+                        ),
+                );
+            } else {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::i18n::t("upgrade_no_asset")),
+                );
+            }
+
+            match &status {
+                UpgradeStatus::Downloading {
+                    downloaded, total, ..
+                } => {
+                    let fraction = total
+                        .filter(|&t| t > 0)
+                        .map(|t| (*downloaded as f32 / t as f32).clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                    let pct = (fraction * 100.0).round() as u64;
+                    let progress_label = match total {
+                        Some(t) if *t > 0 => format!(
+                            "{} {}% ({} / {})",
+                            crate::i18n::t("upgrade_downloading"),
+                            pct,
+                            format_bytes(*downloaded),
+                            format_bytes(*t)
+                        ),
+                        _ => format!(
+                            "{} ({})",
+                            crate::i18n::t("upgrade_downloading"),
+                            format_bytes(*downloaded)
+                        ),
+                    };
+                    body = body.child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(div().text_xs().font_medium().child(progress_label))
+                            .child(
+                                div()
+                                    .w(px(430.))
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(cx.theme().secondary)
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(px(430.0 * fraction))
+                                            .rounded_full()
+                                            .bg(cx.theme().primary),
+                                    ),
+                            ),
+                    );
+                }
+                UpgradeStatus::ReadyToInstall { .. } => {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(cx.theme().primary)
+                            .child(crate::i18n::t("upgrade_ready_launching")),
+                    );
+                }
+                UpgradeStatus::Error { message, .. } => {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(message.clone()),
+                    );
+                }
+                _ => {}
+            }
+
+            let is_downloading = matches!(status, UpgradeStatus::Downloading { .. });
+            let mut footer = DialogFooter::new().gap_2().child(
+                DialogClose::new().child(
+                    Button::new("upgrade-later-btn")
+                        .outline()
+                        .disabled(is_downloading)
+                        .label(crate::i18n::t("upgrade_later")),
+                ),
+            );
+
+            match &status {
+                UpgradeStatus::Downloading { .. } => {
+                    footer = footer.child(
+                        Button::new("upgrade-downloading-btn")
+                            .primary()
+                            .disabled(true)
+                            .label(crate::i18n::t("upgrade_downloading")),
+                    );
+                }
+                UpgradeStatus::ReadyToInstall {
+                    release,
+                    installer_path,
+                } => {
+                    let rel = release.clone();
+                    let path = installer_path.clone();
+                    footer = footer.child(
+                        Button::new("upgrade-install-btn")
+                            .primary()
+                            .icon(LucideIcon::Rocket)
+                            .label(crate::i18n::t("upgrade_install_and_quit"))
+                            .on_click(move |_, window, cx| {
+                                app_install.update(cx, |this, cx| {
+                                    this.launch_downloaded_installer_and_quit(
+                                        rel.clone(),
+                                        &path,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    );
+                }
+                UpgradeStatus::Error { .. } => {
+                    let rel = release;
+                    let url_open = html_url;
+                    footer = footer
+                        .child(
+                            Button::new("upgrade-open-releases-btn")
+                                .outline()
+                                .label(crate::i18n::t("upgrade_open_releases"))
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url_open);
+                                }),
+                        )
+                        .child(
+                            Button::new("upgrade-retry-btn")
+                                .primary()
+                                .label(crate::i18n::t("upgrade_retry"))
+                                .on_click(move |_, window, cx| {
+                                    app_retry.update(cx, |this, cx| {
+                                        this.start_upgrade_download(rel.clone(), window, cx);
+                                    });
+                                }),
+                        );
+                }
+                _ => {
+                    if release.asset.is_some() {
+                        let rel = release;
+                        footer = footer.child(
+                            Button::new("upgrade-download-btn")
+                                .primary()
+                                .icon(LucideIcon::Download)
+                                .label(crate::i18n::t("upgrade_download_and_install"))
+                                .on_click(move |_, window, cx| {
+                                    app_download.update(cx, |this, cx| {
+                                        this.start_upgrade_download(rel.clone(), window, cx);
+                                    });
+                                }),
+                        );
+                    } else {
+                        let url_open = html_url;
+                        footer = footer.child(
+                            Button::new("upgrade-open-releases-btn")
+                                .primary()
+                                .label(crate::i18n::t("upgrade_open_releases"))
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url_open);
+                                }),
+                        );
+                    }
+                }
+            }
+
+            dialog
+                .title(crate::i18n::t("upgrade_available_title"))
+                .width(px(480.))
+                .child(body)
+                .footer(footer)
         });
     }
 
@@ -4478,7 +5039,24 @@ impl Render for TestrixApp {
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_about_dialog(window, cx);
                                         })),
-                                ),
+                                )
+                                .when_some(self.upgrade_status.active_release().cloned(), |this, release| {
+                                    this.child(
+                                        Button::new("upgrade-available-btn")
+                                            .primary()
+                                            .xsmall()
+                                            .icon(LucideIcon::Download)
+                                            .label(format!(
+                                                "{} {}",
+                                                crate::i18n::t("upgrade_badge"),
+                                                release.tag_name
+                                            ))
+                                            .tooltip(crate::i18n::t("upgrade_available_title"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_upgrade_dialog(window, cx);
+                                            })),
+                                    )
+                                }),
                         )
                         // Right-top corner: Profile + Environment Variables
                         .child(
