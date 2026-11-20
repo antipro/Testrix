@@ -3042,7 +3042,6 @@ impl TestrixApp {
         let access_token_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Access Token (optional, limits access to shared site / Cloudflare page)")
-                .masked(true)
                 .default_value(current_share.share_access_token.clone())
         });
 
@@ -3424,6 +3423,17 @@ impl TestrixApp {
                                                     this.share_settings.share_access_token = access_tok;
                                                     let _ = save_config_share_settings(&this.share_settings);
                                                     this.sync_share_settings_to_tabs(cx);
+                                                    let remote_project_ids: Vec<String> = this
+                                                        .active_shares
+                                                        .iter()
+                                                        .filter(|s| s.channel != ShareChannel::LocalNetwork)
+                                                        .map(|s| s.project_id.clone())
+                                                        .collect::<std::collections::HashSet<_>>()
+                                                        .into_iter()
+                                                        .collect();
+                                                    for project_id in remote_project_ids {
+                                                        this.sync_active_shares(&project_id, None, window, cx);
+                                                    }
                                                     cx.notify();
                                                 });
                                                 window.push_notification("Saved Share Access Token", cx);

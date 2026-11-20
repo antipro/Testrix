@@ -1,6 +1,7 @@
 const state = {
   user: null,
   requireEmailVerification: true,
+  requireEula: true,
   projects: [],
   currentProject: null,
   selectedNode: null, // { type: 'project' | 'folder' | 'request', data }
@@ -58,6 +59,7 @@ async function loadCurrentUser() {
   try {
     const cfg = await api('/api/auth/config');
     state.requireEmailVerification = cfg.requireEmailVerification !== false;
+    state.requireEula = cfg.requireEula !== false;
   } catch {}
   try {
     const data = await api('/api/auth/me');
@@ -1010,6 +1012,7 @@ async function loadProject(slug, reqTarget = null) {
 function renderAuthForm(mode) {
   const isRegister = mode === 'register';
   const needCode = isRegister && state.requireEmailVerification;
+  const needEula = isRegister && state.requireEula;
   const root = document.getElementById('appRoot');
   root.innerHTML = `
     <div class="card-container">
@@ -1039,6 +1042,21 @@ function renderAuthForm(mode) {
             <div class="form-group">
               <label>Confirm Password</label>
               <input class="input" type="password" name="confirmPassword" required minlength="6" placeholder="••••••" />
+            </div>
+          ` : ''}
+          ${needEula ? `
+            <div class="form-group">
+              <label>End User License Agreement</label>
+              <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;max-height:140px;overflow-y:auto;font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:8px;">
+                <p style="margin:0 0 6px;color:var(--text);font-weight:600;">End User License Agreement (EULA)</p>
+                <p style="margin:0 0 6px;">1. <strong>Unencrypted Storage:</strong> All uploaded YAML files and project data are stored on the server in unencrypted form.</p>
+                <p style="margin:0 0 6px;">2. <strong>No Sensitive Data:</strong> Do not upload any private, confidential, or sensitive content, including real passwords, API keys, access tokens, personal data, or proprietary secrets.</p>
+                <p style="margin:0;">3. <strong>No Liability:</strong> By registering and using this service, you acknowledge that the service provider is not responsible or liable for any content leak, unauthorized access, or data exposure.</p>
+              </div>
+              <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--text);cursor:pointer;">
+                <input type="checkbox" name="acceptEula" required style="margin-top:2px;" />
+                <span>I have read and agree to the End User License Agreement.</span>
+              </label>
             </div>
           ` : ''}
           <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center">
@@ -1107,11 +1125,22 @@ function renderAuthForm(mode) {
         errEl.style.display = 'block';
         return;
       }
+      if (needEula && !form.get('acceptEula')) {
+        errEl.textContent = 'You must agree to the End User License Agreement to register';
+        errEl.style.display = 'block';
+        return;
+      }
     }
 
     try {
       const payload = isRegister
-        ? { email, password, confirmPassword: form.get('confirmPassword'), code: form.get('code') }
+        ? {
+            email,
+            password,
+            confirmPassword: form.get('confirmPassword'),
+            code: form.get('code'),
+            acceptEula: Boolean(form.get('acceptEula')),
+          }
         : { email, password };
       const data = await api(isRegister ? '/api/auth/register' : '/api/auth/login', {
         method: 'POST',

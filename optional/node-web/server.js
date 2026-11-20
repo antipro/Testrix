@@ -32,6 +32,9 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT
 const REQUIRE_EMAIL_VERIFICATION = !['false', '0', 'no'].includes(
   String(process.env.REQUIRE_EMAIL_VERIFICATION || 'true').trim().toLowerCase()
 );
+const REQUIRE_EULA = !['false', '0', 'no'].includes(
+  String(process.env.REQUIRE_EULA || 'true').trim().toLowerCase()
+);
 
 function sanitizeSlug(raw) {
   return String(raw || 'project')
@@ -68,7 +71,10 @@ function createApp(db) {
 
   // Auth endpoints
   app.get('/api/auth/config', (_req, res) => {
-    res.json({ requireEmailVerification: REQUIRE_EMAIL_VERIFICATION });
+    res.json({
+      requireEmailVerification: REQUIRE_EMAIL_VERIFICATION,
+      requireEula: REQUIRE_EULA,
+    });
   });
 
   app.post(
@@ -125,6 +131,9 @@ function createApp(db) {
       }
       if (REQUIRE_EMAIL_VERIFICATION && !code) {
         return res.status(400).json({ error: 'Verification code is required' });
+      }
+      if (REQUIRE_EULA && req.body?.acceptEula !== true && req.body?.acceptEula !== 'true' && req.body?.acceptEula !== 'on') {
+        return res.status(400).json({ error: 'You must agree to the End User License Agreement' });
       }
 
       const existing = await db.get('SELECT id FROM users WHERE email = ?', [email]);
