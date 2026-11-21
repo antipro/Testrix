@@ -1123,6 +1123,22 @@ pub struct TestrixConfig {
     pub shared_projects: Vec<PersistedShareRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_behavior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_mode: Option<String>,
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: String,
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u16,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_bindings: std::collections::BTreeMap<String, String>,
+}
+
+fn default_ui_font_size() -> String {
+    "small".to_string()
+}
+
+fn default_editor_font_size() -> u16 {
+    13
 }
 
 /// Persisted remote share record stored in `~/.testrix/config.yaml`.
@@ -1174,6 +1190,10 @@ impl Default for TestrixConfig {
             share_access_token: String::new(),
             shared_projects: Vec::new(),
             close_behavior: None,
+            theme_mode: None,
+            ui_font_size: default_ui_font_size(),
+            editor_font_size: default_editor_font_size(),
+            key_bindings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1255,6 +1275,59 @@ pub fn save_config_preferences_at(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Persists theme mode, UI font size, and editor font size into `~/.testrix/config.yaml`.
+pub fn save_config_appearance(
+    theme_mode: Option<&str>,
+    ui_font_size: &str,
+    editor_font_size: u16,
+) -> Result<(), StorageError> {
+    save_config_appearance_at(&config_file_path(), theme_mode, ui_font_size, editor_font_size)
+}
+
+/// Persists theme mode, UI font size, and editor font size into `config_path`.
+pub fn save_config_appearance_at(
+    config_path: &Path,
+    theme_mode: Option<&str>,
+    ui_font_size: &str,
+    editor_font_size: u16,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    cfg.theme_mode = theme_mode
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if !ui_font_size.trim().is_empty() {
+        cfg.ui_font_size = ui_font_size.trim().to_string();
+    }
+    cfg.editor_font_size = editor_font_size.clamp(10, 24);
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Persists custom keybindings into `~/.testrix/config.yaml`.
+pub fn save_config_key_bindings(
+    key_bindings: &std::collections::BTreeMap<String, String>,
+) -> Result<(), StorageError> {
+    save_config_key_bindings_at(&config_file_path(), key_bindings)
+}
+
+/// Persists custom keybindings into `config_path`.
+pub fn save_config_key_bindings_at(
+    config_path: &Path,
+    key_bindings: &std::collections::BTreeMap<String, String>,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    cfg.key_bindings = key_bindings.clone();
     write_yaml_atomic(config_path, &cfg)
 }
 

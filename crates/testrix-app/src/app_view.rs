@@ -26,7 +26,7 @@ use gpui_kit::{
         },
         form::{Field, Form},
         h_flex,
-        input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        input::{Input, InputEvent, InputState, Replace, Search, Textarea, TextareaState},
         menu::{ContextMenuExt as _, PopupMenuItem},
         resizable::{h_resizable, resizable_panel, v_resizable},
         select::{Select, SelectEvent, SelectItem, SelectState},
@@ -61,7 +61,8 @@ use testrix_storage::{
     delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
     init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
     load_workspace_explorer_state, load_workspace_history, load_workspace_sets, load_workspace_tabs,
-    move_request, save_config_preferences, save_config_share_settings, save_config_shared_projects,
+    move_request, save_config_appearance, save_config_key_bindings, save_config_preferences,
+    save_config_share_settings, save_config_shared_projects,
     save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
     save_request_response, save_workspace_explorer_state, save_workspace_history,
     save_workspace_sets, save_workspace_state, save_workspace_tabs,
@@ -70,8 +71,9 @@ use tracing::{error, info};
 
 use crate::{
     actions::{
-        APP_KEY_CONTEXT, CancelRequest, CloseActiveTab, FocusQuickSearch, NewFolder, NewProject,
-        NewRequest, Quit, ReloadWorkspace, SaveActive, SendRequest, ToggleEnvSheet, ToggleTheme,
+        APP_KEY_CONTEXT, CUSTOMIZABLE_SHORTCUTS, CancelRequest, CloseActiveTab, FocusQuickSearch,
+        NewFolder, NewProject, NewRequest, Quit, ReloadWorkspace, SaveActive, SendRequest,
+        ToggleEnvSheet, ToggleTheme, apply_keybindings, effective_shortcut, validate_shortcut,
     },
     container_editor::{ActiveShareRecord, ContainerTabEvent, ContainerTabView},
     env_editor::{EnvEditorEvent, EnvEditorView},
@@ -277,6 +279,44 @@ impl UpgradeStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreferencesSection {
+    General,
+    Appearance,
+    Keybindings,
+    ShareSync,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiFontSize {
+    Small,
+    Large,
+}
+
+impl UiFontSize {
+    fn from_code(code: &str) -> Self {
+        if code.eq_ignore_ascii_case("large") {
+            Self::Large
+        } else {
+            Self::Small
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Large => "large",
+        }
+    }
+
+    fn pixels(self) -> gpui_kit::Pixels {
+        match self {
+            Self::Small => px(16.),
+            Self::Large => px(18.),
+        }
+    }
+}
+
 /// Top-level Testrix desktop workbench window view.
 pub struct TestrixApp {
     focus_handle: FocusHandle,
@@ -297,6 +337,11 @@ pub struct TestrixApp {
     remember_open_tabs: bool,
     remember_responses: bool,
     close_behavior: Option<String>,
+    ui_font_size: UiFontSize,
+    editor_font_size: u16,
+    custom_key_bindings: std::collections::BTreeMap<String, String>,
+    pref_section: PreferencesSection,
+    pref_keymap_error: Option<String>,
     share_settings: ShareSettings,
     active_shares: Vec<ActiveShareRecord>,
     share_sync_count: usize,
@@ -404,6 +449,23 @@ impl TestrixApp {
             "loaded Testrix config on startup"
         );
 
+        let initial_ui_font_size = UiFontSize::from_code(&cfg.ui_font_size);
+        let initial_editor_font_size = cfg.editor_font_size.clamp(10, 24);
+        let initial_key_bindings = cfg.key_bindings.clone();
+        if let Some(mode) = cfg.theme_mode.as_deref() {
+            let target_mode = if mode.eq_ignore_ascii_case("dark") {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            };
+            if cx.theme().mode != target_mode {
+                Theme::change(target_mode, Some(window), cx);
+                crate::theme_helpers::configure_syntax_highlighting(cx);
+            }
+        }
+        Theme::global_mut(cx).font_size = initial_ui_font_size.pixels();
+        apply_keybindings(&initial_key_bindings, cx);
+
         let mut app = Self {
             focus_handle: cx.focus_handle(),
             workspace_dir,
@@ -423,6 +485,11 @@ impl TestrixApp {
             remember_open_tabs: cfg.remember_open_tabs,
             remember_responses: cfg.remember_responses,
             close_behavior: cfg.close_behavior.clone(),
+            ui_font_size: initial_ui_font_size,
+            editor_font_size: initial_editor_font_size,
+            custom_key_bindings: initial_key_bindings,
+            pref_section: PreferencesSection::General,
+            pref_keymap_error: None,
             share_settings: ShareSettings::from(&cfg),
             active_shares: restored_shares,
             share_sync_count: 0,
@@ -908,6 +975,7 @@ impl TestrixApp {
                     };
                     let active_env = self.workspace.active_environment().map(|e| e.doc.clone());
                     let runner = self.runner.clone();
+                    let editor_font_size = f32::from(self.editor_font_size);
                     let tab_view = cx.new(|cx| {
                         let mut v = RequestTabView::new(
                             &stub_proj,
@@ -919,6 +987,7 @@ impl TestrixApp {
                             cx,
                         );
                         v.set_ephemeral(true);
+                        v.set_editor_font_size(editor_font_size, cx);
                         v
                     });
                     let sub = cx.subscribe_in(
@@ -1464,10 +1533,12 @@ impl TestrixApp {
                 } else {
                     None
                 };
+                let editor_font_size = f32::from(self.editor_font_size);
                 let view = cx.new(|cx| {
                     let mut tab = RequestTabView::new(
                         project, &ancestors, req_node, active_env, runner, window, cx,
                     );
+                    tab.set_editor_font_size(editor_font_size, cx);
                     if let Some(snap) = cached_resp {
                         tab.restore_response(snap, window, cx);
                     }
@@ -3058,9 +3129,65 @@ impl TestrixApp {
         });
     }
 
+    fn set_theme_mode(&mut self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
+        Theme::change(mode, Some(window), cx);
+        crate::theme_helpers::configure_syntax_highlighting(cx);
+        Theme::global_mut(cx).font_size = self.ui_font_size.pixels();
+        let mode_str = if mode.is_dark() { "dark" } else { "light" };
+        let _ = save_config_appearance(
+            Some(mode_str),
+            self.ui_font_size.code(),
+            self.editor_font_size,
+        );
+        cx.notify();
+    }
+
+    fn set_ui_font_size(&mut self, size: UiFontSize, cx: &mut Context<Self>) {
+        self.ui_font_size = size;
+        Theme::global_mut(cx).font_size = size.pixels();
+        let mode_str = if cx.theme().is_dark() { "dark" } else { "light" };
+        let _ = save_config_appearance(
+            Some(mode_str),
+            self.ui_font_size.code(),
+            self.editor_font_size,
+        );
+        cx.notify();
+    }
+
+    fn set_editor_font_size(&mut self, size: u16, cx: &mut Context<Self>) {
+        let clamped = size.clamp(10, 24);
+        self.editor_font_size = clamped;
+        for tab in &self.tabs {
+            if let WorkbenchTab::Request(view) = tab {
+                view.update(cx, |v, cx| v.set_editor_font_size(f32::from(clamped), cx));
+            }
+        }
+        let mode_str = if cx.theme().is_dark() { "dark" } else { "light" };
+        let _ = save_config_appearance(
+            Some(mode_str),
+            self.ui_font_size.code(),
+            self.editor_font_size,
+        );
+        cx.notify();
+    }
+
     fn open_preferences_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app_entity = cx.entity();
+        self.pref_keymap_error = None;
         let current_share = self.share_settings.clone();
+
+        let keymap_inputs: Vec<(&'static str, Entity<InputState>)> = CUSTOMIZABLE_SHORTCUTS
+            .iter()
+            .map(|spec| {
+                let current = effective_shortcut(&self.custom_key_bindings, spec);
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder(spec.default_shortcut)
+                        .default_value(current)
+                });
+                (spec.id, input)
+            })
+            .collect();
 
         let server_url_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -3106,12 +3233,34 @@ impl TestrixApp {
         });
 
         window.open_dialog(cx, move |dialog, _, cx| {
-            let remember_tabs = app_entity.read(cx).remember_open_tabs;
-            let remember_responses = app_entity.read(cx).remember_responses;
-            let language_select = app_entity.read(cx).language_select.clone();
-            let close_behavior_select = app_entity.read(cx).close_behavior_select.clone();
-            let share_state = app_entity.read(cx).share_settings.clone();
+            let (
+                remember_tabs,
+                remember_responses,
+                language_select,
+                close_behavior_select,
+                share_state,
+                pref_section,
+                ui_font_size,
+                editor_font_size,
+                custom_key_bindings,
+                keymap_error,
+            ) = {
+                let app = app_entity.read(cx);
+                (
+                    app.remember_open_tabs,
+                    app.remember_responses,
+                    app.language_select.clone(),
+                    app.close_behavior_select.clone(),
+                    app.share_settings.clone(),
+                    app.pref_section,
+                    app.ui_font_size,
+                    app.editor_font_size,
+                    app.custom_key_bindings.clone(),
+                    app.pref_keymap_error.clone(),
+                )
+            };
             let is_logged_in = !share_state.share_token.trim().is_empty();
+            let is_dark = cx.theme().is_dark();
 
             let app_tabs = app_entity.clone();
             let app_resps = app_entity.clone();
@@ -3119,6 +3268,14 @@ impl TestrixApp {
             let app_logout = app_entity.clone();
             let app_cf = app_entity.clone();
             let app_access = app_entity.clone();
+            let app_theme_light = app_entity.clone();
+            let app_theme_dark = app_entity.clone();
+            let app_ui_small = app_entity.clone();
+            let app_ui_large = app_entity.clone();
+            let app_ed_dec = app_entity.clone();
+            let app_ed_inc = app_entity.clone();
+            let app_ed_reset = app_entity.clone();
+            let app_km_reset_all = app_entity.clone();
 
             let srv_for_login = server_url_input.clone();
             let email_for_login = email_input.clone();
@@ -3131,15 +3288,81 @@ impl TestrixApp {
             let access_tok_for_cf = access_token_input.clone();
             let access_tok_for_save = access_token_input.clone();
 
+            let nav_item = |id: &'static str,
+                            label: &'static str,
+                            section: PreferencesSection,
+                            app_handle: Entity<Self>| {
+                let active = pref_section == section;
+                Button::new(id)
+                    .w_full()
+                    .justify_start()
+                    .small()
+                    .when(active, |b| b.primary())
+                    .when(!active, |b| b.ghost())
+                    .label(label)
+                    .on_click(move |_, window, cx| {
+                        app_handle.update(cx, |this, cx| {
+                            this.pref_section = section;
+                            cx.notify();
+                        });
+                        window.refresh();
+                    })
+            };
+
+            let keymap_inputs_for_reset = keymap_inputs.clone();
+
             dialog
                 .title(crate::i18n::t("preferences"))
-                .width(px(540.))
+                .width(px(700.))
                 .child(
-                    v_flex()
+                    h_flex()
+                        .w_full()
+                        .h(px(460.))
+                        .items_stretch()
                         .gap_3()
-                        .max_h(px(540.))
-                        .overflow_y_scrollbar()
                         .child(
+                            v_flex()
+                                .w(px(164.))
+                                .flex_none()
+                                .border_r_1()
+                                .border_color(cx.theme().border)
+                                .pr_3()
+                                .gap_1()
+                                .child(nav_item(
+                                    "pref-nav-general",
+                                    "General",
+                                    PreferencesSection::General,
+                                    app_entity.clone(),
+                                ))
+                                .child(nav_item(
+                                    "pref-nav-appearance",
+                                    "Appearance",
+                                    PreferencesSection::Appearance,
+                                    app_entity.clone(),
+                                ))
+                                .child(nav_item(
+                                    "pref-nav-keybindings",
+                                    "Keybindings",
+                                    PreferencesSection::Keybindings,
+                                    app_entity.clone(),
+                                ))
+                                .child(nav_item(
+                                    "pref-nav-share",
+                                    "Share & Sync",
+                                    PreferencesSection::ShareSync,
+                                    app_entity.clone(),
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .pr_1()
+                                .overflow_y_scrollbar()
+                                .gap_3()
+                                .when(pref_section == PreferencesSection::General, |pane| {
+                                    pane.child(
                             h_flex()
                                 .w_full()
                                 .justify_between()
@@ -3293,12 +3516,355 @@ impl TestrixApp {
                                     ),
                                 ),
                         )
-                        .child(
+                                })
+                                .when(pref_section == PreferencesSection::Appearance, |pane| {
+                                    pane.child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_medium()
+                                                            .child("Theme"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("Switch between Light and Dark appearance"),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        Button::new("pref-theme-light")
+                                                            .small()
+                                                            .icon(IconName::Sun)
+                                                            .label("Light")
+                                                            .when(!is_dark, |b| b.primary())
+                                                            .when(is_dark, |b| b.outline())
+                                                            .on_click(move |_, window, cx| {
+                                                                app_theme_light.update(cx, |this, cx| {
+                                                                    this.set_theme_mode(ThemeMode::Light, window, cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        Button::new("pref-theme-dark")
+                                                            .small()
+                                                            .icon(IconName::Moon)
+                                                            .label("Dark")
+                                                            .when(is_dark, |b| b.primary())
+                                                            .when(!is_dark, |b| b.outline())
+                                                            .on_click(move |_, window, cx| {
+                                                                app_theme_dark.update(cx, |this, cx| {
+                                                                    this.set_theme_mode(ThemeMode::Dark, window, cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_medium()
+                                                            .child("UI Font Size"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("Controls overall interface text size (default: Small)"),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(
+                                                        Button::new("pref-ui-font-small")
+                                                            .small()
+                                                            .label("Small")
+                                                            .when(ui_font_size == UiFontSize::Small, |b| b.primary())
+                                                            .when(ui_font_size != UiFontSize::Small, |b| b.outline())
+                                                            .on_click(move |_, window, cx| {
+                                                                app_ui_small.update(cx, |this, cx| {
+                                                                    this.set_ui_font_size(UiFontSize::Small, cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        Button::new("pref-ui-font-large")
+                                                            .small()
+                                                            .label("Large")
+                                                            .when(ui_font_size == UiFontSize::Large, |b| b.primary())
+                                                            .when(ui_font_size != UiFontSize::Large, |b| b.outline())
+                                                            .on_click(move |_, window, cx| {
+                                                                app_ui_large.update(cx, |this, cx| {
+                                                                    this.set_ui_font_size(UiFontSize::Large, cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_medium()
+                                                            .child("Editor Font Size"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("Request Body, Response Body, and Post-Script"),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .child(
+                                                        Button::new("pref-editor-font-dec")
+                                                            .small()
+                                                            .outline()
+                                                            .label("-")
+                                                            .disabled(editor_font_size <= 10)
+                                                            .on_click(move |_, window, cx| {
+                                                                app_ed_dec.update(cx, |this, cx| {
+                                                                    this.set_editor_font_size(this.editor_font_size.saturating_sub(1), cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(52.))
+                                                            .text_center()
+                                                            .text_sm()
+                                                            .font_medium()
+                                                            .child(format!("{editor_font_size} px")),
+                                                    )
+                                                    .child(
+                                                        Button::new("pref-editor-font-inc")
+                                                            .small()
+                                                            .outline()
+                                                            .label("+")
+                                                            .disabled(editor_font_size >= 24)
+                                                            .on_click(move |_, window, cx| {
+                                                                app_ed_inc.update(cx, |this, cx| {
+                                                                    this.set_editor_font_size(this.editor_font_size.saturating_add(1), cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        Button::new("pref-editor-font-reset")
+                                                            .small()
+                                                            .ghost()
+                                                            .label("Reset")
+                                                            .disabled(editor_font_size == 13)
+                                                            .on_click(move |_, window, cx| {
+                                                                app_ed_reset.update(cx, |this, cx| {
+                                                                    this.set_editor_font_size(13, cx);
+                                                                });
+                                                                window.refresh();
+                                                            }),
+                                                    ),
+                                            ),
+                                    )
+                                })
+                                .when(pref_section == PreferencesSection::Keybindings, |pane| {
+                                    pane.child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                v_flex()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_semibold()
+                                                            .child("Keyboard Shortcuts"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child("Use modifiers like cmd-s, ctrl-shift-f, alt-enter"),
+                                                    ),
+                                            )
+                                            .child(
+                                                Button::new("pref-keymap-reset-all")
+                                                    .small()
+                                                    .outline()
+                                                    .label("Reset All")
+                                                    .disabled(custom_key_bindings.is_empty())
+                                                    .on_click(move |_, window, cx| {
+                                                        for (id, input) in &keymap_inputs_for_reset {
+                                                            if let Some(spec) = CUSTOMIZABLE_SHORTCUTS.iter().find(|s| s.id == *id) {
+                                                                input.update(cx, |st, cx| {
+                                                                    st.set_value(spec.default_shortcut, window, cx);
+                                                                });
+                                                            }
+                                                        }
+                                                        app_km_reset_all.update(cx, |this, cx| {
+                                                            this.custom_key_bindings.clear();
+                                                            this.pref_keymap_error = None;
+                                                            apply_keybindings(&this.custom_key_bindings, cx);
+                                                            let _ = save_config_key_bindings(&this.custom_key_bindings);
+                                                            cx.notify();
+                                                        });
+                                                        window.refresh();
+                                                    }),
+                                            ),
+                                    )
+                                    .when_some(keymap_error, |pane, err| {
+                                        pane.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().danger)
+                                                .child(err),
+                                        )
+                                    })
+                                    .children(CUSTOMIZABLE_SHORTCUTS.iter().enumerate().map(|(ix, spec)| {
+                                        let input = keymap_inputs[ix].1.clone();
+                                        let input_apply = input.clone();
+                                        let input_reset = input.clone();
+                                        let app_apply = app_entity.clone();
+                                        let app_reset = app_entity.clone();
+                                        let is_custom = custom_key_bindings.contains_key(spec.id);
+                                        let action_id = spec.id;
+                                        let default_sc = spec.default_shortcut;
+
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_2()
+                                            .py_1()
+                                            .border_b_1()
+                                            .border_color(cx.theme().border)
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_medium()
+                                                            .child(spec.label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(spec.description),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .flex_none()
+                                                    .child(
+                                                        div()
+                                                            .w(px(124.))
+                                                            .child(Input::new(&input).small()),
+                                                    )
+                                                    .child(
+                                                        Button::new(SharedString::from(format!(
+                                                            "pref-keymap-apply-{action_id}"
+                                                        )))
+                                                        .small()
+                                                        .outline()
+                                                        .label("Apply")
+                                                        .on_click(move |_, window, cx| {
+                                                            let raw = input_apply.read(cx).value().to_string();
+                                                            match validate_shortcut(&raw) {
+                                                                Ok(valid) => {
+                                                                    app_apply.update(cx, |this, cx| {
+                                                                        if valid == default_sc {
+                                                                            this.custom_key_bindings.remove(action_id);
+                                                                        } else {
+                                                                            this.custom_key_bindings.insert(action_id.to_string(), valid);
+                                                                        }
+                                                                        this.pref_keymap_error = None;
+                                                                        apply_keybindings(&this.custom_key_bindings, cx);
+                                                                        let _ = save_config_key_bindings(&this.custom_key_bindings);
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                                Err(err) => {
+                                                                    app_apply.update(cx, |this, cx| {
+                                                                        this.pref_keymap_error = Some(err);
+                                                                        cx.notify();
+                                                                    });
+                                                                }
+                                                            }
+                                                            window.refresh();
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        Button::new(SharedString::from(format!(
+                                                            "pref-keymap-reset-{action_id}"
+                                                        )))
+                                                        .small()
+                                                        .ghost()
+                                                        .label("Reset")
+                                                        .disabled(!is_custom)
+                                                        .on_click(move |_, window, cx| {
+                                                            input_reset.update(cx, |st, cx| {
+                                                                st.set_value(default_sc, window, cx);
+                                                            });
+                                                            app_reset.update(cx, |this, cx| {
+                                                                this.custom_key_bindings.remove(action_id);
+                                                                this.pref_keymap_error = None;
+                                                                apply_keybindings(&this.custom_key_bindings, cx);
+                                                                let _ = save_config_key_bindings(&this.custom_key_bindings);
+                                                                cx.notify();
+                                                            });
+                                                            window.refresh();
+                                                        }),
+                                                    ),
+                                            )
+                                    }))
+                                })
+                                .when(pref_section == PreferencesSection::ShareSync, |pane| {
+                                    pane.child(
                             v_flex()
                                 .gap_2()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(cx.theme().border)
                                 .child(
                                     h_flex()
                                         .justify_between()
@@ -3501,6 +4067,8 @@ impl TestrixApp {
                                             }),
                                     ),
                                 ),
+                        )
+                                }),
                         ),
                 )
                 .footer(
@@ -4858,11 +5426,22 @@ impl TestrixApp {
             view.update(cx, |v, cx| v.cancel_request(cx));
         }
     }
+
+    fn open_active_body_search(&mut self, replace_mode: bool, cx: &mut Context<Self>) {
+        if let Some(ix) = self.active_tab_ix
+            && let Some(WorkbenchTab::Request(view)) = self.tabs.get(ix)
+        {
+            view.update(cx, |v, cx| {
+                if !v.open_request_body_search(replace_mode, cx) {
+                    v.open_response_body_search(cx);
+                }
+            });
+        }
+    }
 }
 
 impl Render for TestrixApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_dark = cx.theme().is_dark();
         let active_project = self.workspace.active_project();
         let active_env = self.workspace.active_environment();
         let enabled_var_count = active_env
@@ -4947,6 +5526,12 @@ impl Render for TestrixApp {
             .on_action(cx.listener(|this, _: &ReloadWorkspace, window, cx| {
                 this.reload_workspace(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &Search, _, cx| {
+                this.open_active_body_search(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Replace, _, cx| {
+                this.open_active_body_search(true, cx);
+            }))
             // Top TitleBar with workspace actions on left and Profile + Env Vars on right-top corner
             .child(
                 TitleBar::new().child(
@@ -4990,26 +5575,6 @@ impl Render for TestrixApp {
                                             .child(proj.doc.name.clone()),
                                     )
                                 })
-                                .child(
-                                    Button::new("toggle-theme-btn")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(if is_dark {
-                                            IconName::Sun
-                                        } else {
-                                            IconName::Moon
-                                        })
-                                        .tooltip("Switch Light / Dark theme")
-                                        .on_click(|_, _, cx| {
-                                            let next = if cx.theme().is_dark() {
-                                                ThemeMode::Light
-                                            } else {
-                                                ThemeMode::Dark
-                                            };
-                                            Theme::change(next, None, cx);
-                                            crate::theme_helpers::configure_syntax_highlighting(cx);
-                                        }),
-                                )
                                 .child(
                                     Button::new("shares-window-btn")
                                         .ghost()

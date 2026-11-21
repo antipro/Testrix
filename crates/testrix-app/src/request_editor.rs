@@ -4,8 +4,9 @@ use std::{
 };
 
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Subscription, Window,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
+    Subscription, Window,
     assets::IconName as LucideIcon,
     component::{
         ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, WindowExt as _,
@@ -13,7 +14,10 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         form::{Field, Form},
         h_flex,
-        input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
+        input::{
+            Editor, EditorState, Input, InputEvent, InputState, Replace, Search, Textarea,
+            TextareaState,
+        },
         resizable::{resizable_panel, v_resizable},
         scroll::ScrollableElement as _,
         select::{Select, SelectEvent, SelectItem, SelectState},
@@ -246,6 +250,7 @@ pub(crate) struct RequestTabView {
     auth_editor: Entity<AuthEditor>,
     post_script_editor: Entity<EditorState>,
     post_script_status: Option<Result<String, String>>,
+    editor_font_size: f32,
     yaml_editor: Entity<EditorState>,
     code_target: CodegenTarget,
     code_editor: Entity<EditorState>,
@@ -409,12 +414,14 @@ impl RequestTabView {
             EditorState::new(window, cx)
                 .language("json")
                 .folding(true)
+                .searchable(true)
                 .default_value(json_text)
         });
         let raw_editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(raw_format.editor_language())
                 .folding(true)
+                .searchable(true)
                 .default_value(raw_text)
         });
         let form_table = cx.new(|cx| {
@@ -461,6 +468,7 @@ impl RequestTabView {
             EditorState::new(window, cx)
                 .language("javascript")
                 .folding(true)
+                .searchable(true)
                 .default_value(doc.request.post_script.clone())
         });
 
@@ -488,6 +496,8 @@ impl RequestTabView {
             EditorState::new(window, cx)
                 .language("json")
                 .folding(true)
+                .searchable(true)
+                .replaceable(false)
                 .default_value("")
         });
 
@@ -540,6 +550,7 @@ impl RequestTabView {
             auth_editor,
             post_script_editor,
             post_script_status: None,
+            editor_font_size: 13.0,
             yaml_editor,
             code_target: CodegenTarget::Curl,
             code_editor,
@@ -1548,6 +1559,16 @@ impl RequestTabView {
         v_flex()
             .size_full()
             .min_h_0()
+            .on_action(cx.listener(|this, _: &Search, _, cx| {
+                if !this.open_request_body_search(false, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Replace, _, cx| {
+                if !this.open_request_body_search(true, cx) {
+                    cx.propagate();
+                }
+            }))
             .child(
                 TabBar::new(SharedString::from(format!("req-sections-{id_base}")))
                     .w_full()
@@ -1678,6 +1699,48 @@ impl RequestTabView {
             )
     }
 
+    fn active_request_body_editor(&self) -> Option<&Entity<EditorState>> {
+        match self.active_request_section {
+            RequestSection::Body if !self.show_body_meta => match self.body_mode {
+                BodyMode::Json => Some(&self.json_editor),
+                BodyMode::Raw => Some(&self.raw_editor),
+                _ => None,
+            },
+            RequestSection::PostScript => Some(&self.post_script_editor),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_editor_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.editor_font_size = size.clamp(10.0, 24.0);
+        cx.notify();
+    }
+
+    pub(crate) fn open_request_body_search(
+        &self,
+        replace_mode: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.active_request_body_editor() else {
+            return false;
+        };
+        editor.update(cx, |ed, cx| ed.open_search(replace_mode, cx));
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn open_response_body_search(&self, cx: &mut Context<Self>) -> bool {
+        if self.active_response_section != ResponseSection::Body
+            || !matches!(self.execution, RequestExecutionState::Completed(_))
+        {
+            return false;
+        }
+        self.response_body_editor
+            .update(cx, |ed, cx| ed.open_search(false, cx));
+        cx.notify();
+        true
+    }
+
     fn render_body_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let id_base = self.request_id.clone();
         let mode_ix = BodyMode::ALL
@@ -1792,6 +1855,24 @@ impl RequestTabView {
                                         ),
                                 )
                             })
+                            .when(
+                                matches!(self.body_mode, BodyMode::Json | BodyMode::Raw)
+                                    && !self.show_body_meta,
+                                |row| {
+                                    row.child(
+                                        Button::new(SharedString::from(format!(
+                                            "body-find-{id_base}"
+                                        )))
+                                        .outline()
+                                        .xsmall()
+                                        .icon(IconName::Search)
+                                        .tooltip("Find (Ctrl/Cmd+F) / Replace (Ctrl/Cmd+H)")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_request_body_search(false, cx);
+                                        })),
+                                    )
+                                },
+                            )
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "body-meta-toggle-{id_base}"
@@ -1825,10 +1906,18 @@ impl RequestTabView {
                         )
                     })
                     .when(self.body_mode == BodyMode::Json, |this| {
-                        this.child(Editor::new(&self.json_editor).size_full())
+                        this.child(
+                            Editor::new(&self.json_editor)
+                                .size_full()
+                                .text_size(px(self.editor_font_size)),
+                        )
                     })
                     .when(self.body_mode == BodyMode::Raw, |this| {
-                        this.child(Editor::new(&self.raw_editor).size_full())
+                        this.child(
+                            Editor::new(&self.raw_editor)
+                                .size_full()
+                                .text_size(px(self.editor_font_size)),
+                        )
                     })
                     .when(self.body_mode == BodyMode::FormUrlEncoded, |this| {
                         this.child(self.form_table.clone())
@@ -1895,6 +1984,7 @@ impl RequestTabView {
     }
 
     fn render_post_script_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let id_base = self.request_id.clone();
         v_flex()
             .size_full()
             .min_h_0()
@@ -1903,6 +1993,7 @@ impl RequestTabView {
                 h_flex()
                     .w_full()
                     .justify_between()
+                    .items_center()
                     .gap_2()
                     .child(
                         div()
@@ -1910,22 +2001,41 @@ impl RequestTabView {
                             .text_color(cx.theme().muted_foreground)
                             .child("Globals: environment, request, response (runs in gpui-shell after response)"),
                     )
-                    .when_some(self.post_script_status.as_ref(), |row, status| match status {
-                        Ok(msg) => row.child(
-                            Tag::new()
-                                .with_variant(TagVariant::Success)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .when_some(self.post_script_status.as_ref(), |row, status| {
+                                match status {
+                                    Ok(msg) => row.child(
+                                        Tag::new()
+                                            .with_variant(TagVariant::Success)
+                                            .outline()
+                                            .xsmall()
+                                            .child(msg.clone()),
+                                    ),
+                                    Err(err) => row.child(
+                                        Tag::new()
+                                            .with_variant(TagVariant::Danger)
+                                            .outline()
+                                            .xsmall()
+                                            .child(err.clone()),
+                                    ),
+                                }
+                            })
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "post-script-find-{id_base}"
+                                )))
                                 .outline()
                                 .xsmall()
-                                .child(msg.clone()),
-                        ),
-                        Err(err) => row.child(
-                            Tag::new()
-                                .with_variant(TagVariant::Danger)
-                                .outline()
-                                .xsmall()
-                                .child(err.clone()),
-                        ),
-                    }),
+                                .icon(IconName::Search)
+                                .tooltip("Find (Ctrl/Cmd+F) / Replace (Ctrl/Cmd+H)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_request_body_search(false, cx);
+                                })),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -1935,7 +2045,11 @@ impl RequestTabView {
                     .border_color(cx.theme().border)
                     .rounded(cx.theme().radius)
                     .overflow_hidden()
-                    .child(Editor::new(&self.post_script_editor).size_full()),
+                    .child(
+                        Editor::new(&self.post_script_editor)
+                            .size_full()
+                            .text_size(px(self.editor_font_size)),
+                    ),
             )
     }
 
@@ -2357,6 +2471,16 @@ impl RequestTabView {
             .size_full()
             .min_h_0()
             .bg(cx.theme().background)
+            .on_action(cx.listener(|this, _: &Search, _, cx| {
+                if !this.open_response_body_search(cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Replace, _, cx| {
+                if !this.open_response_body_search(cx) {
+                    cx.propagate();
+                }
+            }))
             .when_some(
                 match &self.execution {
                     RequestExecutionState::Completed(snapshot) => Some(snapshot),
@@ -2590,49 +2714,64 @@ impl RequestTabView {
                                                     )),
                                             )
                                             .child(
-                                                h_flex().gap_1().children(
-                                                    ResponseBodyFormat::ALL.iter().map(|fmt| {
-                                                        let fmt = *fmt;
-                                                        let snap_click = snap_for_fmt.clone();
+                                                h_flex()
+                                                    .gap_1()
+                                                    .children(
+                                                        ResponseBodyFormat::ALL.iter().map(|fmt| {
+                                                            let fmt = *fmt;
+                                                            let snap_click = snap_for_fmt.clone();
+                                                            Button::new(SharedString::from(format!(
+                                                                "resp-fmt-{id_base}-{}",
+                                                                fmt.label()
+                                                            )))
+                                                            .xsmall()
+                                                            .label(fmt.label())
+                                                            .when(
+                                                                self.response_body_format == fmt,
+                                                                |b| b.primary(),
+                                                            )
+                                                            .when(
+                                                                self.response_body_format != fmt,
+                                                                |b| b.outline(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.response_body_format = fmt;
+                                                                    let lang =
+                                                                        fmt.language(&snap_click);
+                                                                    this.response_body_editor.update(
+                                                                        cx,
+                                                                        |ed, cx| {
+                                                                            ed.set_highlighter(
+                                                                                lang, cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                        }),
+                                                    )
+                                                    .child(
                                                         Button::new(SharedString::from(format!(
-                                                            "resp-fmt-{id_base}-{}",
-                                                            fmt.label()
+                                                            "resp-find-{id_base}"
                                                         )))
+                                                        .outline()
                                                         .xsmall()
-                                                        .label(fmt.label())
-                                                        .when(
-                                                            self.response_body_format == fmt,
-                                                            |b| b.primary(),
-                                                        )
-                                                        .when(
-                                                            self.response_body_format != fmt,
-                                                            |b| b.outline(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.response_body_format = fmt;
-                                                                let lang =
-                                                                    fmt.language(&snap_click);
-                                                                this.response_body_editor.update(
-                                                                    cx,
-                                                                    |ed, cx| {
-                                                                        ed.set_highlighter(
-                                                                            lang, cx,
-                                                                        );
-                                                                    },
-                                                                );
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                    }),
-                                                ),
+                                                        .icon(IconName::Search)
+                                                        .tooltip("Find (Ctrl/Cmd+F)")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.open_response_body_search(cx);
+                                                        })),
+                                                    ),
                                             ),
                                     )
                                     .child(
                                         div().flex_1().min_h_0().child(
                                             Editor::new(&self.response_body_editor)
                                                 .size_full()
-                                                .readonly(true),
+                                                .readonly(true)
+                                                .text_size(px(self.editor_font_size)),
                                         ),
                                     ),
                             )
@@ -3335,6 +3474,18 @@ impl Render for RequestTabView {
             .size_full()
             .min_h_0()
             .bg(cx.theme().background)
+            .on_action(cx.listener(|this, _: &Search, _, cx| {
+                if !this.open_request_body_search(false, cx) && !this.open_response_body_search(cx)
+                {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Replace, _, cx| {
+                if !this.open_request_body_search(true, cx) && !this.open_response_body_search(cx)
+                {
+                    cx.propagate();
+                }
+            }))
             .child(self.render_header_and_url_bar(cx))
             .child(
                 div().flex_1().min_h_0().child(

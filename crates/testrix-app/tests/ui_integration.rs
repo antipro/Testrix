@@ -634,3 +634,297 @@ async fn auto_sync_triggers_on_ctrl_s_after_editing_meta_info(cx: &mut TestAppCo
         "expected updated request YAML in auto-sync upload"
     );
 }
+
+#[gpui_kit::test]
+async fn find_and_replace_in_request_body_and_find_only_in_response_body(
+    cx: &mut TestAppContext,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept http connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let body = r#"{"status":"ok","marker":"resp-alpha","other":"resp-alpha"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let dir = TempDir::new().unwrap();
+    let mut tree = ensure_seeded_workspace(dir.path()).unwrap();
+    {
+        let dev_env = &mut tree.environments[0];
+        let base_var = dev_env
+            .doc
+            .variables
+            .iter_mut()
+            .find(|v| v.key == "base_url")
+            .expect("base_url variable");
+        base_var.value = format!("http://127.0.0.1:{port}");
+        save_environment(dev_env).unwrap();
+    }
+
+    cx.update(init_app);
+    let (handle, app) = open_testrix_test_window(cx, dir.path().to_path_buf());
+
+    // Open a request with a JSON body and switch to Body tab.
+    cx.update_window(handle.into(), |_, window, cx| {
+        app.update(cx, |this, cx| {
+            this.open_node(
+                ExplorerNode::Request {
+                    project_id: "proj-starter".to_string(),
+                    request_id: "req-security-rotate".to_string(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window
+            .within("req-sections-req-security-rotate")
+            .click(3usize, cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("body-find-req-security-rotate").is_some(),
+            "expected Body tab to be active with Find button"
+        );
+        // Switch to JSON body mode (index 1) and focus inside the request view.
+        window
+            .within("req-body-mode-req-security-rotate")
+            .click(1usize, cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("format-json-req-security-rotate").is_some(),
+            "expected JSON body mode to be active"
+        );
+        // Clicking Find button opens SearchPanel in JSON request body.
+        window.click("body-find-req-security-rotate", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("case-insensitive").is_some(),
+            "expected search panel to open when clicking Find in JSON request body"
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.click("req-url-req-security-rotate", cx);
+        window.render_frame(cx);
+
+        // Open Find in JSON request body using Cmd+F.
+        window.press("cmd-f", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("case-insensitive").is_some(),
+            "expected search panel to open on Cmd+F in JSON request body"
+        );
+        assert!(
+            window.try_find("replace-mode").is_some(),
+            "expected replace-mode toggle in JSON request body"
+        );
+
+        // Toggle Replace in JSON request body using Ctrl+H.
+        window.press("ctrl-h", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("replace-one").is_some() && window.try_find("replace-all").is_some(),
+            "expected Replace UI in JSON request body on Ctrl+H"
+        );
+
+        // Close search panel with Escape, then switch to Raw body mode and open Replace via Cmd+H.
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window
+            .within("req-body-mode-req-security-rotate")
+            .click(2usize, cx);
+        window.click("req-url-req-security-rotate", cx);
+        window.render_frame(cx);
+        window.press("cmd-h", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("case-insensitive").is_some()
+                && window.try_find("replace-one").is_some()
+                && window.try_find("replace-all").is_some(),
+            "expected search & replace panel to open on Cmd+H in Raw request body"
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+
+        // Switch to Post-Script tab (index 5) and verify Find & Replace.
+        window
+            .within("req-sections-req-security-rotate")
+            .click(5usize, cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("post-script-find-req-security-rotate").is_some(),
+            "expected Post-Script tab to show Find button"
+        );
+        window.click("req-url-req-security-rotate", cx);
+        window.render_frame(cx);
+        window.press("ctrl-h", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("case-insensitive").is_some()
+                && window.try_find("replace-one").is_some()
+                && window.try_find("replace-all").is_some(),
+            "expected search & replace panel to open on Ctrl+H in Post-Script"
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // Send the request and verify Find (without Replace) in Response body.
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("req-send-req-security-rotate", cx);
+    })
+    .unwrap();
+
+    cx.wait_for(handle.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("resp-find-req-security-rotate").is_some()
+    })
+    .await;
+    server.join().unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("resp-find-req-security-rotate", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("case-insensitive").is_some(),
+            "expected search panel to open in response body"
+        );
+        assert!(
+            window.try_find("replace-mode").is_none(),
+            "read-only response body must not show replace-mode toggle"
+        );
+        // Pressing Ctrl+H / Cmd+H on read-only response body must NOT enable Replace UI.
+        window.press("ctrl-h", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("replace-one").is_none() && window.try_find("replace-all").is_none(),
+            "response body is read-only and must not show Replace UI"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn preferences_navigation_theme_fonts_and_custom_keymap(cx: &mut TestAppContext) {
+    let dir = TempDir::new().unwrap();
+    let _tree = ensure_seeded_workspace(dir.path()).unwrap();
+
+    cx.update(init_app);
+    let (handle, app) = open_testrix_test_window(cx, dir.path().to_path_buf());
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+
+        // Theme toggle button was moved out of the titlebar into Preferences.
+        assert!(
+            window.try_find("toggle-theme-btn").is_none(),
+            "toggle-theme-btn should no longer be in the titlebar"
+        );
+
+        // Open Preferences dialog and verify navigation list.
+        window.click("preferences-btn", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("pref-nav-general").is_some());
+        assert!(window.try_find("pref-nav-appearance").is_some());
+        assert!(window.try_find("pref-nav-keybindings").is_some());
+        assert!(window.try_find("pref-nav-share").is_some());
+
+        // Navigate to Appearance section.
+        window.click("pref-nav-appearance", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("pref-theme-light").is_some());
+        assert!(window.try_find("pref-theme-dark").is_some());
+        assert!(window.try_find("pref-ui-font-small").is_some());
+        assert!(window.try_find("pref-ui-font-large").is_some());
+        assert!(window.try_find("pref-editor-font-inc").is_some());
+        assert!(window.try_find("pref-editor-font-dec").is_some());
+
+        // Default UI font size is Small (16px); switching to Large makes it 18px.
+        assert_eq!(
+            gpui_kit::component::Theme::global(cx).font_size,
+            px(16.)
+        );
+        window.click("pref-ui-font-large", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            gpui_kit::component::Theme::global(cx).font_size,
+            px(18.)
+        );
+        window.click("pref-ui-font-small", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            gpui_kit::component::Theme::global(cx).font_size,
+            px(16.)
+        );
+
+        // Switch theme to Dark and back to Light.
+        window.click("pref-theme-dark", cx);
+        window.render_frame(cx);
+        assert!(gpui_kit::component::Theme::global(cx).is_dark());
+        window.click("pref-theme-light", cx);
+        window.render_frame(cx);
+        assert!(!gpui_kit::component::Theme::global(cx).is_dark());
+
+        // Adjust editor font size.
+        window.click("pref-editor-font-inc", cx);
+        window.render_frame(cx);
+
+        // Navigate to Keybindings section and verify controls.
+        window.click("pref-nav-keybindings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("pref-keymap-apply-find").is_some());
+        assert!(window.try_find("pref-keymap-reset-all").is_some());
+
+        // Close Preferences.
+        window.click("pref-done-btn", cx);
+        window.render_frame(cx);
+
+        // Open a request and verify editor font size is applied cleanly.
+        app.update(cx, |this, cx| {
+            this.open_node(
+                ExplorerNode::Request {
+                    project_id: "proj-starter".to_string(),
+                    request_id: "req-security-rotate".to_string(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window
+            .within("req-sections-req-security-rotate")
+            .click(3usize, cx);
+        window.render_frame(cx);
+        assert!(window.try_find("body-find-req-security-rotate").is_some());
+    })
+    .unwrap();
+}
