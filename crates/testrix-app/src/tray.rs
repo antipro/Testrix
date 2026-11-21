@@ -137,7 +137,7 @@ fn win32_set_window_visibility(window: &Window, show: bool) {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, ShowWindow};
 
-    if let Ok(handle) = window.window_handle()
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
         && let RawWindowHandle::Win32(win32) = handle.as_raw()
     {
         let hwnd = win32.hwnd.get() as HWND;
