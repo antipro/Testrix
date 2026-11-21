@@ -32,6 +32,10 @@ tray-icon.workspace = true
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["tree-sitter-yaml", "tree-sitter-html", "test-support"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [build-dependencies]
 winresource = "0.1"
 

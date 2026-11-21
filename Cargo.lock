@@ -9030,6 +9030,7 @@ dependencies = [
  "gpui-kit",
  "gpui-shell",
  "image",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tempfile",
@@ -9039,6 +9040,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

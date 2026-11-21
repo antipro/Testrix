@@ -81,20 +81,8 @@ use crate::{
     sets_panel::SetsPanelEvent,
     sidebar_pane::{SidebarPane, SidebarPaneEvent, SidebarViewMode},
     theme_helpers::method_badge,
+    tray::hide_window_to_tray,
 };
-
-fn hide_window_to_tray(window: &Window, cx: &App) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = window;
-        cx.hide();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = cx;
-        window.minimize_window();
-    }
-}
 
 fn app_titlebar_icon() -> Arc<Image> {
     static ICON: OnceLock<Arc<Image>> = OnceLock::new();

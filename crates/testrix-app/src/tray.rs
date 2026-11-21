@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gpui_kit::{AnyWindowHandle, App, Entity};
+use gpui_kit::{AnyWindowHandle, App, Entity, Window};
 use tracing::warn;
 use tray_icon::{
     Icon as TrayIconImage, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -95,6 +95,7 @@ pub fn init_system_tray(
                 let _ = cx.update(|cx| {
                     cx.activate(true);
                     let _ = window_handle.update(cx, |_, window, _| {
+                        show_window_from_tray(window);
                         window.activate_window();
                     });
                 });
@@ -102,6 +103,50 @@ pub fn init_system_tray(
         }
     })
     .detach();
+}
+
+/// Hides the main window into the system tray without leaving a taskbar button on Windows.
+pub(crate) fn hide_window_to_tray(window: &Window, cx: &App) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        cx.hide();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = cx;
+        win32_set_window_visibility(window, false);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = cx;
+        window.minimize_window();
+    }
+}
+
+fn show_window_from_tray(window: &Window) {
+    #[cfg(target_os = "windows")]
+    win32_set_window_visibility(window, true);
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+}
+
+#[cfg(target_os = "windows")]
+fn win32_set_window_visibility(window: &Window, show: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, ShowWindow};
+
+    if let Ok(handle) = window.window_handle()
+        && let RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        let hwnd = win32.hwnd.get() as HWND;
+        let cmd = if show { SW_SHOW } else { SW_HIDE };
+        // SAFETY: `hwnd` is obtained from the live GPUI `Window` on the owning UI thread.
+        unsafe {
+            ShowWindow(hwnd, cmd);
+        }
+    }
 }
 
 fn load_tray_icon() -> Result<TrayIconImage, String> {
