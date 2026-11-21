@@ -4,6 +4,20 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v0.7.0] - 2026-11-21
+
+### Added
+- Add Find (`Ctrl/Cmd+F`) in Request Body (JSON and Raw), Response Body, and Post-Script, plus Replace (`Ctrl/Cmd+H`) in Request Body and Post-Script.
+- Add a left navigation list (`General`, `Appearance`, `Keybindings`, `Share & Sync`) to the Preferences window.
+- Add UI Font Size (`Small` / `Large`) and Editor Font Size (`10`–`24 px` for Request Body, Response Body, and Post-Script) controls in Preferences.
+- Add customizable Key Map settings in Preferences with per-action Apply/Reset and Reset All.
+
+### Changed
+- Move the Light/Dark theme toggle from the titlebar into the Preferences **Appearance** section and persist theme, font sizes, and keybindings in `config.yaml`.
+
+### Fixed
+- Hide the Windows taskbar button when minimizing to the system tray and disambiguate `HasWindowHandle::window_handle`.
+
 ## [v0.6.0] - 2026-11-20
 
 ### Added
