@@ -614,7 +614,7 @@ async function start() {
   });
 }
 
-if (require.main === module) {
+if (require.main === module || !process.env.TESTRIX_NO_AUTOSTART) {
   start().catch((err) => {
     console.error('Failed to start Testrix Share Server:', err);
     process.exit(1);
