@@ -456,4 +456,49 @@ mod tests {
         assert_eq!(txt_res.conflicts, vec!["notes.txt".to_string()]);
         assert!(txt_res.merged_files.get("notes.txt").unwrap().contains("<<<<<<<"));
     }
+
+    #[test]
+    fn merges_environment_yaml_variables_from_fresh_workspace_and_remote() {
+        use std::collections::BTreeMap;
+        use testrix_core::{EnvVariable, EnvironmentDoc};
+
+        let mut local_env = EnvironmentDoc::new("env-local-1", "Development");
+        local_env
+            .variables
+            .push(EnvVariable::new("LOCAL_ONLY", "local-val"));
+
+        let mut remote_env = EnvironmentDoc::new("env-remote-1", "Development");
+        remote_env
+            .variables
+            .push(EnvVariable::new("API_KEY", "secret-123"));
+        remote_env
+            .variables
+            .push(EnvVariable::new("BASE_URL", "https://api.example.com"));
+
+        let base = BTreeMap::new();
+        let mut local = BTreeMap::new();
+        local.insert(
+            "environments/development.env.yaml".to_string(),
+            to_yaml_pretty(&local_env).unwrap(),
+        );
+        let mut remote = BTreeMap::new();
+        remote.insert(
+            "environments/development.env.yaml".to_string(),
+            to_yaml_pretty(&remote_env).unwrap(),
+        );
+
+        let merged = three_way_merge_trees(&base, &local, &remote).unwrap();
+        assert!(merged.conflicts.is_empty());
+        assert!(merged.local_changed);
+        assert!(merged.remote_changed);
+
+        let merged_yaml = merged
+            .merged_files
+            .get("environments/development.env.yaml")
+            .unwrap();
+        let merged_doc: EnvironmentDoc = yaml_serde::from_str(merged_yaml).unwrap();
+        assert!(merged_doc.variables.iter().any(|v| v.key == "API_KEY" && v.value == "secret-123"));
+        assert!(merged_doc.variables.iter().any(|v| v.key == "BASE_URL" && v.value == "https://api.example.com"));
+        assert!(merged_doc.variables.iter().any(|v| v.key == "LOCAL_ONLY" && v.value == "local-val"));
+    }
 }

@@ -639,6 +639,18 @@ pub fn three_way_merge_trees(
         match (l, r) {
             (Some(lc), Some(rc)) => {
                 let bc = b.map(String::as_str).unwrap_or("");
+                if path.ends_with(".env.yaml")
+                    && let Some(merged_env) = merge_environment_yaml_three_way(bc, lc, rc)
+                {
+                    if merged_env != *lc {
+                        local_changed = true;
+                    }
+                    if merged_env != *rc {
+                        remote_changed = true;
+                    }
+                    merged_files.insert(path, merged_env);
+                    continue;
+                }
                 let (merged, has_conflict) = merge_file_three_way(bc, lc, rc)?;
                 let is_yaml = path.ends_with(".yaml") || path.ends_with(".yml");
                 if has_conflict && is_yaml {
@@ -688,4 +700,112 @@ pub fn three_way_merge_trees(
         local_changed,
         remote_changed,
     })
+}
+
+fn merge_environment_yaml_three_way(
+    base_yaml: &str,
+    local_yaml: &str,
+    remote_yaml: &str,
+) -> Option<String> {
+    let local_doc: testrix_core::EnvironmentDoc = yaml_serde::from_str(local_yaml).ok()?;
+    let remote_doc: testrix_core::EnvironmentDoc = yaml_serde::from_str(remote_yaml).ok()?;
+    let base_doc: Option<testrix_core::EnvironmentDoc> = if base_yaml.trim().is_empty() {
+        None
+    } else {
+        yaml_serde::from_str(base_yaml).ok()
+    };
+
+    let local_map: BTreeMap<String, testrix_core::EnvVariable> = local_doc
+        .variables
+        .iter()
+        .map(|v| (v.key.clone(), v.clone()))
+        .collect();
+    let remote_map: BTreeMap<String, testrix_core::EnvVariable> = remote_doc
+        .variables
+        .iter()
+        .map(|v| (v.key.clone(), v.clone()))
+        .collect();
+
+    let mut merged_vars: Vec<testrix_core::EnvVariable> = Vec::new();
+    let mut seen_keys = std::collections::BTreeSet::new();
+
+    if let Some(base) = base_doc {
+        let base_map: BTreeMap<String, testrix_core::EnvVariable> = base
+            .variables
+            .iter()
+            .map(|v| (v.key.clone(), v.clone()))
+            .collect();
+
+        let mut all_keys = Vec::new();
+        for v in remote_doc
+            .variables
+            .iter()
+            .chain(local_doc.variables.iter())
+            .chain(base.variables.iter())
+        {
+            if seen_keys.insert(v.key.clone()) {
+                all_keys.push(v.key.clone());
+            }
+        }
+
+        for k in all_keys {
+            let b = base_map.get(&k);
+            let l = local_map.get(&k);
+            let r = remote_map.get(&k);
+            let chosen = if l == r {
+                l.cloned()
+            } else if b == l {
+                r.cloned()
+            } else if b == r {
+                l.cloned()
+            } else {
+                // Both modified: prefer non-empty local, fallback to remote.
+                match (l, r) {
+                    (Some(lv), Some(rv)) => {
+                        if lv.value.trim().is_empty() && !rv.value.trim().is_empty() {
+                            Some(rv.clone())
+                        } else {
+                            Some(lv.clone())
+                        }
+                    }
+                    (Some(lv), None) => Some(lv.clone()),
+                    (None, Some(rv)) => Some(rv.clone()),
+                    (None, None) => None,
+                }
+            };
+            if let Some(var) = chosen {
+                merged_vars.push(var);
+            }
+        }
+    } else {
+        // No common base (e.g. fresh workspace syncing with existing remote):
+        // preserve all remote variables and add any extra local variables.
+        for rv in &remote_doc.variables {
+            seen_keys.insert(rv.key.clone());
+            if let Some(lv) = local_map.get(&rv.key)
+                && rv.value.trim().is_empty()
+                && !lv.value.trim().is_empty()
+            {
+                merged_vars.push(lv.clone());
+            } else {
+                merged_vars.push(rv.clone());
+            }
+        }
+        for lv in &local_doc.variables {
+            if seen_keys.insert(lv.key.clone()) {
+                merged_vars.push(lv.clone());
+            }
+        }
+    }
+
+    let mut merged_doc = remote_doc;
+    if merged_doc.name.trim().is_empty() {
+        merged_doc.name = local_doc.name;
+    }
+    if merged_doc.description.trim().is_empty() {
+        merged_doc.description = local_doc.description;
+    }
+    merged_doc.variables = merged_vars;
+
+    yaml_serde::to_string(&merged_doc).ok()
 }
