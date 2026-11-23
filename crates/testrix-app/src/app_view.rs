@@ -573,6 +573,7 @@ impl TestrixApp {
         app.sync_sidebars(Some(&saved_expanded), cx);
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
+        app.maybe_auto_git_sync(window, cx);
         if !cfg!(debug_assertions) {
             app.check_for_updates(false, window, cx);
         }
@@ -1716,6 +1717,7 @@ impl TestrixApp {
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
+                    self.maybe_auto_git_sync(window, cx);
                 }
             }
             RequestTabEvent::OpenAuthSource { project_id, node } => {
@@ -2068,6 +2070,7 @@ impl TestrixApp {
                                             }
                                             this.sync_sidebars(None, cx);
                                             this.refresh_dirty_indicators(cx);
+                                            this.maybe_auto_git_sync(window, cx);
                                         });
                                         window.close_dialog(cx);
                                         window.push_notification(
@@ -2132,6 +2135,7 @@ impl TestrixApp {
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
+                    self.maybe_auto_git_sync(window, cx);
                 }
             }
             ContainerTabEvent::SaveFolder {
@@ -4258,6 +4262,7 @@ impl TestrixApp {
                                                                         this.share_settings.share_token = login.token;
                                                                         let _ = save_config_share_settings(&this.share_settings);
                                                                         this.sync_share_settings_to_tabs(cx);
+                                                                        this.maybe_auto_git_sync(window, cx);
                                                                         cx.notify();
                                                                     });
                                                                     window.push_notification(
@@ -5065,6 +5070,7 @@ impl TestrixApp {
                 self.refresh_profile_selector(window, cx);
                 self.sync_env_editor(window, cx);
                 self.open_initial_request(window, cx);
+                self.maybe_auto_git_sync(window, cx);
                 cx.notify();
             }
             Err(err) => {
@@ -5073,25 +5079,41 @@ impl TestrixApp {
         }
     }
 
-    fn open_git_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let default_slug = self
-            .workspace_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("workspace")
-            .to_string();
+    fn effective_sync_credentials(&self) -> (String, String, String, String) {
+        let server_url = if !self.sync_settings.sync_server_url.trim().is_empty() {
+            self.sync_settings.sync_server_url.trim().to_string()
+        } else {
+            self.share_settings.share_server_url.trim().to_string()
+        };
+        let email = if !self.sync_settings.sync_email.trim().is_empty() {
+            self.sync_settings.sync_email.trim().to_string()
+        } else {
+            self.share_settings.share_email.trim().to_string()
+        };
+        let token = if !self.sync_settings.sync_token.trim().is_empty() {
+            self.sync_settings.sync_token.trim().to_string()
+        } else {
+            self.share_settings.share_token.trim().to_string()
+        };
+        let repo_slug = if !self.sync_settings.sync_repo_slug.trim().is_empty() {
+            self.sync_settings.sync_repo_slug.trim().to_string()
+        } else {
+            self.workspace_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("workspace")
+                .to_string()
+        };
+        (server_url, email, token, repo_slug)
+    }
 
-        let current_url = if self.sync_settings.sync_server_url.trim().is_empty() {
+    fn open_git_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (current_url, current_email, _, current_slug) = self.effective_sync_credentials();
+        let current_url = if current_url.is_empty() {
             "http://localhost:3456".to_string()
         } else {
-            self.sync_settings.sync_server_url.clone()
-        };
-        let current_email = self.sync_settings.sync_email.clone();
-        let current_slug = if self.sync_settings.sync_repo_slug.trim().is_empty() {
-            default_slug
-        } else {
-            self.sync_settings.sync_repo_slug.clone()
+            current_url
         };
 
         let server_url_input = cx.new(|cx| {
@@ -5118,8 +5140,8 @@ impl TestrixApp {
         let app_entity = cx.entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let app_ref = app_entity.read(cx);
-            let logged_in = !app_ref.sync_settings.sync_token.trim().is_empty();
-            let signed_in_email = app_ref.sync_settings.sync_email.clone();
+            let (_, signed_in_email, eff_token, _) = app_ref.effective_sync_credentials();
+            let logged_in = !eff_token.is_empty();
             let syncing = app_ref.sync_in_progress;
 
             let app_login = app_entity.clone();
@@ -5281,16 +5303,36 @@ impl TestrixApp {
                 match res {
                     Ok(Ok(login)) => {
                         app_entity.update(cx, |this, cx| {
-                            this.sync_settings.sync_token = login.token;
+                            this.sync_settings.sync_token = login.token.clone();
                             this.sync_settings.sync_email = login.email.clone();
+                            if this.sync_settings.sync_repo_slug.trim().is_empty() {
+                                this.sync_settings.sync_repo_slug = this
+                                    .workspace_dir
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or("workspace")
+                                    .to_string();
+                            }
                             let _ = save_config_sync_settings(&this.sync_settings);
+                            if this.share_settings.share_token.trim().is_empty() {
+                                if !this.sync_settings.sync_server_url.trim().is_empty() {
+                                    this.share_settings.share_server_url =
+                                        this.sync_settings.sync_server_url.clone();
+                                }
+                                this.share_settings.share_email = login.email.clone();
+                                this.share_settings.share_token = login.token;
+                                let _ = save_config_share_settings(&this.share_settings);
+                                this.sync_share_settings_to_tabs(cx);
+                            }
+                            this.start_bidirectional_git_sync(window, cx);
                             cx.notify();
                         });
+                        window.close_dialog(cx);
                         window.push_notification(
-                            format!("Signed in to Git Sync as {}.", login.email),
+                            format!("Signed in to Git Sync as {}. Starting sync…", login.email),
                             cx,
                         );
-                        window.refresh();
                     }
                     Ok(Err(err)) => {
                         window.push_notification(format!("Git Sync sign in failed: {err}"), cx);
@@ -5304,13 +5346,31 @@ impl TestrixApp {
         .detach();
     }
 
+    fn maybe_auto_git_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (server_url, _, token, repo_slug) = self.effective_sync_credentials();
+        if !server_url.is_empty()
+            && !token.is_empty()
+            && !repo_slug.is_empty()
+            && !self.sync_in_progress
+        {
+            self.start_bidirectional_git_sync_with_options(false, window, cx);
+        }
+    }
+
     fn start_bidirectional_git_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_bidirectional_git_sync_with_options(true, window, cx);
+    }
+
+    fn start_bidirectional_git_sync_with_options(
+        &mut self,
+        notify_when_up_to_date: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sync_in_progress {
             return;
         }
-        let server_url = self.sync_settings.sync_server_url.trim().to_string();
-        let token = self.sync_settings.sync_token.trim().to_string();
-        let repo_slug = self.sync_settings.sync_repo_slug.trim().to_string();
+        let (server_url, _, token, repo_slug) = self.effective_sync_credentials();
         if server_url.is_empty() || token.is_empty() || repo_slug.is_empty() {
             window.push_notification(
                 "Please configure Sync Server URL, Repository Slug, and sign in first.",
@@ -5399,10 +5459,12 @@ impl TestrixApp {
                                     cx,
                                 );
                             } else if !merge.local_changed && !merge.remote_changed {
-                                window.push_notification(
-                                    "Already up to date with node-web.",
-                                    cx,
-                                );
+                                if notify_when_up_to_date {
+                                    window.push_notification(
+                                        "Already up to date with node-web.",
+                                        cx,
+                                    );
+                                }
                             } else {
                                 window.push_notification(
                                     format!(
