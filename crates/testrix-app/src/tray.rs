@@ -47,7 +47,7 @@ pub fn acquire_single_instance_or_activate_existing() -> Option<SingleInstanceGu
     {
         use std::ptr::null;
         use windows_sys::Win32::Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError,
         };
         use windows_sys::Win32::System::Threading::{
             CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent,

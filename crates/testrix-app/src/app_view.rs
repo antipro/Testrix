@@ -2362,7 +2362,7 @@ impl TestrixApp {
         let app_entity = cx.entity();
         let remember_state = std::rc::Rc::new(Cell::new(true));
 
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, _, _cx| {
             let app_cancel = app_entity.clone();
             let app_tray = app_entity.clone();
             let app_quit = app_entity.clone();
