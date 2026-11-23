@@ -5211,7 +5211,7 @@ impl TestrixApp {
 
             dialog
                 .title("Sign Out")
-                .width(px(460.))
+                .width(px(540.))
                 .child(
                     v_flex().gap_2().child(
                         div().text_sm().child(format!(
@@ -5220,17 +5220,21 @@ impl TestrixApp {
                     ),
                 )
                 .footer(
-                    DialogFooter::new()
-                        .gap_2()
-                        .child(
-                            DialogClose::new()
-                                .child(Button::new("logout-cancel").label("Cancel").outline()),
-                        )
-                        .child(
-                            Button::new("logout-keep-cloud")
-                                .outline()
-                                .label("Sign Out Only")
-                                .on_click(move |_, window, cx| {
+                    DialogFooter::new().child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                DialogClose::new()
+                                    .child(Button::new("logout-cancel").label("Cancel").outline()),
+                            )
+                            .child(
+                                Button::new("logout-keep-cloud")
+                                    .outline()
+                                    .label("Sign Out Only")
+                                    .on_click(move |_, window, cx| {
                                     app_keep.update(cx, |this, cx| {
                                         this.sync_settings.sync_token.clear();
                                         this.share_settings.share_token.clear();
@@ -5247,7 +5251,7 @@ impl TestrixApp {
                         .child(
                             Button::new("logout-delete-cloud")
                                 .danger()
-                                .label("Delete Cloud Data & Sign Out")
+                                .label("Delete & Sign Out")
                                 .on_click(move |_, window, cx| {
                                     let srv_sync = del_srv.clone();
                                     let tok_sync = del_token.clone();
@@ -5327,6 +5331,7 @@ impl TestrixApp {
                                     .detach();
                                 }),
                         ),
+                    ),
                 )
         });
     }
