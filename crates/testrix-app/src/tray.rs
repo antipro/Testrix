@@ -3,11 +3,115 @@ use std::time::Duration;
 use gpui_kit::{AnyWindowHandle, App, Entity, Window};
 use tracing::warn;
 use tray_icon::{
-    Icon as TrayIconImage, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    Icon as TrayIconImage, MouseButton, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem},
 };
 
 use crate::TestrixApp;
+
+/// RAII guard for the primary GUI instance (enforces single-instance on Windows).
+pub struct SingleInstanceGuard {
+    #[cfg(target_os = "windows")]
+    mutex_handle: isize,
+    #[cfg(target_os = "windows")]
+    event_handle: isize,
+}
+
+#[cfg(target_os = "windows")]
+static SHOW_WINDOW_EVENT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(target_os = "windows")]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+
+        SHOW_WINDOW_EVENT.store(0, std::sync::atomic::Ordering::Release);
+        // SAFETY: Handles were created by `CreateMutexW`/`CreateEventW` and are owned by this guard.
+        unsafe {
+            if self.event_handle != 0 {
+                CloseHandle(self.event_handle as HANDLE);
+            }
+            if self.mutex_handle != 0 {
+                CloseHandle(self.mutex_handle as HANDLE);
+            }
+        }
+    }
+}
+
+/// Ensures only a single GUI instance runs on Windows.
+///
+/// If another instance is already running, signals it to restore/focus its window and returns
+/// `None` so the duplicate process can exit immediately without creating a second tray icon.
+pub fn acquire_single_instance_or_activate_existing() -> Option<SingleInstanceGuard> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ptr::null;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+
+        let mutex_name: Vec<u16> = "Local\\TestrixSingleInstanceMutex\0".encode_utf16().collect();
+        let event_name: Vec<u16> = "Local\\TestrixShowWindowEvent\0".encode_utf16().collect();
+
+        // SAFETY: Null-terminated UTF-16 strings are valid for the duration of the Win32 calls.
+        unsafe {
+            let mutex = CreateMutexW(null(), 1, mutex_name.as_ptr());
+            if mutex.is_null() {
+                // Fail open if Win32 mutex creation fails unexpectedly.
+                return Some(SingleInstanceGuard {
+                    mutex_handle: 0,
+                    event_handle: 0,
+                });
+            }
+
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                AllowSetForegroundWindow(ASFW_ANY);
+                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+                if !ev.is_null() {
+                    SetEvent(ev);
+                    CloseHandle(ev);
+                }
+                CloseHandle(mutex);
+                return None;
+            }
+
+            let ev = CreateEventW(null(), 0, 0, event_name.as_ptr());
+            let ev_raw = if ev.is_null() { 0 } else { ev as isize };
+            SHOW_WINDOW_EVENT.store(ev_raw, std::sync::atomic::Ordering::Release);
+            Some(SingleInstanceGuard {
+                mutex_handle: mutex as isize,
+                event_handle: ev_raw,
+            })
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(SingleInstanceGuard {})
+    }
+}
+
+fn poll_show_window_event() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let ev = SHOW_WINDOW_EVENT.load(std::sync::atomic::Ordering::Acquire);
+        if ev == 0 {
+            return false;
+        }
+        // SAFETY: `ev` is a valid Win32 event handle owned by `SingleInstanceGuard`.
+        unsafe { WaitForSingleObject(ev as HANDLE, 0) == WAIT_OBJECT_0 }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
 
 /// Initializes the cross-platform system tray icon and its Show / Quit event loop.
 ///
@@ -45,16 +149,15 @@ pub fn init_system_tray(
         }
     };
 
-    // Keep the tray icon alive for the lifetime of the application on the main thread.
-    std::mem::forget(Box::new(tray) as Box<TrayIcon>);
-
     cx.spawn(async move |cx| {
+        // Keep the tray icon alive for the lifetime of the loop and drop it cleanly on quit.
+        let _tray = tray;
         loop {
             cx.background_executor()
                 .timer(Duration::from_millis(120))
                 .await;
 
-            let mut should_show = false;
+            let mut should_show = poll_show_window_event();
             let mut should_quit = false;
 
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {

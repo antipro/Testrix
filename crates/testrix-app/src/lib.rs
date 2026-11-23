@@ -19,4 +19,4 @@ mod theme_helpers;
 mod tray;
 
 pub use app_view::{TestrixApp, init_app, open_main_window};
-pub use tray::init_system_tray;
+pub use tray::{SingleInstanceGuard, acquire_single_instance_or_activate_existing, init_system_tray};

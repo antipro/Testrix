@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 testrix-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

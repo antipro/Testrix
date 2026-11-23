@@ -9042,6 +9042,7 @@ dependencies = [
  "tray-icon",
  "windows-sys 0.61.2",
  "winresource",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -9077,6 +9078,7 @@ name = "testrix-storage"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tempfile",
  "testrix-core",
  "thiserror 2.0.21",

@@ -52,20 +52,25 @@ use testrix_core::{
 use testrix_http::{
     DownloadProgressState, HttpRunner, OneshotTryRecvError, ReleaseInfo, ShareChannel, ShareFile,
     check_for_upgrade, collect_project_yaml_files, dispatch_share_future, download_release_asset,
-    launch_installer, login_testrix_server, revoke_cloudflare_r2_share,
-    revoke_testrix_server_share, upload_to_cloudflare_r2, upload_to_testrix_server,
+    fetch_remote_sync_state, launch_installer, login_sync_server, login_testrix_server,
+    push_merged_sync_state, revoke_cloudflare_r2_share, revoke_testrix_server_share,
+    upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
-    PersistedShareRecord, ShareSettings, clear_saved_responses, create_environment, create_folder,
-    create_project, create_request, delete_environment, delete_folder, delete_project,
-    delete_request, duplicate_request, ensure_seeded_workspace, import_project_bundle,
-    init_or_load_config, load_request_response, load_workspace, load_workspace_environments,
-    load_workspace_explorer_state, load_workspace_history, load_workspace_sets, load_workspace_tabs,
-    move_request, save_config_appearance, save_config_key_bindings, save_config_preferences,
-    save_config_share_settings, save_config_shared_projects,
-    save_config_workspace_dir, save_environment, save_folder, save_project, save_request,
-    save_request_response, save_workspace_explorer_state, save_workspace_history,
-    save_workspace_sets, save_workspace_state, save_workspace_tabs,
+    GitCommitInfo, PersistedShareRecord, ShareSettings, SyncSettings,
+    apply_synced_files_and_commit, clear_saved_responses, collect_workspace_tracked_files,
+    commit_workspace_change, create_environment, create_folder, create_project, create_request,
+    delete_environment, delete_folder, delete_project, delete_request, duplicate_request,
+    ensure_seeded_workspace, ensure_workspace_git_repo, import_project_bundle, init_or_load_config,
+    list_file_commits, load_request_response, load_sync_base, load_workspace,
+    load_workspace_environments, load_workspace_explorer_state, load_workspace_history,
+    load_workspace_sets, load_workspace_tabs, move_request, read_file_at_commit,
+    restore_file_from_commit, save_config_appearance, save_config_key_bindings,
+    save_config_preferences, save_config_share_settings, save_config_shared_projects,
+    save_config_sync_settings, save_config_workspace_dir, save_environment, save_folder,
+    save_project, save_request, save_request_response, save_sync_base,
+    save_workspace_explorer_state, save_workspace_history, save_workspace_sets,
+    save_workspace_state, save_workspace_tabs, three_way_merge_trees,
 };
 use tracing::{error, info};
 
@@ -345,6 +350,8 @@ pub struct TestrixApp {
     share_settings: ShareSettings,
     active_shares: Vec<ActiveShareRecord>,
     share_sync_count: usize,
+    sync_settings: SyncSettings,
+    sync_in_progress: bool,
     quit_after_sync: bool,
     force_quit: bool,
     exit_prompt_open: bool,
@@ -361,7 +368,12 @@ impl Focusable for TestrixApp {
 impl TestrixApp {
     pub fn new(workspace_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = match ensure_seeded_workspace(&workspace_dir) {
-            Ok(tree) => tree,
+            Ok(tree) => {
+                if let Err(err) = ensure_workspace_git_repo(&tree.root_dir) {
+                    tracing::warn!(error = %err, "failed initializing workspace git repo");
+                }
+                tree
+            }
             Err(err) => {
                 error!(error = %err, "failed to load workspace");
                 WorkspaceTree {
@@ -493,6 +505,8 @@ impl TestrixApp {
             share_settings: ShareSettings::from(&cfg),
             active_shares: restored_shares,
             share_sync_count: 0,
+            sync_settings: SyncSettings::from(&cfg),
+            sync_in_progress: false,
             quit_after_sync: false,
             force_quit: false,
             exit_prompt_open: false,
@@ -1316,8 +1330,10 @@ impl TestrixApp {
             window.push_notification(format!("Failed saving request: {err}"), cx);
             return;
         }
+        let req_name = created.doc.name.clone();
         let req_id = created.doc.id.clone();
         insert_request_into_project(proj, target_folder_id, created);
+        self.commit_git_change(&format!("Create request: {req_name}"));
         self.sync_sidebars(None, cx);
         self.open_node(
             ExplorerNode::Request {
@@ -1354,6 +1370,7 @@ impl TestrixApp {
                         window.push_notification(format!("Failed saving profile: {err}"), cx);
                         return;
                     }
+                    let env_name = env_node.doc.name.clone();
                     self.workspace
                         .environments
                         .sort_by_key(|a| a.doc.name.to_lowercase());
@@ -1362,6 +1379,7 @@ impl TestrixApp {
                             propagate_variable_rewrites_in_project(proj, &renamed_keys, true);
                         }
                     }
+                    self.commit_git_change(&format!("Update environment: {env_name}"));
                     self.refresh_profile_selector(window, cx);
                     self.sync_env_editor(window, cx);
                     if is_active && !renamed_keys.is_empty() {
@@ -1378,10 +1396,12 @@ impl TestrixApp {
                 match create_environment(&self.workspace.root_dir, &name) {
                     Ok(env_node) => {
                         let new_id = env_node.doc.id.clone();
+                        let env_name = env_node.doc.name.clone();
                         self.workspace.environments.push(env_node);
                         self.workspace
                             .environments
                             .sort_by_key(|a| a.doc.name.to_lowercase());
+                        self.commit_git_change(&format!("Create environment: {env_name}"));
                         self.select_environment(Some(new_id.clone()), window, cx);
                         self.sync_env_editor(window, cx);
                         self.env_editor.update(cx, |editor, cx| {
@@ -1408,6 +1428,7 @@ impl TestrixApp {
                     self.workspace.environments.insert(pos, removed);
                     return;
                 }
+                self.commit_git_change(&format!("Delete environment: {}", removed.doc.name));
                 if self.workspace.active_environment_id.as_deref() == Some(&env_id) {
                     self.workspace.active_environment_id = self
                         .workspace
@@ -1649,8 +1670,10 @@ impl TestrixApp {
                         window.push_notification(format!("Failed saving YAML request: {err}"), cx);
                         return;
                     }
+                    let req_name = req_node.doc.name.clone();
                     let req_file_path = req_node.file_path.clone();
                     first_proj.requests.push(req_node);
+                    self.commit_git_change(&format!("Create request: {req_name}"));
                     let old_key = format!("req:{request_id}");
                     if let Some(WorkbenchTab::Request(tab)) =
                         self.tabs.iter().find(|t| t.key(cx) == old_key)
@@ -1673,8 +1696,10 @@ impl TestrixApp {
                         window.push_notification(format!("Failed saving YAML request: {err}"), cx);
                         return;
                     }
+                    let req_name = req_node.doc.name.clone();
                     let req_file_path = req_node.file_path.clone();
                     let changed_file = share_file_from_disk(&proj.root_dir, &req_file_path);
+                    self.commit_git_change(&format!("Update request: {req_name}"));
                     info!(
                         project_id = %project_id,
                         request_id = %request_id,
@@ -1719,6 +1744,8 @@ impl TestrixApp {
                             );
                             return;
                         }
+                        let env_name = env_node.doc.name.clone();
+                        self.commit_git_change(&format!("Update environment: {env_name}"));
                         self.sync_env_editor(window, cx);
                         self.sync_all_tabs(window, cx);
                     }
@@ -1756,7 +1783,302 @@ impl TestrixApp {
                 let _ = save_workspace_history(&self.workspace.root_dir, &self.history_entries);
                 self.sync_sidebars(None, cx);
             }
+            RequestTabEvent::OpenRequestHistory {
+                project_id,
+                request_id,
+                file_path,
+                request_name,
+            } => {
+                self.open_request_git_history_dialog(
+                    project_id,
+                    request_id,
+                    file_path,
+                    request_name,
+                    window,
+                    cx,
+                );
+            }
         }
+    }
+
+    fn commit_git_change(&self, message: &str) {
+        if let Err(err) = commit_workspace_change(&self.workspace_dir, message) {
+            tracing::warn!(error = %err, message = %message, "failed to auto-commit workspace change");
+        }
+    }
+
+    fn format_unix_timestamp(ts: i64) -> String {
+        if ts <= 0 {
+            return "unknown".to_string();
+        }
+        let secs = ts as u64;
+        let days = secs / 86_400;
+        let rem = secs % 86_400;
+        let hours = rem / 3_600;
+        let mins = (rem % 3_600) / 60;
+
+        // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm)
+        let z = days as i64 + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097) as u64;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}-{m:02}-{d:02} {hours:02}:{mins:02}")
+    }
+
+    fn open_request_git_history_dialog(
+        &mut self,
+        project_id: String,
+        request_id: String,
+        file_path: PathBuf,
+        request_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_root = self.workspace_dir.clone();
+        let commits: Vec<GitCommitInfo> = match list_file_commits(&workspace_root, &file_path, 50) {
+            Ok(list) => list,
+            Err(err) => {
+                window.push_notification(format!("Failed reading git history: {err}"), cx);
+                return;
+            }
+        };
+
+        let initial_preview = commits.first().and_then(|c| {
+            let rel = c
+                .file_path_at_commit
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| {
+                    testrix_storage::workspace_relative_path(&workspace_root, &file_path).ok()
+                })?;
+            read_file_at_commit(&workspace_root, &rel, &c.hash).ok()
+        });
+
+        let selected_ix = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let preview_cache = std::rc::Rc::new(std::cell::RefCell::new(initial_preview));
+        let app_entity = cx.entity();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let commits_list = commits.clone();
+            let sel_ix = selected_ix.get().min(commits_list.len().saturating_sub(1));
+            let selected_commit = commits_list.get(sel_ix).cloned();
+            let preview_text = preview_cache
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "No preview available.".to_string());
+
+            let app_restore = app_entity.clone();
+            let pid_restore = project_id.clone();
+            let rid_restore = request_id.clone();
+            let fpath_restore = file_path.clone();
+            let rname_restore = request_name.clone();
+            let wroot_restore = workspace_root.clone();
+
+            dialog
+                .title(format!("History: {request_name}"))
+                .width(px(820.))
+                .child(if commits_list.is_empty() {
+                    div()
+                        .p_4()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No git commit history found for this request yet. Save a change to create a commit.")
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .w_full()
+                        .h(px(420.))
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .id("req-git-history-list")
+                                .w(px(280.))
+                                .h_full()
+                                .overflow_y_scrollbar()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .rounded_md()
+                                .p_1p5()
+                                .gap_1()
+                                .children(commits_list.iter().enumerate().map(|(ix, commit)| {
+                                    let is_selected = ix == sel_ix;
+                                    let sel_ref = selected_ix.clone();
+                                    let prev_ref = preview_cache.clone();
+                                    let wroot = workspace_root.clone();
+                                    let fpath = file_path.clone();
+                                    let commit_clone = commit.clone();
+                                    let ts_label = Self::format_unix_timestamp(commit.timestamp);
+
+                                    div()
+                                        .id(SharedString::from(format!("git-hist-item-{ix}")))
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_2()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .when(is_selected, |el| {
+                                            el.bg(cx.theme().secondary)
+                                                .border_color(cx.theme().primary)
+                                        })
+                                        .when(!is_selected, |el| {
+                                            el.border_color(gpui_kit::transparent_black())
+                                                .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                                        })
+                                        .on_click(move |_, window, _| {
+                                            sel_ref.set(ix);
+                                            let rel = commit_clone
+                                                .file_path_at_commit
+                                                .clone()
+                                                .or_else(|| {
+                                                    testrix_storage::workspace_relative_path(
+                                                        &wroot, &fpath,
+                                                    )
+                                                    .ok()
+                                                });
+                                            let next_preview = rel.and_then(|r| {
+                                                read_file_at_commit(&wroot, &r, &commit_clone.hash)
+                                                    .ok()
+                                            });
+                                            *prev_ref.borrow_mut() = next_preview;
+                                            window.refresh();
+                                        })
+                                        .child(
+                                            v_flex()
+                                                .gap_1()
+                                                .child(
+                                                    h_flex()
+                                                        .justify_between()
+                                                        .gap_2()
+                                                        .child(
+                                                            Tag::new()
+                                                                .outline()
+                                                                .small()
+                                                                .child(commit.short_hash.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(ts_label),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .truncate()
+                                                        .child(commit.message.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .truncate()
+                                                        .child(commit.author.clone()),
+                                                ),
+                                        )
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("req-git-history-preview")
+                                .flex_1()
+                                .h_full()
+                                .overflow_y_scrollbar()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .rounded_md()
+                                .bg(cx.theme().secondary.opacity(0.3))
+                                .p_3()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_xs()
+                                .child(preview_text),
+                        )
+                        .into_any_element()
+                })
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("git-hist-close").label("Close").outline()),
+                        )
+                        .when_some(selected_commit, |footer, commit| {
+                            footer.child(
+                                Button::new("git-hist-restore")
+                                    .primary()
+                                    .icon(Icon::new(LucideIcon::RotateCcwClock))
+                                    .label(format!("Restore ({})", commit.short_hash))
+                                    .on_click(move |_, window, cx| {
+                                        let restored_yaml = match restore_file_from_commit(
+                                            &wroot_restore,
+                                            &fpath_restore,
+                                            &commit.hash,
+                                            commit.file_path_at_commit.as_deref(),
+                                        ) {
+                                            Ok(content) => content,
+                                            Err(err) => {
+                                                window.push_notification(
+                                                    format!("Restore failed: {err}"),
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                        };
+
+                                        let restored_doc: HttpRequestDoc =
+                                            match yaml_serde::from_str(&restored_yaml) {
+                                                Ok(doc) => doc,
+                                                Err(err) => {
+                                                    window.push_notification(
+                                                        format!("Restored YAML invalid: {err}"),
+                                                        cx,
+                                                    );
+                                                    return;
+                                                }
+                                            };
+
+                                        let pid = pid_restore.clone();
+                                        let rid = rid_restore.clone();
+                                        let short_hash = commit.short_hash.clone();
+                                        let rname = rname_restore.clone();
+                                        app_restore.update(cx, |this, cx| {
+                                            if let Some(proj) = this.workspace.find_project_mut(&pid)
+                                                && let Some(req_node) = proj.find_request_mut(&rid)
+                                            {
+                                                req_node.doc = restored_doc.clone();
+                                            }
+                                            let target_key = format!("req:{rid}");
+                                            if let Some(WorkbenchTab::Request(tab)) =
+                                                this.tabs.iter().find(|t| t.key(cx) == target_key)
+                                            {
+                                                tab.update(cx, |view, cx| {
+                                                    view.recover_from_doc(&restored_doc, window, cx);
+                                                    view.mark_saved(cx);
+                                                });
+                                            }
+                                            this.sync_sidebars(None, cx);
+                                            this.refresh_dirty_indicators(cx);
+                                        });
+                                        window.close_dialog(cx);
+                                        window.push_notification(
+                                            format!("Restored \"{rname}\" to {short_hash}."),
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        }),
+                )
+        });
     }
 
     fn handle_container_tab_event(
@@ -1798,11 +2120,13 @@ impl TestrixApp {
                             }
                         }
                     }
+                    let proj_name = proj.doc.name.clone();
                     let changed_file = if base_changed {
                         None
                     } else {
                         share_file_from_disk(&proj.root_dir, &proj.manifest_path)
                     };
+                    self.commit_git_change(&format!("Update project: {proj_name}"));
                     self.sync_sidebars(None, cx);
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
@@ -1830,8 +2154,10 @@ impl TestrixApp {
                     {
                         tab.update(cx, |view, cx| view.mark_saved(cx));
                     }
+                    let folder_name = folder.doc.name.clone();
                     let folder_manifest_path = folder.manifest_path.clone();
                     let changed_file = share_file_from_disk(&proj.root_dir, &folder_manifest_path);
+                    self.commit_git_change(&format!("Update folder: {folder_name}"));
                     self.sync_sidebars(None, cx);
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
@@ -2591,6 +2917,7 @@ impl TestrixApp {
                                         this.workspace.active_project_id.as_deref(),
                                         this.workspace.active_environment_id.as_deref(),
                                     );
+                                    this.commit_git_change(&format!("Import {kind_label} project: {proj_name}"));
                                     this.refresh_profile_selector(window, cx);
                                     this.sync_env_editor(window, cx);
                                     this.sync_all_tabs(window, cx);
@@ -2691,6 +3018,10 @@ impl TestrixApp {
                                     .projects
                                     .sort_by_key(|p| p.doc.name.to_lowercase());
                                 this.workspace.active_project_id = Some(proj_id.clone());
+                                this.commit_git_change(&format!(
+                                    "Import Postman: {}",
+                                    imported_names.join(", ")
+                                ));
                                 let _ = save_workspace_state(
                                     &this.workspace.root_dir,
                                     this.workspace.active_project_id.as_deref(),
@@ -2756,6 +3087,7 @@ impl TestrixApp {
                 if let Some(target_proj) = self.workspace.find_project_mut(target_project_id) {
                     insert_request_into_project(target_proj, target_folder_id, moved);
                 }
+                self.commit_git_change(&format!("Move request: {moved_name}"));
                 for tab in &self.tabs {
                     if let WorkbenchTab::Request(view) = tab
                         && view.read(cx).request_id() == request_id
@@ -4716,6 +5048,9 @@ impl TestrixApp {
         match ensure_seeded_workspace(&dir) {
             Ok(tree) => {
                 info!(dir = %dir.display(), "switched workspace directory");
+                if let Err(err) = ensure_workspace_git_repo(&tree.root_dir) {
+                    tracing::warn!(error = %err, "failed initializing workspace git repo");
+                }
                 if let Err(err) = save_config_workspace_dir(&dir) {
                     tracing::warn!(error = %err, "failed updating ~/.testrix/config.yaml");
                 }
@@ -4736,6 +5071,360 @@ impl TestrixApp {
                 window.push_notification(format!("Failed opening workspace: {err}"), cx);
             }
         }
+    }
+
+    fn open_git_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let default_slug = self
+            .workspace_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("workspace")
+            .to_string();
+
+        let current_url = if self.sync_settings.sync_server_url.trim().is_empty() {
+            "http://localhost:3456".to_string()
+        } else {
+            self.sync_settings.sync_server_url.clone()
+        };
+        let current_email = self.sync_settings.sync_email.clone();
+        let current_slug = if self.sync_settings.sync_repo_slug.trim().is_empty() {
+            default_slug
+        } else {
+            self.sync_settings.sync_repo_slug.clone()
+        };
+
+        let server_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("http://localhost:3456")
+                .default_value(current_url)
+        });
+        let email_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("you@example.com")
+                .default_value(current_email)
+        });
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password (required to sign in)")
+                .masked(true)
+        });
+        let repo_slug_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("workspace")
+                .default_value(current_slug)
+        });
+
+        let app_entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let app_ref = app_entity.read(cx);
+            let logged_in = !app_ref.sync_settings.sync_token.trim().is_empty();
+            let signed_in_email = app_ref.sync_settings.sync_email.clone();
+            let syncing = app_ref.sync_in_progress;
+
+            let app_login = app_entity.clone();
+            let app_logout = app_entity.clone();
+            let app_sync = app_entity.clone();
+
+            let url_login = server_url_input.clone();
+            let email_login = email_input.clone();
+            let pass_login = password_input.clone();
+            let slug_login = repo_slug_input.clone();
+
+            let url_sync = server_url_input.clone();
+            let email_sync = email_input.clone();
+            let slug_sync = repo_slug_input.clone();
+
+            dialog
+                .title("Git Bidirectional Sync (Merge)")
+                .width(px(520.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Independent 3-way Git merge between your local workspace and node-web (separate from Sharing)."),
+                        )
+                        .child(
+                            Form::new()
+                                .child(
+                                    Field::new()
+                                        .label("node-web Server URL")
+                                        .child(Input::new(&server_url_input)),
+                                )
+                                .child(
+                                    Field::new()
+                                        .label("Sync Repository Slug")
+                                        .child(Input::new(&repo_slug_input)),
+                                )
+                                .when(!logged_in, |form| {
+                                    form.child(
+                                        Field::new()
+                                            .label("Email")
+                                            .child(Input::new(&email_input)),
+                                    )
+                                    .child(
+                                        Field::new()
+                                            .label("Password")
+                                            .child(Input::new(&password_input)),
+                                    )
+                                }),
+                        )
+                        .when(logged_in, |col| {
+                            col.child(
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .p_2p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().secondary.opacity(0.4))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .child(format!("Signed in as {signed_in_email}")),
+                                    )
+                                    .child(
+                                        Button::new("git-sync-signout")
+                                            .outline()
+                                            .xsmall()
+                                            .label("Sign Out")
+                                            .on_click(move |_, window, cx| {
+                                                app_logout.update(cx, |this, cx| {
+                                                    this.sync_settings.sync_token.clear();
+                                                    let _ = save_config_sync_settings(&this.sync_settings);
+                                                    cx.notify();
+                                                });
+                                                window.refresh();
+                                            }),
+                                    ),
+                            )
+                        }),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("git-sync-close").label("Close").outline()),
+                        )
+                        .when(!logged_in, |footer| {
+                            footer.child(
+                                Button::new("git-sync-login")
+                                    .primary()
+                                    .label("Sign In")
+                                    .on_click(move |_, window, cx| {
+                                        let url = url_login.read(cx).value().trim().to_string();
+                                        let email = email_login.read(cx).value().trim().to_string();
+                                        let password = pass_login.read(cx).value().to_string();
+                                        let slug = slug_login.read(cx).value().trim().to_string();
+                                        app_login.update(cx, |this, cx| {
+                                            this.sync_settings.sync_server_url = url.clone();
+                                            this.sync_settings.sync_email = email.clone();
+                                            this.sync_settings.sync_repo_slug = slug;
+                                            let _ = save_config_sync_settings(&this.sync_settings);
+                                            this.login_git_sync(url, email, password, window, cx);
+                                        });
+                                    }),
+                            )
+                        })
+                        .when(logged_in, |footer| {
+                            footer.child(
+                                Button::new("git-sync-merge-btn")
+                                    .primary()
+                                    .disabled(syncing)
+                                    .icon(Icon::new(LucideIcon::GitMerge))
+                                    .label(if syncing {
+                                        "Syncing…"
+                                    } else {
+                                        "Sync & Merge Now"
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        let url = url_sync.read(cx).value().trim().to_string();
+                                        let email = email_sync.read(cx).value().trim().to_string();
+                                        let slug = slug_sync.read(cx).value().trim().to_string();
+                                        app_sync.update(cx, |this, cx| {
+                                            this.sync_settings.sync_server_url = url;
+                                            if !email.is_empty() {
+                                                this.sync_settings.sync_email = email;
+                                            }
+                                            this.sync_settings.sync_repo_slug = slug;
+                                            let _ = save_config_sync_settings(&this.sync_settings);
+                                            this.start_bidirectional_git_sync(window, cx);
+                                        });
+                                        window.close_dialog(cx);
+                                    }),
+                            )
+                        }),
+                )
+        });
+    }
+
+    fn login_git_sync(
+        &mut self,
+        server_url: String,
+        email: String,
+        password: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = dispatch_share_future(async move {
+            login_sync_server(&server_url, &email, &password).await
+        });
+        let app_entity = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let res = rx.await;
+            let _ = window.update(|window, cx| {
+                match res {
+                    Ok(Ok(login)) => {
+                        app_entity.update(cx, |this, cx| {
+                            this.sync_settings.sync_token = login.token;
+                            this.sync_settings.sync_email = login.email.clone();
+                            let _ = save_config_sync_settings(&this.sync_settings);
+                            cx.notify();
+                        });
+                        window.push_notification(
+                            format!("Signed in to Git Sync as {}.", login.email),
+                            cx,
+                        );
+                        window.refresh();
+                    }
+                    Ok(Err(err)) => {
+                        window.push_notification(format!("Git Sync sign in failed: {err}"), cx);
+                    }
+                    Err(_) => {
+                        window.push_notification("Git Sync sign in cancelled.", cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_bidirectional_git_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sync_in_progress {
+            return;
+        }
+        let server_url = self.sync_settings.sync_server_url.trim().to_string();
+        let token = self.sync_settings.sync_token.trim().to_string();
+        let repo_slug = self.sync_settings.sync_repo_slug.trim().to_string();
+        if server_url.is_empty() || token.is_empty() || repo_slug.is_empty() {
+            window.push_notification(
+                "Please configure Sync Server URL, Repository Slug, and sign in first.",
+                cx,
+            );
+            return;
+        }
+
+        self.sync_in_progress = true;
+        cx.notify();
+
+        let workspace_root = self.workspace_dir.clone();
+        let rx = dispatch_share_future(async move {
+            if let Err(err) = ensure_workspace_git_repo(&workspace_root) {
+                return Err(format!("Failed initializing local git repo: {err}"));
+            }
+            if let Err(err) = commit_workspace_change(&workspace_root, "Pre-sync local snapshot") {
+                return Err(format!("Failed committing local changes: {err}"));
+            }
+            let local_files = collect_workspace_tracked_files(&workspace_root)
+                .map_err(|e| format!("Failed reading local files: {e}"))?;
+            let base_snap = load_sync_base(&workspace_root, &repo_slug)
+                .map_err(|e| format!("Failed loading sync base: {e}"))?;
+            let base_files = base_snap.map(|s| s.files).unwrap_or_default();
+
+            let remote = fetch_remote_sync_state(&server_url, &token, &repo_slug).await?;
+            let merge = three_way_merge_trees(&base_files, &local_files, &remote.files)
+                .map_err(|e| format!("3-way merge failed: {e}"))?;
+
+            if merge.local_changed {
+                apply_synced_files_and_commit(
+                    &workspace_root,
+                    &merge.merged_files,
+                    &merge.deleted_local_paths,
+                    "Sync merge with node-web",
+                )
+                .map_err(|e| format!("Failed applying merged files locally: {e}"))?;
+            }
+
+            let mut next_remote_head = remote.head_oid.clone();
+            if merge.remote_changed || (remote.head_oid.is_none() && !merge.merged_files.is_empty())
+            {
+                let push_res = push_merged_sync_state(
+                    &server_url,
+                    &token,
+                    &repo_slug,
+                    remote.head_oid.as_deref(),
+                    &merge.merged_files,
+                    "Sync merge from Testrix",
+                )
+                .await?;
+                next_remote_head = push_res.head_oid;
+            }
+
+            save_sync_base(
+                &workspace_root,
+                &repo_slug,
+                &testrix_storage::SyncBaseSnapshot {
+                    remote_head_oid: next_remote_head,
+                    files: merge.merged_files.clone(),
+                },
+            )
+            .map_err(|e| format!("Failed saving sync base: {e}"))?;
+
+            Ok(merge)
+        });
+
+        let app_entity = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let res = rx.await;
+            let _ = window.update(|window, cx| {
+                app_entity.update(cx, |this, cx| {
+                    this.sync_in_progress = false;
+                    match res {
+                        Ok(Ok(merge)) => {
+                            if merge.local_changed {
+                                this.reload_workspace(window, cx);
+                            }
+                            if !merge.conflicts.is_empty() {
+                                window.push_notification(
+                                    format!(
+                                        "Sync merged with {} conflict(s): {}",
+                                        merge.conflicts.len(),
+                                        merge.conflicts.join(", ")
+                                    ),
+                                    cx,
+                                );
+                            } else if !merge.local_changed && !merge.remote_changed {
+                                window.push_notification(
+                                    "Already up to date with node-web.",
+                                    cx,
+                                );
+                            } else {
+                                window.push_notification(
+                                    format!(
+                                        "Bidirectional Git sync complete ({} files).",
+                                        merge.merged_files.len()
+                                    ),
+                                    cx,
+                                );
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            window.push_notification(format!("Git Sync failed: {err}"), cx);
+                        }
+                        Err(_) => {
+                            window.push_notification("Git Sync task cancelled.", cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn open_env_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4950,6 +5639,7 @@ impl TestrixApp {
                     return;
                 }
                 let req_id = req_node.doc.id.clone();
+                let req_name = req_node.doc.name.clone();
                 let req_file_path = req_node.file_path.clone();
                 let changed_file = share_file_from_disk(&proj.root_dir, &req_file_path);
                 if let Some(proj_mut) = self.workspace.find_project_mut(project_id) {
@@ -4961,6 +5651,7 @@ impl TestrixApp {
                         proj_mut.requests.push(req_node);
                     }
                 }
+                self.commit_git_change(&format!("Create request: {req_name}"));
                 self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
@@ -4998,6 +5689,7 @@ impl TestrixApp {
         match create_request(&parent_dir, name, HttpMethod::Get, url) {
             Ok(req_node) => {
                 let req_id = req_node.doc.id.clone();
+                let req_name = req_node.doc.name.clone();
                 if let Some(proj_mut) = self.workspace.find_project_mut(project_id) {
                     if let Some(fid) = folder_id
                         && let Some(folder_mut) = proj_mut.find_folder_mut(fid)
@@ -5007,6 +5699,7 @@ impl TestrixApp {
                         proj_mut.requests.push(req_node);
                     }
                 }
+                self.commit_git_change(&format!("Create request: {req_name}"));
                 self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
@@ -5100,6 +5793,7 @@ impl TestrixApp {
         match create_folder(&parent_dir, name, 0) {
             Ok(folder_node) => {
                 let fid = folder_node.doc.id.clone();
+                let fname = folder_node.doc.name.clone();
                 if let Some(proj_mut) = self.workspace.find_project_mut(project_id) {
                     if let Some(parent_id) = parent_folder_id
                         && let Some(parent_mut) = proj_mut.find_folder_mut(parent_id)
@@ -5109,6 +5803,7 @@ impl TestrixApp {
                         proj_mut.folders.push(folder_node);
                     }
                 }
+                self.commit_git_change(&format!("Create folder: {fname}"));
                 self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Folder {
@@ -5192,8 +5887,10 @@ impl TestrixApp {
         match create_project(&self.workspace_dir, name, base_url) {
             Ok(proj_node) => {
                 let pid = proj_node.doc.id.clone();
+                let pname = proj_node.doc.name.clone();
                 self.workspace.projects.push(proj_node);
                 self.workspace.active_project_id = Some(pid.clone());
+                self.commit_git_change(&format!("Create project: {pname}"));
                 let _ = save_workspace_state(
                     &self.workspace_dir,
                     self.workspace.active_project_id.as_deref(),
@@ -5228,6 +5925,7 @@ impl TestrixApp {
         match duplicate_request(req_node) {
             Ok(copy_node) => {
                 let copy_id = copy_node.doc.id.clone();
+                let copy_name = copy_node.doc.name.clone();
                 if let Some(proj_mut) = self.workspace.find_project_mut(project_id) {
                     if let Some(fid) = parent_folder_id
                         && let Some(folder_mut) = proj_mut.find_folder_mut(&fid)
@@ -5237,6 +5935,7 @@ impl TestrixApp {
                         proj_mut.requests.push(copy_node);
                     }
                 }
+                self.commit_git_change(&format!("Duplicate request: {copy_name}"));
                 self.sync_sidebars(None, cx);
                 self.open_node(
                     ExplorerNode::Request {
@@ -5264,6 +5963,7 @@ impl TestrixApp {
             return;
         };
         let req_name = req.doc.name.clone();
+        let req_name_for_commit = req_name.clone();
         let file_path = req.file_path.clone();
         let app_entity = cx.entity();
 
@@ -5272,6 +5972,7 @@ impl TestrixApp {
             let pid = project_id.clone();
             let rid = request_id.clone();
             let path = file_path.clone();
+            let del_name = req_name_for_commit.clone();
             alert
                 .title(format!("Delete \"{req_name}\"?"))
                 .description("This permanently removes the YAML request file from disk.")
@@ -5284,6 +5985,7 @@ impl TestrixApp {
                             window.push_notification(format!("Delete failed: {err}"), cx);
                             return;
                         }
+                        this.commit_git_change(&format!("Delete request: {del_name}"));
                         this.close_tabs_by_keys(&[format!("req:{rid}")], cx);
                         if let Some(proj) = this.workspace.find_project_mut(&pid) {
                             remove_request_from_project(proj, &rid);
@@ -5307,6 +6009,7 @@ impl TestrixApp {
         };
         let folder = *chain.last().expect("folder chain non-empty");
         let folder_name = folder.doc.name.clone();
+        let folder_name_for_commit = folder_name.clone();
         let dir_path = folder.dir_path.clone();
         let app_entity = cx.entity();
 
@@ -5314,6 +6017,7 @@ impl TestrixApp {
             let app_ok = app_entity.clone();
             let path = dir_path.clone();
             let fid = folder_id.clone();
+            let del_name = folder_name_for_commit.clone();
             alert
                 .title(format!("Delete folder \"{folder_name}\"?"))
                 .description("All nested folders and YAML request files inside it will be deleted.")
@@ -5326,6 +6030,7 @@ impl TestrixApp {
                             window.push_notification(format!("Delete failed: {err}"), cx);
                             return;
                         }
+                        this.commit_git_change(&format!("Delete folder: {del_name}"));
                         this.tabs.retain(|t| {
                             let key = t.key(cx);
                             if let Some(rid) = key.strip_prefix("req:") {
@@ -5351,6 +6056,7 @@ impl TestrixApp {
             return;
         };
         let project_name = project.doc.name.clone();
+        let project_name_for_commit = project_name.clone();
         let root_dir = project.root_dir.clone();
         let app_entity = cx.entity();
 
@@ -5358,6 +6064,7 @@ impl TestrixApp {
             let app_ok = app_entity.clone();
             let path = root_dir.clone();
             let pid = project_id.clone();
+            let del_name = project_name_for_commit.clone();
             alert
                 .title(format!("Delete project \"{project_name}\"?"))
                 .description(
@@ -5372,6 +6079,7 @@ impl TestrixApp {
                             window.push_notification(format!("Delete failed: {err}"), cx);
                             return;
                         }
+                        this.commit_git_change(&format!("Delete project: {del_name}"));
                         let removed_project = this.workspace.find_project(&pid).cloned();
                         this.tabs.retain(|t| {
                             let key = t.key(cx);
@@ -5644,6 +6352,21 @@ impl Render for TestrixApp {
                                             .icon(LucideIcon::Layers)
                                             .placeholder("No Environment"),
                                     ),
+                                )
+                                .child(
+                                    Button::new("git-sync-button")
+                                        .outline()
+                                        .xsmall()
+                                        .icon(LucideIcon::GitMerge)
+                                        .label(if self.sync_in_progress {
+                                            "Syncing…"
+                                        } else {
+                                            "Sync"
+                                        })
+                                        .tooltip("Bidirectional Git Sync & Merge with node-web")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_git_sync_dialog(window, cx);
+                                        })),
                                 )
                                 .child(
                                     Button::new("env-vars-button")

@@ -1,29 +1,38 @@
 //! YAML document persistence and workspace management for Testrix (`testrix.io/v1`).
 
 mod error;
+mod git;
 mod seed;
 mod slug;
 mod workspace;
 
 pub use error::StorageError;
+pub use git::{
+    GitCommitInfo, SyncBaseSnapshot, ThreeWayMergeResult, apply_synced_files_and_commit,
+    collect_workspace_tracked_files, commit_workspace_change, ensure_workspace_git_repo,
+    head_commit_hash, is_git_repo, list_file_commits, load_sync_base, merge_file_three_way,
+    read_file_at_commit, restore_file_from_commit, save_sync_base, three_way_merge_trees,
+    workspace_relative_path,
+};
 pub use seed::seed_starter_workspace;
 pub use slug::slugify;
 pub use workspace::{
-    PersistedShareRecord, ShareSettings, TestrixConfig, WorkspaceTabState, clear_saved_responses,
-    config_file_path, create_environment, create_folder, create_project, create_request,
-    default_workspace_dir, delete_environment, delete_folder, delete_project, delete_request,
-    duplicate_request, ensure_seeded_workspace, import_bundle_into_project, import_project_bundle,
-    init_or_load_config, init_or_load_config_at, load_project, load_request_response,
-    load_workspace, load_workspace_environments, load_workspace_explorer_state,
-    load_workspace_history, load_workspace_sets, load_workspace_tabs, merge_environments_into_dir,
-    move_request, save_config_appearance, save_config_appearance_at, save_config_key_bindings,
-    save_config_key_bindings_at, save_config_preferences, save_config_preferences_at,
-    save_config_share_settings,
+    PersistedShareRecord, ShareSettings, SyncSettings, TestrixConfig, WorkspaceTabState,
+    clear_saved_responses, config_file_path, create_environment, create_folder, create_project,
+    create_request, default_workspace_dir, delete_environment, delete_folder, delete_project,
+    delete_request, duplicate_request, ensure_seeded_workspace, import_bundle_into_project,
+    import_project_bundle, init_or_load_config, init_or_load_config_at, load_project,
+    load_request_response, load_workspace, load_workspace_environments,
+    load_workspace_explorer_state, load_workspace_history, load_workspace_sets,
+    load_workspace_tabs, merge_environments_into_dir, move_request, save_config_appearance,
+    save_config_appearance_at, save_config_key_bindings, save_config_key_bindings_at,
+    save_config_preferences, save_config_preferences_at, save_config_share_settings,
     save_config_share_settings_at, save_config_shared_projects, save_config_shared_projects_at,
-    save_config_workspace_dir, save_config_workspace_dir_at, save_environment, save_folder,
-    save_project, save_request, save_request_response, save_workspace_explorer_state,
-    save_workspace_history, save_workspace_sets, save_workspace_state, save_workspace_tabs,
-    to_yaml_pretty, validate_yaml_file, write_yaml_atomic,
+    save_config_sync_settings, save_config_sync_settings_at, save_config_workspace_dir,
+    save_config_workspace_dir_at, save_environment, save_folder, save_project, save_request,
+    save_request_response, save_workspace_explorer_state, save_workspace_history,
+    save_workspace_sets, save_workspace_state, save_workspace_tabs, to_yaml_pretty,
+    validate_yaml_file, write_yaml_atomic,
 };
 
 #[cfg(test)]
@@ -307,5 +316,129 @@ mod tests {
         save_workspace_sets(dir.path(), &sets).unwrap();
         let loaded_sets = load_workspace_sets(dir.path());
         assert_eq!(loaded_sets, sets);
+    }
+
+    #[test]
+    fn initializes_and_uses_existing_git_repo_and_commits_request_history() {
+        let dir = TempDir::new().unwrap();
+        let tree = ensure_seeded_workspace(dir.path()).unwrap();
+
+        assert!(ensure_workspace_git_repo(dir.path()).unwrap());
+        assert!(!ensure_workspace_git_repo(dir.path()).unwrap());
+        assert!(is_git_repo(dir.path()));
+
+        let proj_dir = &tree.projects[0].root_dir;
+        let mut req = create_request(proj_dir, "List Items", HttpMethod::Get, "/items").unwrap();
+        let c1 = commit_workspace_change(dir.path(), "Create request: List Items").unwrap();
+        assert!(c1.is_some());
+
+        req.doc.request.method = HttpMethod::Post;
+        req.doc.request.url = "/items/v2".to_string();
+        save_request(&req).unwrap();
+        let c2 = commit_workspace_change(dir.path(), "Update request: List Items").unwrap();
+        assert!(c2.is_some());
+
+        // No-op commit when clean returns None.
+        assert!(
+            commit_workspace_change(dir.path(), "Noop")
+                .unwrap()
+                .is_none()
+        );
+
+        let commits = list_file_commits(dir.path(), &req.file_path, 20).unwrap();
+        assert!(commits.len() >= 2);
+        assert_eq!(commits[0].message, "Update request: List Items");
+        assert_eq!(commits[1].message, "Create request: List Items");
+
+        // Restore back to the first commit.
+        let restored = restore_file_from_commit(
+            dir.path(),
+            &req.file_path,
+            &commits[1].hash,
+            commits[1].file_path_at_commit.as_deref(),
+        )
+        .unwrap();
+        assert!(restored.contains("url: /items"));
+        assert!(!restored.contains("url: /items/v2"));
+
+        let commits_after = list_file_commits(dir.path(), &req.file_path, 20).unwrap();
+        assert_eq!(commits_after.len(), commits.len() + 1);
+        assert!(commits_after[0].message.starts_with("Restore "));
+    }
+
+    #[test]
+    fn three_way_merge_preserves_both_sides_and_detects_conflicts() {
+        use std::collections::BTreeMap;
+
+        let mut base = BTreeMap::new();
+        base.insert("a.request.yaml".to_string(), "name: A\nurl: /a\n".to_string());
+        base.insert("b.request.yaml".to_string(), "name: B\nurl: /b\n".to_string());
+        base.insert(
+            "d.request.yaml".to_string(),
+            "line1\nline2\nline3\nline4\nline5\n".to_string(),
+        );
+
+        let mut local = base.clone();
+        local.insert(
+            "a.request.yaml".to_string(),
+            "name: A\nurl: /a-local\n".to_string(),
+        );
+        local.insert("c.request.yaml".to_string(), "name: C\nurl: /c\n".to_string());
+        local.insert(
+            "d.request.yaml".to_string(),
+            "line1-local\nline2\nline3\nline4\nline5\n".to_string(),
+        );
+
+        let mut remote = base.clone();
+        remote.insert(
+            "b.request.yaml".to_string(),
+            "name: B\nurl: /b-remote\n".to_string(),
+        );
+        remote.insert(
+            "d.request.yaml".to_string(),
+            "line1\nline2\nline3\nline4\nline5-remote\n".to_string(),
+        );
+
+        let merged = three_way_merge_trees(&base, &local, &remote).unwrap();
+        assert!(merged.conflicts.is_empty());
+        assert!(merged.local_changed);
+        assert!(merged.remote_changed);
+        assert_eq!(
+            merged.merged_files.get("a.request.yaml").unwrap(),
+            "name: A\nurl: /a-local\n"
+        );
+        assert_eq!(
+            merged.merged_files.get("b.request.yaml").unwrap(),
+            "name: B\nurl: /b-remote\n"
+        );
+        assert_eq!(
+            merged.merged_files.get("c.request.yaml").unwrap(),
+            "name: C\nurl: /c\n"
+        );
+        assert_eq!(
+            merged.merged_files.get("d.request.yaml").unwrap(),
+            "line1-local\nline2\nline3\nline4\nline5-remote\n"
+        );
+
+        // Conflicting edit on same line
+        let mut local_c = base.clone();
+        local_c.insert(
+            "a.request.yaml".to_string(),
+            "name: A\nurl: /local-conflict\n".to_string(),
+        );
+        let mut remote_c = base.clone();
+        remote_c.insert(
+            "a.request.yaml".to_string(),
+            "name: A\nurl: /remote-conflict\n".to_string(),
+        );
+        let conflict_res = three_way_merge_trees(&base, &local_c, &remote_c).unwrap();
+        assert_eq!(conflict_res.conflicts, vec!["a.request.yaml".to_string()]);
+        assert!(
+            conflict_res
+                .merged_files
+                .get("a.request.yaml")
+                .unwrap()
+                .contains("<<<<<<<")
+        );
     }
 }

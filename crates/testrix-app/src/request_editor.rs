@@ -210,6 +210,12 @@ pub(crate) enum RequestTabEvent {
         status_code: Option<u16>,
         duration_ms: Option<u64>,
     },
+    OpenRequestHistory {
+        project_id: String,
+        request_id: String,
+        file_path: PathBuf,
+        request_name: String,
+    },
     DirtyChanged,
 }
 
@@ -1489,7 +1495,28 @@ impl RequestTabView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.save(cx);
                             })),
-                    ),
+                    )
+                    .when(!self.ephemeral, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("req-history-{id_base}")))
+                                .outline()
+                                .icon(Icon::new(LucideIcon::RotateCcwClock))
+                                .tooltip("Restore History Changes")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let name = this.name_input.read(cx).value().trim().to_string();
+                                    cx.emit(RequestTabEvent::OpenRequestHistory {
+                                        project_id: this.project_id.clone(),
+                                        request_id: this.request_id.clone(),
+                                        file_path: this.file_path.clone(),
+                                        request_name: if name.is_empty() {
+                                            this.saved_doc.name.clone()
+                                        } else {
+                                            name
+                                        },
+                                    });
+                                })),
+                        )
+                    }),
             )
             // Resolved URL / unresolved variables hint
             .child(match preview {

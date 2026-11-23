@@ -76,6 +76,7 @@ function renderAuthBar() {
   if (state.user) {
     bar.innerHTML = `
       <span class="pill">${esc(state.user.email)}</span>
+      <a href="/sync" class="btn btn-sm" data-nav="/sync">Git Sync</a>
       <a href="/dashboard" class="btn btn-sm" data-nav="/dashboard">Dashboard</a>
       <button class="btn btn-sm" id="logoutBtn">Logout</button>
     `;
@@ -1262,6 +1263,173 @@ async function renderDashboard() {
   });
 }
 
+async function renderSyncPage() {
+  if (!state.user) {
+    return navigate('/login');
+  }
+  const root = document.getElementById('appRoot');
+  root.className = 'page-shell';
+  root.innerHTML = `<div class="card"><h2>Git Sync Repositories</h2><p class="muted">Loading repositories...</p></div>`;
+
+  const data = await api('/api/sync/repos');
+  const repos = data.repos || [];
+
+  root.innerHTML = `
+    <div class="card" style="max-width:1100px;margin:0 auto;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+        <div>
+          <h2 style="margin:0;">Git Sync Repositories</h2>
+          <p class="muted" style="margin:4px 0 0;">Independent pure-JS Git repositories for bidirectional merge sync with Testrix.</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input id="newSyncRepoSlug" class="input" placeholder="workspace-slug" style="width:200px;" />
+          <button id="createSyncRepoBtn" class="btn btn-primary btn-sm">Create Repo</button>
+        </div>
+      </div>
+      <div id="syncReposList" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
+        ${
+          repos.length === 0
+            ? '<span class="muted">No sync repositories yet. Create one above or sync from Testrix.</span>'
+            : repos
+                .map(
+                  (r) =>
+                    `<button class="btn btn-sm sync-repo-btn" data-slug="${esc(r.slug)}">${esc(r.name)} (${esc(r.slug)}) ${
+                      r.headOid ? `· ${esc(r.headOid.slice(0, 7))}` : '· empty'
+                    }</button>`
+                )
+                .join('')
+        }
+      </div>
+      <div id="syncRepoDetail"></div>
+    </div>
+  `;
+
+  document.getElementById('createSyncRepoBtn').onclick = async () => {
+    const slug = document.getElementById('newSyncRepoSlug').value.trim() || 'workspace';
+    await api('/api/sync/repos', {
+      method: 'POST',
+      body: JSON.stringify({ slug, name: slug }),
+    });
+    renderSyncPage();
+  };
+
+  async function openSyncRepo(slug) {
+    const detail = document.getElementById('syncRepoDetail');
+    detail.innerHTML = '<p class="muted">Loading repository state...</p>';
+    const repoState = await api(`/api/sync/repos/${encodeURIComponent(slug)}/state`);
+    const fileKeys = Object.keys(repoState.files || {}).sort();
+    const commits = repoState.commits || [];
+    const activeFile = fileKeys[0] || '';
+
+    detail.innerHTML = `
+      <div style="border-top:1px solid var(--border);padding-top:16px;display:grid;grid-template-columns:260px 1fr;gap:16px;">
+        <div>
+          <h3 style="margin:0 0 8px;">Files (${fileKeys.length})</h3>
+          <div id="syncFilesList" style="display:flex;flex-direction:column;gap:4px;max-height:320px;overflow:auto;">
+            ${
+              fileKeys.length === 0
+                ? '<span class="muted">No files committed yet.</span>'
+                : fileKeys
+                    .map(
+                      (fp) =>
+                        `<button class="btn btn-sm sync-file-btn" data-file="${esc(fp)}" style="text-align:left;justify-content:flex-start;">${esc(fp)}</button>`
+                    )
+                    .join('')
+            }
+          </div>
+          <h3 style="margin:16px 0 8px;">Recent Commits (${commits.length})</h3>
+          <div style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto;">
+            ${commits
+              .map(
+                (c) => `
+              <div style="padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:12px;">
+                <div><span class="pill">${esc(c.shortOid)}</span> ${esc(c.message)}</div>
+                <div class="muted" style="margin-top:2px;">${esc(c.author)}</div>
+              </div>`
+              )
+              .join('')}
+          </div>
+        </div>
+        <div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <input id="syncEditorPath" class="input" value="${esc(activeFile)}" placeholder="path/to/file.request.yaml" style="flex:1;" />
+            <input id="syncCommitMsg" class="input" placeholder="Commit message..." style="flex:1;" />
+            <button id="syncSaveFileBtn" class="btn btn-primary btn-sm">Commit File</button>
+          </div>
+          <textarea id="syncEditorContent" style="width:100%;height:420px;font-family:monospace;font-size:12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);">${esc(
+            activeFile ? repoState.files[activeFile] : ''
+          )}</textarea>
+          <div id="syncFileHistory" style="margin-top:12px;"></div>
+        </div>
+      </div>
+    `;
+
+    async function loadFileHistory(filepath) {
+      const histDiv = document.getElementById('syncFileHistory');
+      if (!filepath) {
+        histDiv.innerHTML = '';
+        return;
+      }
+      const logData = await api(
+        `/api/sync/repos/${encodeURIComponent(slug)}/log?filepath=${encodeURIComponent(filepath)}&depth=20`
+      );
+      const list = logData.commits || [];
+      histDiv.innerHTML = `
+        <h4 style="margin:0 0 6px;">File History: ${esc(filepath)}</h4>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          ${list
+            .map(
+              (c) =>
+                `<button class="btn btn-sm sync-restore-btn" data-oid="${esc(c.oid)}" data-file="${esc(filepath)}" title="${esc(c.message)}">Restore ${esc(c.shortOid)}</button>`
+            )
+            .join('')}
+        </div>
+      `;
+      histDiv.querySelectorAll('.sync-restore-btn').forEach((btn) => {
+        btn.onclick = async () => {
+          await api(`/api/sync/repos/${encodeURIComponent(slug)}/restore`, {
+            method: 'POST',
+            body: JSON.stringify({ oid: btn.dataset.oid, filepath: btn.dataset.file }),
+          });
+          openSyncRepo(slug);
+        };
+      });
+    }
+
+    detail.querySelectorAll('.sync-file-btn').forEach((btn) => {
+      btn.onclick = () => {
+        const fp = btn.dataset.file;
+        document.getElementById('syncEditorPath').value = fp;
+        document.getElementById('syncEditorContent').value = repoState.files[fp] || '';
+        loadFileHistory(fp);
+      };
+    });
+
+    document.getElementById('syncSaveFileBtn').onclick = async () => {
+      const filepath = document.getElementById('syncEditorPath').value.trim();
+      const content = document.getElementById('syncEditorContent').value;
+      const message = document.getElementById('syncCommitMsg').value.trim() || `Update ${filepath}`;
+      if (!filepath) return;
+      await api(`/api/sync/repos/${encodeURIComponent(slug)}/file`, {
+        method: 'POST',
+        body: JSON.stringify({ filepath, content, message }),
+      });
+      openSyncRepo(slug);
+    };
+
+    if (activeFile) {
+      loadFileHistory(activeFile);
+    }
+  }
+
+  document.querySelectorAll('.sync-repo-btn').forEach((btn) => {
+    btn.onclick = () => openSyncRepo(btn.dataset.slug);
+  });
+  if (repos.length > 0) {
+    openSyncRepo(repos[0].slug);
+  }
+}
+
 async function renderRoute() {
   const p = location.pathname;
   if (p === '/login') {
@@ -1275,6 +1443,10 @@ async function renderRoute() {
   if (p === '/dashboard') {
     setTopbarViewerMode(false);
     return renderDashboard();
+  }
+  if (p === '/sync') {
+    setTopbarViewerMode(false);
+    return renderSyncPage();
   }
 
   const match = p.match(/^\/s\/([^/]+)(?:\/(.+))?$/);

@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
+    "isomorphic-git": "^1.44.18",
     "js-yaml": "^4.1.0",
     "mysql2": "^3.24.6",
     "nodemailer": "^10.6.0"

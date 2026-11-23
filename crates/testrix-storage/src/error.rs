@@ -27,4 +27,7 @@ pub enum StorageError {
 
     #[error("invalid path `{path}`: {reason}")]
     InvalidPath { path: PathBuf, reason: String },
+
+    #[error("git error: {0}")]
+    Git(String),
 }

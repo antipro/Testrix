@@ -1,12 +1,17 @@
 //! Asynchronous HTTP execution engine for Testrix built on Reqwest and Tokio.
 
 mod error;
+mod git_sync;
 mod local_share;
 mod runner;
 mod share;
 mod upgrade;
 
 pub use error::HttpError;
+pub use git_sync::{
+    RemoteSyncPushResult, RemoteSyncRepoSummary, RemoteSyncState, SyncLoginResult,
+    fetch_remote_sync_state, list_remote_sync_repos, login_sync_server, push_merged_sync_state,
+};
 pub use local_share::{
     LocalShareHandle, NetworkAdapterIp, list_outbound_ipv4_addresses, start_local_share_server,
 };

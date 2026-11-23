@@ -23,6 +23,15 @@ const {
   loadProjectFromDir,
   flattenProjectItems,
 } = require('./src/yamlReader');
+const {
+  ensureRepo,
+  getHeadOid,
+  readRepoTree,
+  commitRepoChanges,
+  getRepoLog,
+  readFileAtCommit,
+  restoreFileFromCommit,
+} = require('./src/gitSync');
 
 const PORT = Number(process.env.PORT || 3456);
 const YAML_DIR = path.resolve(process.env.YAML_DIR || process.env.DATA_DIR || path.join(__dirname, 'data'));
@@ -578,8 +587,243 @@ function createApp(db) {
     })
   );
 
+  // Independent Git Sync API (separate from Sharing; powered by pure-JS isomorphic-git)
+  async function ensureUserGitRepo(userId, rawSlug, rawName) {
+    const slug = sanitizeSlug(rawSlug || 'workspace');
+    const name = String(rawName || slug).trim() || slug;
+    const repoDir = path.join(YAML_DIR, 'git-repos', String(userId), slug);
+    await ensureRepo(repoDir);
+    let row = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [userId, slug]);
+    if (!row) {
+      await db.run(
+        'INSERT INTO git_repos (user_id, slug, name, dir_path) VALUES (?, ?, ?, ?)',
+        [userId, slug, name, repoDir]
+      );
+      row = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [userId, slug]);
+    }
+    return row;
+  }
+
+  app.get(
+    '/api/sync/repos',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const rows = await db.all(
+        'SELECT * FROM git_repos WHERE user_id = ? ORDER BY updated_at DESC',
+        [req.user.id]
+      );
+      const repos = [];
+      for (const r of rows) {
+        const headOid = await getHeadOid(r.dir_path);
+        const commits = await getRepoLog(r.dir_path, { depth: 10 });
+        repos.push({
+          id: r.id,
+          slug: r.slug,
+          name: r.name,
+          headOid,
+          recentCommits: commits.length,
+          updatedAt: r.updated_at,
+        });
+      }
+      res.json({ repos });
+    })
+  );
+
+  app.post(
+    '/api/sync/repos',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.body?.slug || req.body?.name || 'workspace');
+      const name = String(req.body?.name || slug).trim() || slug;
+      const repo = await ensureUserGitRepo(req.user.id, slug, name);
+      const headOid = await getHeadOid(repo.dir_path);
+      res.json({ ok: true, repo: { id: repo.id, slug: repo.slug, name: repo.name, headOid } });
+    })
+  );
+
+  app.get(
+    '/api/sync/repos/:slug/state',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      let repo = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [
+        req.user.id,
+        slug,
+      ]);
+      if (!repo) {
+        if (req.query.create === '1' || req.query.create === 'true') {
+          repo = await ensureUserGitRepo(req.user.id, slug, String(req.query.name || slug));
+        } else {
+          return res.status(404).json({ error: 'Sync repository not found' });
+        }
+      }
+      const { headOid, files } = await readRepoTree(repo.dir_path);
+      const commits = await getRepoLog(repo.dir_path, { depth: 30 });
+      res.json({
+        ok: true,
+        slug: repo.slug,
+        name: repo.name,
+        headOid,
+        files,
+        commits,
+      });
+    })
+  );
+
+  app.post(
+    '/api/sync/repos/:slug/push',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await ensureUserGitRepo(req.user.id, slug, req.body?.name || slug);
+      const files = req.body?.files && typeof req.body.files === 'object' ? req.body.files : {};
+      const deletedPaths = Array.isArray(req.body?.deletedPaths) ? req.body.deletedPaths : [];
+      const replaceTree = Boolean(req.body?.replaceTree);
+      const expectedHeadOid =
+        req.body?.expectedHeadOid !== undefined ? req.body.expectedHeadOid : undefined;
+      const message = String(req.body?.message || 'Sync from Testrix').trim();
+
+      try {
+        const result = await commitRepoChanges(repo.dir_path, {
+          files,
+          deletedPaths,
+          replaceTree,
+          expectedHeadOid,
+          authorName: req.user.email,
+          authorEmail: req.user.email,
+          message,
+        });
+        await db.run('UPDATE git_repos SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [repo.id]);
+        res.json({
+          ok: true,
+          slug: repo.slug,
+          headOid: result.headOid,
+          committed: result.committed,
+          filesCount: Object.keys(files).length,
+        });
+      } catch (err) {
+        if (err.statusCode === 409) {
+          return res.status(409).json({
+            error: err.message,
+            currentHeadOid: err.currentHeadOid,
+          });
+        }
+        throw err;
+      }
+    })
+  );
+
+  app.get(
+    '/api/sync/repos/:slug/log',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [
+        req.user.id,
+        slug,
+      ]);
+      if (!repo) return res.status(404).json({ error: 'Sync repository not found' });
+      const filepath = req.query.filepath ? String(req.query.filepath) : undefined;
+      const depth = Math.min(Number(req.query.depth || 50), 200);
+      const commits = await getRepoLog(repo.dir_path, { filepath, depth });
+      res.json({ ok: true, commits });
+    })
+  );
+
+  app.get(
+    '/api/sync/repos/:slug/blob',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [
+        req.user.id,
+        slug,
+      ]);
+      if (!repo) return res.status(404).json({ error: 'Sync repository not found' });
+      const oid = String(req.query.oid || '').trim();
+      const filepath = String(req.query.filepath || '').trim();
+      if (!oid || !filepath) {
+        return res.status(400).json({ error: 'oid and filepath are required' });
+      }
+      const content = await readFileAtCommit(repo.dir_path, oid, filepath);
+      res.json({ ok: true, oid, filepath, content });
+    })
+  );
+
+  app.post(
+    '/api/sync/repos/:slug/file',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await ensureUserGitRepo(req.user.id, slug, slug);
+      const filepath = String(req.body?.filepath || '').trim();
+      const content = String(req.body?.content ?? '');
+      const message = String(req.body?.message || `Update ${filepath}`).trim();
+      if (!filepath) {
+        return res.status(400).json({ error: 'filepath is required' });
+      }
+      const result = await commitRepoChanges(repo.dir_path, {
+        files: { [filepath]: content },
+        authorName: req.user.email,
+        authorEmail: req.user.email,
+        message,
+      });
+      await db.run('UPDATE git_repos SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [repo.id]);
+      res.json({ ok: true, headOid: result.headOid, committed: result.committed });
+    })
+  );
+
+  app.post(
+    '/api/sync/repos/:slug/restore',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [
+        req.user.id,
+        slug,
+      ]);
+      if (!repo) return res.status(404).json({ error: 'Sync repository not found' });
+      const oid = String(req.body?.oid || '').trim();
+      const filepath = String(req.body?.filepath || '').trim();
+      if (!oid || !filepath) {
+        return res.status(400).json({ error: 'oid and filepath are required' });
+      }
+      const result = await restoreFileFromCommit(repo.dir_path, {
+        oid,
+        filepath,
+        authorName: req.user.email,
+        authorEmail: req.user.email,
+      });
+      await db.run('UPDATE git_repos SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [repo.id]);
+      res.json({
+        ok: true,
+        headOid: result.headOid,
+        filepath: result.filepath,
+        content: result.content,
+      });
+    })
+  );
+
+  app.delete(
+    '/api/sync/repos/:slug',
+    requireAuth,
+    asyncHandler(async (req, res) => {
+      const slug = sanitizeSlug(req.params.slug);
+      const repo = await db.get('SELECT * FROM git_repos WHERE user_id = ? AND slug = ?', [
+        req.user.id,
+        slug,
+      ]);
+      if (!repo) return res.status(404).json({ error: 'Sync repository not found' });
+      await db.run('DELETE FROM git_repos WHERE id = ?', [repo.id]);
+      if (repo.dir_path && repo.dir_path.startsWith(YAML_DIR)) {
+        fs.rmSync(repo.dir_path, { recursive: true, force: true });
+      }
+      res.json({ ok: true });
+    })
+  );
+
   // Page routes (no webpack, plain HTML)
-  app.get(['/s/:slug', '/s/:slug/*', '/login', '/register', '/dashboard'], (_req, res) => {
+  app.get(['/s/:slug', '/s/:slug/*', '/login', '/register', '/dashboard', '/sync'], (_req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   });
 

@@ -1131,6 +1131,14 @@ pub struct TestrixConfig {
     pub editor_font_size: u16,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub key_bindings: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub sync_server_url: String,
+    #[serde(default)]
+    pub sync_email: String,
+    #[serde(default)]
+    pub sync_token: String,
+    #[serde(default)]
+    pub sync_repo_slug: String,
 }
 
 fn default_ui_font_size() -> String {
@@ -1194,6 +1202,10 @@ impl Default for TestrixConfig {
             ui_font_size: default_ui_font_size(),
             editor_font_size: default_editor_font_size(),
             key_bindings: std::collections::BTreeMap::new(),
+            sync_server_url: String::new(),
+            sync_email: String::new(),
+            sync_token: String::new(),
+            sync_repo_slug: String::new(),
         }
     }
 }
@@ -1399,5 +1411,47 @@ pub fn save_config_shared_projects_at(
 ) -> Result<(), StorageError> {
     let mut cfg = init_or_load_config_at(config_path)?;
     cfg.shared_projects = shares.to_vec();
+    write_yaml_atomic(config_path, &cfg)
+}
+
+/// Independent Git Sync settings (separate from Sharing) stored in `~/.testrix/config.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncSettings {
+    pub sync_server_url: String,
+    pub sync_email: String,
+    pub sync_token: String,
+    pub sync_repo_slug: String,
+}
+
+impl From<&TestrixConfig> for SyncSettings {
+    fn from(cfg: &TestrixConfig) -> Self {
+        Self {
+            sync_server_url: cfg.sync_server_url.clone(),
+            sync_email: cfg.sync_email.clone(),
+            sync_token: cfg.sync_token.clone(),
+            sync_repo_slug: cfg.sync_repo_slug.clone(),
+        }
+    }
+}
+
+/// Persists independent Git Sync settings into `~/.testrix/config.yaml`.
+pub fn save_config_sync_settings(settings: &SyncSettings) -> Result<(), StorageError> {
+    save_config_sync_settings_at(&config_file_path(), settings)
+}
+
+/// Persists independent Git Sync settings into `config_path`.
+pub fn save_config_sync_settings_at(
+    config_path: &Path,
+    settings: &SyncSettings,
+) -> Result<(), StorageError> {
+    let mut cfg = if config_path.is_file() {
+        read_yaml_file::<TestrixConfig>(config_path).unwrap_or_default()
+    } else {
+        TestrixConfig::default()
+    };
+    cfg.sync_server_url = settings.sync_server_url.trim().to_string();
+    cfg.sync_email = settings.sync_email.trim().to_string();
+    cfg.sync_token = settings.sync_token.trim().to_string();
+    cfg.sync_repo_slug = settings.sync_repo_slug.trim().to_string();
     write_yaml_atomic(config_path, &cfg)
 }
