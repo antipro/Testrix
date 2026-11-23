@@ -420,7 +420,7 @@ mod tests {
             "line1-local\nline2\nline3\nline4\nline5-remote\n"
         );
 
-        // Conflicting edit on same line
+        // Conflicting edit on same line in a YAML file: must keep valid YAML (no `<<<<<<<` markers)
         let mut local_c = base.clone();
         local_c.insert(
             "a.request.yaml".to_string(),
@@ -433,12 +433,27 @@ mod tests {
         );
         let conflict_res = three_way_merge_trees(&base, &local_c, &remote_c).unwrap();
         assert_eq!(conflict_res.conflicts, vec!["a.request.yaml".to_string()]);
+        assert_eq!(
+            conflict_res.merged_files.get("a.request.yaml").unwrap(),
+            "name: A\nurl: /local-conflict\n"
+        );
         assert!(
-            conflict_res
+            !conflict_res
                 .merged_files
                 .get("a.request.yaml")
                 .unwrap()
                 .contains("<<<<<<<")
         );
+
+        // Conflicting edit on a plain text file keeps standard conflict markers
+        let mut base_txt = BTreeMap::new();
+        base_txt.insert("notes.txt".to_string(), "hello\n".to_string());
+        let mut local_txt = BTreeMap::new();
+        local_txt.insert("notes.txt".to_string(), "hello local\n".to_string());
+        let mut remote_txt = BTreeMap::new();
+        remote_txt.insert("notes.txt".to_string(), "hello remote\n".to_string());
+        let txt_res = three_way_merge_trees(&base_txt, &local_txt, &remote_txt).unwrap();
+        assert_eq!(txt_res.conflicts, vec!["notes.txt".to_string()]);
+        assert!(txt_res.merged_files.get("notes.txt").unwrap().contains("<<<<<<<"));
     }
 }

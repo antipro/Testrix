@@ -636,24 +636,44 @@ pub fn three_way_merge_trees(
         }
 
         // Both sides changed this path differently.
-        local_changed = true;
-        remote_changed = true;
         match (l, r) {
             (Some(lc), Some(rc)) => {
                 let bc = b.map(String::as_str).unwrap_or("");
                 let (merged, has_conflict) = merge_file_three_way(bc, lc, rc)?;
-                merged_files.insert(path.clone(), merged);
-                if has_conflict {
+                let is_yaml = path.ends_with(".yaml") || path.ends_with(".yml");
+                if has_conflict && is_yaml {
+                    // Never write Git conflict markers (`<<<<<<<`) into structured YAML files,
+                    // because it breaks YAML workspace parsing. Keep a valid YAML side (prefer
+                    // local unless local already contains conflict markers) and report the conflict.
+                    let chosen = if lc.contains("<<<<<<<") && !rc.contains("<<<<<<<") {
+                        local_changed = true;
+                        rc.clone()
+                    } else {
+                        remote_changed = true;
+                        lc.clone()
+                    };
+                    merged_files.insert(path.clone(), chosen);
                     conflicts.push(path);
+                } else {
+                    local_changed = true;
+                    remote_changed = true;
+                    merged_files.insert(path.clone(), merged);
+                    if has_conflict {
+                        conflicts.push(path);
+                    }
                 }
             }
             (Some(lc), None) => {
                 // Local modified, remote deleted: keep local and flag conflict.
+                local_changed = true;
+                remote_changed = true;
                 merged_files.insert(path.clone(), lc.clone());
                 conflicts.push(path);
             }
             (None, Some(rc)) => {
                 // Local deleted, remote modified: restore remote and flag conflict.
+                local_changed = true;
+                remote_changed = true;
                 merged_files.insert(path.clone(), rc.clone());
                 conflicts.push(path);
             }
