@@ -32,6 +32,8 @@ pub struct RemoteSyncState {
     #[serde(default)]
     pub head_oid: Option<String>,
     #[serde(default)]
+    pub unchanged: bool,
+    #[serde(default)]
     pub files: BTreeMap<String, String>,
 }
 
@@ -75,6 +77,7 @@ struct ListReposResponse {
 struct PushSyncBody<'a> {
     expected_head_oid: Option<&'a str>,
     files: &'a BTreeMap<String, String>,
+    deleted_paths: &'a [String],
     replace_tree: bool,
     message: &'a str,
     name: &'a str,
@@ -178,6 +181,7 @@ pub async fn fetch_remote_sync_state(
     server_url: &str,
     token: &str,
     repo_slug: &str,
+    known_head_oid: Option<&str>,
 ) -> Result<RemoteSyncState, String> {
     let base = normalize_base_url(server_url)?;
     let slug = repo_slug.trim();
@@ -185,8 +189,12 @@ pub async fn fetch_remote_sync_state(
         return Err("Sync repository slug is required.".to_string());
     }
     let client = reqwest::Client::new();
+    let mut url = format!("{base}/api/sync/repos/{slug}/state?create=1");
+    if let Some(oid) = known_head_oid.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&knownHeadOid={oid}"));
+    }
     let resp = client
-        .get(format!("{base}/api/sync/repos/{slug}/state?create=1"))
+        .get(url)
         .bearer_auth(token.trim())
         .send()
         .await
@@ -201,14 +209,16 @@ pub async fn fetch_remote_sync_state(
         .map_err(|e| format!("Invalid remote sync state JSON: {e}"))
 }
 
-/// Pushes a merged file tree to `node-web` (`POST /api/sync/repos/:slug/push`) with optimistic
-/// concurrency checking against `expected_head_oid`.
+/// Pushes changed and deleted files to `node-web` (`POST /api/sync/repos/:slug/push`) with
+/// optimistic concurrency checking against `expected_head_oid`.
 pub async fn push_merged_sync_state(
     server_url: &str,
     token: &str,
     repo_slug: &str,
     expected_head_oid: Option<&str>,
-    files: &BTreeMap<String, String>,
+    changed_files: &BTreeMap<String, String>,
+    deleted_paths: &[String],
+    replace_tree: bool,
     message: &str,
 ) -> Result<RemoteSyncPushResult, String> {
     let base = normalize_base_url(server_url)?;
@@ -219,8 +229,9 @@ pub async fn push_merged_sync_state(
     let client = reqwest::Client::new();
     let body = PushSyncBody {
         expected_head_oid,
-        files,
-        replace_tree: true,
+        files: changed_files,
+        deleted_paths,
+        replace_tree,
         message,
         name: slug,
     };

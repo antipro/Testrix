@@ -1390,6 +1390,7 @@ impl TestrixApp {
                     self.env_editor.update(cx, |editor, cx| {
                         window.focus(&editor.focus_handle(cx), cx);
                     });
+                    self.maybe_auto_git_sync(window, cx);
                     window.push_notification("Profile saved.", cx);
                 }
             }
@@ -2167,6 +2168,7 @@ impl TestrixApp {
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
+                    self.maybe_auto_git_sync(window, cx);
                 }
             }
             ContainerTabEvent::OpenAuthSource(node) => {
@@ -5643,7 +5645,11 @@ impl TestrixApp {
                 .map_err(|e| format!("Failed reading local files: {e}"))?;
             let base_snap = load_sync_base(&workspace_root, &repo_slug)
                 .map_err(|e| format!("Failed loading sync base: {e}"))?;
-            let remote = fetch_remote_sync_state(&server_url, &token, &repo_slug).await?;
+            let known_head = base_snap
+                .as_ref()
+                .and_then(|s| s.remote_head_oid.as_deref());
+            let remote =
+                fetch_remote_sync_state(&server_url, &token, &repo_slug, known_head).await?;
             // If the remote repository has no commits yet (empty/newly created or recreated),
             // do not treat a stale local sync base as remote deletions.
             let base_files = if remote.head_oid.is_none() {
@@ -5651,7 +5657,12 @@ impl TestrixApp {
             } else {
                 base_snap.map(|s| s.files).unwrap_or_default()
             };
-            let merge = three_way_merge_trees(&base_files, &local_files, &remote.files)
+            let remote_files = if remote.unchanged {
+                base_files.clone()
+            } else {
+                remote.files
+            };
+            let merge = three_way_merge_trees(&base_files, &local_files, &remote_files)
                 .map_err(|e| format!("3-way merge failed: {e}"))?;
 
             if merge.local_changed {
@@ -5667,16 +5678,32 @@ impl TestrixApp {
             let mut next_remote_head = remote.head_oid.clone();
             if merge.remote_changed || (remote.head_oid.is_none() && !merge.merged_files.is_empty())
             {
-                let push_res = push_merged_sync_state(
-                    &server_url,
-                    &token,
-                    &repo_slug,
-                    remote.head_oid.as_deref(),
-                    &merge.merged_files,
-                    "Sync merge from Testrix",
-                )
-                .await?;
-                next_remote_head = push_res.head_oid;
+                let mut changed_files = std::collections::BTreeMap::new();
+                for (path, content) in &merge.merged_files {
+                    if remote_files.get(path) != Some(content) {
+                        changed_files.insert(path.clone(), content.clone());
+                    }
+                }
+                let deleted_remote_paths: Vec<String> = remote_files
+                    .keys()
+                    .filter(|path| !merge.merged_files.contains_key(*path))
+                    .cloned()
+                    .collect();
+
+                if !changed_files.is_empty() || !deleted_remote_paths.is_empty() {
+                    let push_res = push_merged_sync_state(
+                        &server_url,
+                        &token,
+                        &repo_slug,
+                        remote.head_oid.as_deref(),
+                        &changed_files,
+                        &deleted_remote_paths,
+                        false,
+                        "Sync merge from Testrix",
+                    )
+                    .await?;
+                    next_remote_head = push_res.head_oid;
+                }
             }
 
             save_sync_base(

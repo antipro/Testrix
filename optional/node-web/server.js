@@ -657,13 +657,27 @@ function createApp(db) {
           return res.status(404).json({ error: 'Sync repository not found' });
         }
       }
-      const { headOid, files } = await readRepoTree(repo.dir_path);
+      const headOid = await getHeadOid(repo.dir_path);
+      const knownHeadOid = req.query.knownHeadOid ? String(req.query.knownHeadOid).trim() : '';
+      if (knownHeadOid && headOid && knownHeadOid === headOid) {
+        return res.json({
+          ok: true,
+          slug: repo.slug,
+          name: repo.name,
+          headOid,
+          unchanged: true,
+          files: {},
+          commits: [],
+        });
+      }
+      const { files } = await readRepoTree(repo.dir_path);
       const commits = await getRepoLog(repo.dir_path, { depth: 30 });
       res.json({
         ok: true,
         slug: repo.slug,
         name: repo.name,
         headOid,
+        unchanged: false,
         files,
         commits,
       });
