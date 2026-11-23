@@ -4,6 +4,12 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v0.9.0] - 2026-11-23
+
+### Changed
+- Replace `git` CLI subprocesses in `testrix-storage` with pure-Rust `gix` (`gitoxide`) for in-process repository initialization, commits, history, and 3-way text merge (eliminating Windows console window flashes and external `git` binary requirements).
+- Make bidirectional Git sync with `node-web` incremental using `knownHeadOid` delta pulls and changed/deleted-only delta pushes, and trigger auto-sync on environment and folder saves.
+
 ## [v0.8.0] - 2026-11-23
 
 ### Added
