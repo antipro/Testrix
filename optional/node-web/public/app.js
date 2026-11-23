@@ -1322,7 +1322,15 @@ async function renderSyncPage() {
     const activeFile = fileKeys[0] || '';
 
     detail.innerHTML = `
-      <div style="border-top:1px solid var(--border);padding-top:16px;display:grid;grid-template-columns:260px 1fr;gap:16px;">
+      <div style="border-top:1px solid var(--border);padding-top:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <div>
+            <strong>Repository:</strong> <span class="pill">${esc(slug)}</span>
+            ${repoState.headOid ? `<span class="muted" style="margin-left:8px;">HEAD ${esc(repoState.headOid.slice(0, 7))}</span>` : ''}
+          </div>
+          <button id="deleteSyncRepoBtn" class="btn btn-sm btn-danger">Delete Repo</button>
+        </div>
+        <div style="display:grid;grid-template-columns:260px 1fr;gap:16px;">
         <div>
           <h3 style="margin:0 0 8px;">Files (${fileKeys.length})</h3>
           <div id="syncFilesList" style="display:flex;flex-direction:column;gap:4px;max-height:320px;overflow:auto;">
@@ -1362,7 +1370,16 @@ async function renderSyncPage() {
           <div id="syncFileHistory" style="margin-top:12px;"></div>
         </div>
       </div>
+      </div>
     `;
+
+    document.getElementById('deleteSyncRepoBtn').onclick = async () => {
+      if (!confirm(`Delete Git Sync repository "${slug}" from server? This cannot be undone.`)) {
+        return;
+      }
+      await api(`/api/sync/repos/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+      renderSyncPage();
+    };
 
     async function loadFileHistory(filepath) {
       const histDiv = document.getElementById('syncFileHistory');

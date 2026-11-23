@@ -5081,7 +5081,7 @@ impl TestrixApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (server_url, email, token, _) = self.effective_sync_credentials();
+        let (server_url, email, token, saved_slug) = self.effective_sync_credentials();
         if server_url.is_empty() || token.is_empty() {
             return;
         }
@@ -5097,7 +5097,7 @@ impl TestrixApp {
         let slug_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("workspace")
-                .default_value(workspace_name.clone())
+                .default_value(saved_slug)
         });
         let app_entity = cx.entity();
 
@@ -5163,7 +5163,9 @@ impl TestrixApp {
                                     let slug = slug_ok.read(cx).value().trim().to_string();
                                     app_ok.update(cx, |this, cx| {
                                         if !slug.is_empty() {
-                                            this.sync_settings.sync_repo_slug = slug;
+                                            let ws_dir = this.workspace_dir.clone();
+                                            this.sync_settings
+                                                .set_repo_slug_for_workspace(&ws_dir, &slug);
                                             let _ = save_config_sync_settings(&this.sync_settings);
                                         }
                                         this.start_bidirectional_git_sync(window, cx);
@@ -5349,16 +5351,9 @@ impl TestrixApp {
         } else {
             self.share_settings.share_token.trim().to_string()
         };
-        let repo_slug = if !self.sync_settings.sync_repo_slug.trim().is_empty() {
-            self.sync_settings.sync_repo_slug.trim().to_string()
-        } else {
-            self.workspace_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("workspace")
-                .to_string()
-        };
+        let repo_slug = self
+            .sync_settings
+            .repo_slug_for_workspace(&self.workspace_dir);
         (server_url, email, token, repo_slug)
     }
 
@@ -5495,9 +5490,11 @@ impl TestrixApp {
                                         let password = pass_login.read(cx).value().to_string();
                                         let slug = slug_login.read(cx).value().trim().to_string();
                                         app_login.update(cx, |this, cx| {
+                                            let ws_dir = this.workspace_dir.clone();
                                             this.sync_settings.sync_server_url = url.clone();
                                             this.sync_settings.sync_email = email.clone();
-                                            this.sync_settings.sync_repo_slug = slug;
+                                            this.sync_settings
+                                                .set_repo_slug_for_workspace(&ws_dir, &slug);
                                             let _ = save_config_sync_settings(&this.sync_settings);
                                             this.login_git_sync(url, email, password, window, cx);
                                         });
@@ -5520,11 +5517,13 @@ impl TestrixApp {
                                         let email = email_sync.read(cx).value().trim().to_string();
                                         let slug = slug_sync.read(cx).value().trim().to_string();
                                         app_sync.update(cx, |this, cx| {
+                                            let ws_dir = this.workspace_dir.clone();
                                             this.sync_settings.sync_server_url = url;
                                             if !email.is_empty() {
                                                 this.sync_settings.sync_email = email;
                                             }
-                                            this.sync_settings.sync_repo_slug = slug;
+                                            this.sync_settings
+                                                .set_repo_slug_for_workspace(&ws_dir, &slug);
                                             let _ = save_config_sync_settings(&this.sync_settings);
                                             this.start_bidirectional_git_sync(window, cx);
                                         });
@@ -5556,15 +5555,10 @@ impl TestrixApp {
                         app_entity.update(cx, |this, cx| {
                             this.sync_settings.sync_token = login.token.clone();
                             this.sync_settings.sync_email = login.email.clone();
-                            if this.sync_settings.sync_repo_slug.trim().is_empty() {
-                                this.sync_settings.sync_repo_slug = this
-                                    .workspace_dir
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .filter(|s| !s.trim().is_empty())
-                                    .unwrap_or("workspace")
-                                    .to_string();
-                            }
+                            let ws_dir = this.workspace_dir.clone();
+                            let slug = this.sync_settings.repo_slug_for_workspace(&ws_dir);
+                            this.sync_settings
+                                .set_repo_slug_for_workspace(&ws_dir, &slug);
                             let _ = save_config_sync_settings(&this.sync_settings);
                             if this.share_settings.share_token.trim().is_empty() {
                                 if !this.sync_settings.sync_server_url.trim().is_empty() {

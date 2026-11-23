@@ -1139,6 +1139,8 @@ pub struct TestrixConfig {
     pub sync_token: String,
     #[serde(default)]
     pub sync_repo_slug: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sync_workspace_repos: std::collections::BTreeMap<String, String>,
 }
 
 fn default_ui_font_size() -> String {
@@ -1206,6 +1208,7 @@ impl Default for TestrixConfig {
             sync_email: String::new(),
             sync_token: String::new(),
             sync_repo_slug: String::new(),
+            sync_workspace_repos: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1414,6 +1417,14 @@ pub fn save_config_shared_projects_at(
     write_yaml_atomic(config_path, &cfg)
 }
 
+fn normalize_workspace_key(workspace_dir: &Path) -> String {
+    let raw = std::fs::canonicalize(workspace_dir)
+        .unwrap_or_else(|_| workspace_dir.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    raw.trim_end_matches('/').to_string()
+}
+
 /// Independent Git Sync settings (separate from Sharing) stored in `~/.testrix/config.yaml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncSettings {
@@ -1421,6 +1432,37 @@ pub struct SyncSettings {
     pub sync_email: String,
     pub sync_token: String,
     pub sync_repo_slug: String,
+    pub sync_workspace_repos: std::collections::BTreeMap<String, String>,
+}
+
+impl SyncSettings {
+    /// Returns the saved remote repo slug for `workspace_dir`, or defaults to the
+    /// workspace directory name when `workspace_dir` has not been mapped yet.
+    pub fn repo_slug_for_workspace(&self, workspace_dir: &Path) -> String {
+        let key = normalize_workspace_key(workspace_dir);
+        if let Some(slug) = self.sync_workspace_repos.get(&key)
+            && !slug.trim().is_empty()
+        {
+            return slug.trim().to_string();
+        }
+        workspace_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("workspace")
+            .to_string()
+    }
+
+    /// Saves the remote repo slug for `workspace_dir` and updates `sync_repo_slug`.
+    pub fn set_repo_slug_for_workspace(&mut self, workspace_dir: &Path, slug: &str) {
+        let trimmed = slug.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = normalize_workspace_key(workspace_dir);
+        self.sync_workspace_repos.insert(key, trimmed.clone());
+        self.sync_repo_slug = trimmed;
+    }
 }
 
 impl From<&TestrixConfig> for SyncSettings {
@@ -1430,6 +1472,7 @@ impl From<&TestrixConfig> for SyncSettings {
             sync_email: cfg.sync_email.clone(),
             sync_token: cfg.sync_token.clone(),
             sync_repo_slug: cfg.sync_repo_slug.clone(),
+            sync_workspace_repos: cfg.sync_workspace_repos.clone(),
         }
     }
 }
@@ -1453,5 +1496,6 @@ pub fn save_config_sync_settings_at(
     cfg.sync_email = settings.sync_email.trim().to_string();
     cfg.sync_token = settings.sync_token.trim().to_string();
     cfg.sync_repo_slug = settings.sync_repo_slug.trim().to_string();
+    cfg.sync_workspace_repos = settings.sync_workspace_repos.clone();
     write_yaml_atomic(config_path, &cfg)
 }
