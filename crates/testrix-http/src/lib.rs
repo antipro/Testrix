@@ -10,7 +10,8 @@ mod upgrade;
 pub use error::HttpError;
 pub use git_sync::{
     RemoteSyncPushResult, RemoteSyncRepoSummary, RemoteSyncState, SyncLoginResult,
-    fetch_remote_sync_state, list_remote_sync_repos, login_sync_server, push_merged_sync_state,
+    delete_remote_sync_repo, fetch_remote_sync_state, list_remote_sync_repos, login_sync_server,
+    push_merged_sync_state,
 };
 pub use local_share::{
     LocalShareHandle, NetworkAdapterIp, list_outbound_ipv4_addresses, start_local_share_server,

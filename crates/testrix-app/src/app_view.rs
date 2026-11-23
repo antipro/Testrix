@@ -52,9 +52,9 @@ use testrix_core::{
 use testrix_http::{
     DownloadProgressState, HttpRunner, OneshotTryRecvError, ReleaseInfo, ShareChannel, ShareFile,
     check_for_upgrade, collect_project_yaml_files, dispatch_share_future, download_release_asset,
-    fetch_remote_sync_state, launch_installer, login_sync_server, login_testrix_server,
-    push_merged_sync_state, revoke_cloudflare_r2_share, revoke_testrix_server_share,
-    upload_to_cloudflare_r2, upload_to_testrix_server,
+    delete_remote_sync_repo, fetch_remote_sync_state, launch_installer, login_sync_server,
+    login_testrix_server, push_merged_sync_state, revoke_cloudflare_r2_share,
+    revoke_testrix_server_share, upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
     GitCommitInfo, PersistedShareRecord, ShareSettings, SyncSettings,
@@ -2362,7 +2362,7 @@ impl TestrixApp {
         let app_entity = cx.entity();
         let remember_state = std::rc::Rc::new(Cell::new(true));
 
-        window.open_dialog(cx, move |dialog, _, _cx| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let app_cancel = app_entity.clone();
             let app_tray = app_entity.clone();
             let app_quit = app_entity.clone();
@@ -4291,13 +4291,8 @@ impl TestrixApp {
                                                     .label("Logout")
                                                     .on_click(move |_, window, cx| {
                                                         app_logout.update(cx, |this, cx| {
-                                                            this.share_settings.share_token.clear();
-                                                            let _ = save_config_share_settings(&this.share_settings);
-                                                            this.sync_share_settings_to_tabs(cx);
-                                                            cx.notify();
+                                                            this.confirm_logout_with_cloud_cleanup(window, cx);
                                                         });
-                                                        window.push_notification("Signed out of Share Server", cx);
-                                                        window.refresh();
                                                     }),
                                             )
                                         }),
@@ -5070,13 +5065,270 @@ impl TestrixApp {
                 self.refresh_profile_selector(window, cx);
                 self.sync_env_editor(window, cx);
                 self.open_initial_request(window, cx);
-                self.maybe_auto_git_sync(window, cx);
+                self.prompt_sync_after_workspace_switch(window, cx);
                 cx.notify();
             }
             Err(err) => {
                 window.push_notification(format!("Failed opening workspace: {err}"), cx);
             }
         }
+    }
+
+    fn prompt_sync_after_workspace_switch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (server_url, email, token, _) = self.effective_sync_credentials();
+        if server_url.is_empty() || token.is_empty() {
+            return;
+        }
+
+        let workspace_name = self
+            .workspace_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("workspace")
+            .to_string();
+
+        let slug_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("workspace")
+                .default_value(workspace_name.clone())
+        });
+        let app_entity = cx.entity();
+
+        window.open_dialog(cx, move |dialog, _, _cx| {
+            let app_ok = app_entity.clone();
+            let app_no = app_entity.clone();
+            let slug_ok = slug_input.clone();
+            let srv = server_url.clone();
+            let acct = if email.is_empty() {
+                "your account".to_string()
+            } else {
+                email.clone()
+            };
+
+            dialog
+                .title("Sync Workspace with node-web?")
+                .width(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div().text_sm().child(format!(
+                                "Switched to workspace \"{workspace_name}\". Would you like to run a bidirectional Git sync & merge with {srv} ({acct})?"
+                            )),
+                        )
+                        .child(
+                            Form::new().child(
+                                Field::new()
+                                    .label("Sync Repository Slug")
+                                    .child(Input::new(&slug_input)),
+                            ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            Button::new("ws-sync-skip")
+                                .label("No (Disconnect)")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    app_no.update(cx, |this, cx| {
+                                        this.sync_settings.sync_token.clear();
+                                        this.share_settings.share_token.clear();
+                                        let _ = save_config_sync_settings(&this.sync_settings);
+                                        let _ = save_config_share_settings(&this.share_settings);
+                                        this.sync_share_settings_to_tabs(cx);
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                    window.push_notification(
+                                        "Disconnected node-web account.",
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("ws-sync-confirm")
+                                .primary()
+                                .icon(Icon::new(LucideIcon::GitMerge))
+                                .label("Sync & Merge")
+                                .on_click(move |_, window, cx| {
+                                    let slug = slug_ok.read(cx).value().trim().to_string();
+                                    app_ok.update(cx, |this, cx| {
+                                        if !slug.is_empty() {
+                                            this.sync_settings.sync_repo_slug = slug;
+                                            let _ = save_config_sync_settings(&this.sync_settings);
+                                        }
+                                        this.start_bidirectional_git_sync(window, cx);
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn confirm_logout_with_cloud_cleanup(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (server_url, email, token, repo_slug) = self.effective_sync_credentials();
+        let share_server_url = self.share_settings.share_server_url.trim().to_string();
+        let share_token = self.share_settings.share_token.trim().to_string();
+        let testrix_share_slugs: Vec<String> = self
+            .active_shares
+            .iter()
+            .filter(|s| s.channel == ShareChannel::TestrixServer)
+            .map(|s| s.project_slug.clone())
+            .collect();
+
+        let app_entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _cx| {
+            let app_keep = app_entity.clone();
+            let app_delete = app_entity.clone();
+            let srv = if !server_url.is_empty() {
+                server_url.clone()
+            } else {
+                share_server_url.clone()
+            };
+            let acct = if email.is_empty() {
+                "your account".to_string()
+            } else {
+                email.clone()
+            };
+            let del_srv = server_url.clone();
+            let del_token = token.clone();
+            let del_slug = repo_slug.clone();
+            let del_share_srv = share_server_url.clone();
+            let del_share_token = share_token.clone();
+            let del_share_slugs = testrix_share_slugs.clone();
+
+            dialog
+                .title("Sign Out")
+                .width(px(460.))
+                .child(
+                    v_flex().gap_2().child(
+                        div().text_sm().child(format!(
+                            "Do you also want to delete your cloud data (Git sync repo & shared projects) on {srv} for {acct} before signing out?"
+                        )),
+                    ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("logout-cancel").label("Cancel").outline()),
+                        )
+                        .child(
+                            Button::new("logout-keep-cloud")
+                                .outline()
+                                .label("Sign Out Only")
+                                .on_click(move |_, window, cx| {
+                                    app_keep.update(cx, |this, cx| {
+                                        this.sync_settings.sync_token.clear();
+                                        this.share_settings.share_token.clear();
+                                        let _ = save_config_sync_settings(&this.sync_settings);
+                                        let _ = save_config_share_settings(&this.share_settings);
+                                        this.sync_share_settings_to_tabs(cx);
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                    window.push_notification("Signed out (cloud data kept).", cx);
+                                    window.refresh();
+                                }),
+                        )
+                        .child(
+                            Button::new("logout-delete-cloud")
+                                .danger()
+                                .label("Delete Cloud Data & Sign Out")
+                                .on_click(move |_, window, cx| {
+                                    let srv_sync = del_srv.clone();
+                                    let tok_sync = del_token.clone();
+                                    let slug_sync = del_slug.clone();
+                                    let srv_share = del_share_srv.clone();
+                                    let tok_share = del_share_token.clone();
+                                    let slugs_share = del_share_slugs.clone();
+
+                                    let rx = dispatch_share_future(async move {
+                                        let mut errs = Vec::new();
+                                        if !srv_sync.is_empty()
+                                            && !tok_sync.is_empty()
+                                            && !slug_sync.is_empty()
+                                            && let Err(e) = delete_remote_sync_repo(
+                                                &srv_sync,
+                                                &tok_sync,
+                                                &slug_sync,
+                                            )
+                                            .await
+                                        {
+                                            errs.push(format!("Git sync delete: {e}"));
+                                        }
+                                        if !srv_share.is_empty() && !tok_share.is_empty() {
+                                            for s in slugs_share {
+                                                if let Err(e) = revoke_testrix_server_share(
+                                                    srv_share.clone(),
+                                                    tok_share.clone(),
+                                                    s.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    errs.push(format!("Share revoke ({s}): {e}"));
+                                                }
+                                            }
+                                        }
+                                        errs
+                                    });
+
+                                    let app_done = app_delete.clone();
+                                    window.close_dialog(cx);
+                                    window.spawn(cx, async move |window| {
+                                        let errs = rx.await.unwrap_or_default();
+                                        let _ = window.update(|window, cx| {
+                                            app_done.update(cx, |this, cx| {
+                                                this.sync_settings.sync_token.clear();
+                                                this.share_settings.share_token.clear();
+                                                this.active_shares.retain(|s| {
+                                                    s.channel != ShareChannel::TestrixServer
+                                                });
+                                                this.persist_remote_shares();
+                                                let _ = save_config_sync_settings(
+                                                    &this.sync_settings,
+                                                );
+                                                let _ = save_config_share_settings(
+                                                    &this.share_settings,
+                                                );
+                                                this.sync_share_settings_to_tabs(cx);
+                                                cx.notify();
+                                            });
+                                            if errs.is_empty() {
+                                                window.push_notification(
+                                                    "Deleted cloud data and signed out.",
+                                                    cx,
+                                                );
+                                            } else {
+                                                window.push_notification(
+                                                    format!(
+                                                        "Signed out with warnings: {}",
+                                                        errs.join("; ")
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                            window.refresh();
+                                        });
+                                    })
+                                    .detach();
+                                }),
+                        ),
+                )
+        });
     }
 
     fn effective_sync_credentials(&self) -> (String, String, String, String) {
@@ -5216,11 +5468,8 @@ impl TestrixApp {
                                             .label("Sign Out")
                                             .on_click(move |_, window, cx| {
                                                 app_logout.update(cx, |this, cx| {
-                                                    this.sync_settings.sync_token.clear();
-                                                    let _ = save_config_sync_settings(&this.sync_settings);
-                                                    cx.notify();
+                                                    this.confirm_logout_with_cloud_cleanup(window, cx);
                                                 });
-                                                window.refresh();
                                             }),
                                     ),
                             )

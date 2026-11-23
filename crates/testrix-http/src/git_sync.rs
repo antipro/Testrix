@@ -241,3 +241,29 @@ pub async fn push_merged_sync_state(
         .await
         .map_err(|e| format!("Invalid sync push response JSON: {e}"))
 }
+
+/// Deletes a Git Sync repository on `node-web` (`DELETE /api/sync/repos/:slug`).
+pub async fn delete_remote_sync_repo(
+    server_url: &str,
+    token: &str,
+    repo_slug: &str,
+) -> Result<(), String> {
+    let base = normalize_base_url(server_url)?;
+    let slug = repo_slug.trim();
+    if slug.is_empty() {
+        return Ok(());
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!("{base}/api/sync/repos/{slug}"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("Failed deleting remote sync repo: {e}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(extract_error(resp).await)
+    }
+}
