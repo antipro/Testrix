@@ -5220,21 +5220,17 @@ impl TestrixApp {
                     ),
                 )
                 .footer(
-                    DialogFooter::new().child(
-                        h_flex()
-                            .w_full()
-                            .flex_wrap()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                DialogClose::new()
-                                    .child(Button::new("logout-cancel").label("Cancel").outline()),
-                            )
-                            .child(
-                                Button::new("logout-keep-cloud")
-                                    .outline()
-                                    .label("Sign Out Only")
-                                    .on_click(move |_, window, cx| {
+                    DialogFooter::new()
+                        .gap_2()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("logout-cancel").label("Cancel").outline()),
+                        )
+                        .child(
+                            Button::new("logout-keep-cloud")
+                                .outline()
+                                .label("Sign Out Only")
+                                .on_click(move |_, window, cx| {
                                     app_keep.update(cx, |this, cx| {
                                         this.sync_settings.sync_token.clear();
                                         this.share_settings.share_token.clear();
@@ -5331,7 +5327,6 @@ impl TestrixApp {
                                     .detach();
                                 }),
                         ),
-                    ),
                 )
         });
     }
