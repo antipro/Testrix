@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,61 +29,12 @@ pub struct GitCommitInfo {
     pub file_path_at_commit: Option<String>,
 }
 
-fn git_cmd(workspace_root: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(workspace_root);
-    cmd
+fn git_err(context: &str, err: impl std::fmt::Display) -> StorageError {
+    StorageError::Git(format!("{context}: {err}"))
 }
 
-fn run_git_output(workspace_root: &Path, args: &[&str]) -> Result<std::process::Output, StorageError> {
-    git_cmd(workspace_root)
-        .args(args)
-        .output()
-        .map_err(|e| StorageError::Git(format!("failed to invoke git {:?}: {e}", args)))
-}
-
-fn run_git_checked(workspace_root: &Path, args: &[&str]) -> Result<String, StorageError> {
-    let output = run_git_output(workspace_root, args)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(StorageError::Git(format!(
-            "git {} failed: {detail}",
-            args.join(" ")
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn git_config_exists(workspace_root: &Path, key: &str) -> bool {
-    run_git_output(workspace_root, &["config", "--get", key])
-        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn run_git_commit(workspace_root: &Path, message: &str) -> Result<String, StorageError> {
-    let mut cmd = git_cmd(workspace_root);
-    if !git_config_exists(workspace_root, "user.name") {
-        cmd.arg("-c").arg("user.name=Testrix");
-    }
-    if !git_config_exists(workspace_root, "user.email") {
-        cmd.arg("-c").arg("user.email=testrix@local");
-    }
-    let output = cmd
-        .args(["commit", "-m", message])
-        .output()
-        .map_err(|e| StorageError::Git(format!("failed to invoke git commit: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(StorageError::Git(format!("git commit failed: {detail}")));
-    }
-
-    head_commit_hash(workspace_root)?
-        .ok_or_else(|| StorageError::Git("HEAD missing after git commit".to_string()))
+fn open_repo(workspace_root: &Path) -> Result<gix::Repository, StorageError> {
+    gix::discover(workspace_root).map_err(|e| git_err("failed to open git repository", e))
 }
 
 fn ensure_lines_in_file(path: &Path, patterns: &[&str]) -> Result<(), StorageError> {
@@ -131,35 +81,17 @@ fn ensure_lines_in_file(path: &Path, patterns: &[&str]) -> Result<(), StorageErr
     })
 }
 
-fn resolve_git_dir(workspace_root: &Path) -> Result<PathBuf, StorageError> {
-    let raw = run_git_checked(workspace_root, &["rev-parse", "--git-dir"])?;
-    let trimmed = raw.trim();
-    let p = PathBuf::from(trimmed);
-    if p.is_absolute() {
-        Ok(p)
-    } else {
-        Ok(workspace_root.join(p))
-    }
-}
-
 /// Returns `true` if `workspace_root` is inside a git working tree.
 pub fn is_git_repo(workspace_root: &Path) -> bool {
-    run_git_output(workspace_root, &["rev-parse", "--is-inside-work-tree"])
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
+    gix::discover(workspace_root).is_ok()
 }
 
 /// Returns the current `HEAD` commit hash, or `None` if the repo has no commits yet.
 pub fn head_commit_hash(workspace_root: &Path) -> Result<Option<String>, StorageError> {
-    let out = run_git_output(workspace_root, &["rev-parse", "--verify", "HEAD"])?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if hash.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(hash))
+    let repo = open_repo(workspace_root)?;
+    match repo.head_id() {
+        Ok(id) => Ok(Some(id.to_string())),
+        Err(_) => Ok(None),
     }
 }
 
@@ -176,27 +108,23 @@ pub fn ensure_workspace_git_repo(workspace_root: &Path) -> Result<bool, StorageE
         })?;
     }
 
-    let initialized_new = if is_git_repo(workspace_root) {
-        false
-    } else {
-        debug!(path = %workspace_root.display(), "initializing git repository for workspace");
-        let init_b = run_git_output(workspace_root, &["init", "-b", "main"])?;
-        if !init_b.status.success() {
-            run_git_checked(workspace_root, &["init"])?;
+    let (repo, initialized_new) = match gix::discover(workspace_root) {
+        Ok(repo) => (repo, false),
+        Err(_) => {
+            debug!(path = %workspace_root.display(), "initializing pure-rust git repository for workspace");
+            let repo = gix::init(workspace_root).map_err(|e| git_err("git init failed", e))?;
+            let gitignore_path = workspace_root.join(".gitignore");
+            if !gitignore_path.exists() {
+                ensure_lines_in_file(&gitignore_path, LOCAL_IGNORE_PATTERNS)?;
+            }
+            (repo, true)
         }
-        let gitignore_path = workspace_root.join(".gitignore");
-        if !gitignore_path.exists() {
-            ensure_lines_in_file(&gitignore_path, LOCAL_IGNORE_PATTERNS)?;
-        }
-        true
     };
 
     // Always exclude ephemeral Testrix files via .git/info/exclude so existing repos
     // without those entries in .gitignore never commit local tab/response state.
-    if let Ok(git_dir) = resolve_git_dir(workspace_root) {
-        let exclude_path = git_dir.join("info").join("exclude");
-        let _ = ensure_lines_in_file(&exclude_path, LOCAL_IGNORE_PATTERNS);
-    }
+    let exclude_path = repo.git_dir().join("info").join("exclude");
+    let _ = ensure_lines_in_file(&exclude_path, LOCAL_IGNORE_PATTERNS);
 
     // Create an initial commit if HEAD does not exist yet and there are files to commit.
     if head_commit_hash(workspace_root)?.is_none() {
@@ -204,6 +132,54 @@ pub fn ensure_workspace_git_repo(workspace_root: &Path) -> Result<bool, StorageE
     }
 
     Ok(initialized_new)
+}
+
+fn collect_workspace_files_raw(
+    work_dir: &Path,
+    cur_dir: &Path,
+    out: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), StorageError> {
+    let entries = fs::read_dir(cur_dir).map_err(|source| StorageError::Io {
+        path: cur_dir.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: cur_dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name == ".git" || name == ".DS_Store" || name.contains(".tmp.") {
+            continue;
+        }
+        let rel = workspace_relative_path(work_dir, &path)?;
+        if is_ephemeral_rel_path(&rel) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_workspace_files_raw(work_dir, &path, out)?;
+        } else if path.is_file() {
+            let bytes = fs::read(&path).map_err(|source| StorageError::Io { path, source })?;
+            out.insert(rel, bytes);
+        }
+    }
+    Ok(())
+}
+
+fn sync_git_index_to_tree(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+) -> Result<(), StorageError> {
+    let state = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
+        .map_err(|e| git_err("failed building index from tree", e))?;
+    let mut index = gix::index::File::from_state(state, repo.index_path());
+    index
+        .write(Default::default(), Default::default())
+        .map_err(|e| git_err("failed writing git index", e))?;
+    Ok(())
 }
 
 /// Stages all non-ignored workspace changes and creates a git commit with `message` if anything
@@ -217,16 +193,70 @@ pub fn commit_workspace_change(
         ensure_workspace_git_repo(workspace_root)?;
     }
 
-    run_git_checked(workspace_root, &["add", "-A"])?;
+    let mut repo = open_repo(workspace_root)?;
+    let work_dir = repo
+        .workdir()
+        .unwrap_or(workspace_root)
+        .to_path_buf();
 
-    let diff_out = run_git_output(workspace_root, &["diff", "--cached", "--quiet"])?;
-    if diff_out.status.success() {
-        // Exit code 0 means no staged differences.
+    let mut files = BTreeMap::new();
+    collect_workspace_files_raw(&work_dir, &work_dir, &mut files)?;
+
+    let empty_tree_id = repo.empty_tree().id;
+    let new_tree_id = {
+        let mut editor = repo
+            .edit_tree(empty_tree_id)
+            .map_err(|e| git_err("failed creating tree editor", e))?;
+        for (rel, bytes) in &files {
+            let blob_id = repo
+                .write_blob(bytes)
+                .map_err(|e| git_err("failed writing blob", e))?;
+            editor
+                .upsert(rel.as_str(), gix::object::tree::EntryKind::Blob, blob_id)
+                .map_err(|e| git_err("failed upserting tree entry", e))?;
+        }
+        editor
+            .write()
+            .map_err(|e| git_err("failed writing tree", e))?
+            .detach()
+    };
+
+    if let Ok(head_tree_id) = repo.head_tree_id()
+        && head_tree_id.detach() == new_tree_id
+    {
         return Ok(None);
     }
 
-    let hash = run_git_commit(workspace_root, message)?;
-    Ok(Some(hash))
+    let parents: Vec<gix::ObjectId> = repo
+        .head_id()
+        .ok()
+        .map(|id| vec![id.detach()])
+        .unwrap_or_default();
+
+    // Ensure committer/author identity exists (falling back to Testrix <testrix@local>).
+    let sig_owned = match repo.committer() {
+        Some(Ok(sig)) => sig.to_owned().map_err(|e| git_err("invalid committer", e))?,
+        _ => {
+            repo.committer_or_set_generic_fallback()
+                .map_err(|e| git_err("failed setting fallback identity", e))?;
+            let time = gix::date::Time::now_local_or_utc();
+            gix::actor::Signature {
+                name: "Testrix".into(),
+                email: "testrix@local".into(),
+                time,
+            }
+        }
+    };
+    let mut time_buf = gix::date::parse::TimeBuf::default();
+    let sig_ref = sig_owned.to_ref(&mut time_buf);
+
+    let commit_id = repo
+        .commit_as(sig_ref, sig_ref, "HEAD", message, new_tree_id, parents)
+        .map_err(|e| git_err("failed creating commit", e))?;
+
+    let _ = sync_git_index_to_tree(&repo, new_tree_id);
+
+    Ok(Some(commit_id.to_string()))
 }
 
 /// Computes a git-friendly forward-slash relative path for `file_path` inside `workspace_root`.
@@ -261,63 +291,88 @@ pub fn workspace_relative_path(
         .join("/"))
 }
 
-/// Lists git commits that modified `file_path` (following renames), newest first.
+fn tree_blob_id_at_path(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    rel_path: &str,
+) -> Option<gix::ObjectId> {
+    let tree = repo.find_tree(tree_id).ok()?;
+    let entry = tree.lookup_entry_by_path(rel_path).ok()??;
+    Some(entry.object_id())
+}
+
+/// Lists git commits that modified `file_path`, newest first.
 pub fn list_file_commits(
     workspace_root: &Path,
     file_path: &Path,
     limit: usize,
 ) -> Result<Vec<GitCommitInfo>, StorageError> {
-    if !is_git_repo(workspace_root) || head_commit_hash(workspace_root)?.is_none() {
+    if !is_git_repo(workspace_root) {
         return Ok(Vec::new());
     }
+    let repo = open_repo(workspace_root)?;
+    let Ok(head_id) = repo.head_id() else {
+        return Ok(Vec::new());
+    };
 
     let rel_path = workspace_relative_path(workspace_root, file_path)?;
-    let limit_str = limit.max(1).to_string();
-    let format_arg = "--format=COMMIT\x1f%H\x1f%h\x1f%an\x1f%at\x1f%s";
-    let output = run_git_checked(
-        workspace_root,
-        &[
-            "log",
-            "--follow",
-            "-n",
-            &limit_str,
-            "--name-only",
-            format_arg,
-            "--",
-            &rel_path,
-        ],
-    )?;
-
+    let max_commits = limit.max(1);
     let mut commits = Vec::new();
-    let mut current: Option<GitCommitInfo> = None;
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("COMMIT\x1f") {
-            if let Some(prev) = current.take() {
-                commits.push(prev);
+    let walk = repo
+        .rev_walk([head_id.detach()])
+        .all()
+        .map_err(|e| git_err("failed starting rev walk", e))?;
+
+    for item in walk {
+        let info = item.map_err(|e| git_err("rev walk error", e))?;
+        let commit = info
+            .object()
+            .map_err(|e| git_err("failed loading commit", e))?;
+        let tree_id = commit
+            .tree_id()
+            .map_err(|e| git_err("failed reading commit tree", e))?
+            .detach();
+
+        let cur_blob = tree_blob_id_at_path(&repo, tree_id, &rel_path);
+        let parent_id = commit.parent_ids().next().map(|p| p.detach());
+        let parent_blob = parent_id.and_then(|pid| {
+            let pcommit = repo.find_commit(pid).ok()?;
+            let ptree = pcommit.tree_id().ok()?.detach();
+            tree_blob_id_at_path(&repo, ptree, &rel_path)
+        });
+
+        // Include commit if the file was added or modified in this commit.
+        if cur_blob.is_some() && cur_blob != parent_blob {
+            let hash = commit.id.to_string();
+            let short_hash = hash[..hash.len().min(7)].to_string();
+            let author_sig = commit
+                .author()
+                .map_err(|e| git_err("failed reading commit author", e))?;
+            let author = author_sig.name.to_string();
+            let timestamp = commit.time().map(|t| t.seconds).unwrap_or(0);
+            let message = commit
+                .message_raw_sloppy()
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            commits.push(GitCommitInfo {
+                hash,
+                short_hash,
+                author,
+                timestamp,
+                message,
+                file_path_at_commit: Some(rel_path.clone()),
+            });
+
+            if commits.len() >= max_commits {
+                break;
             }
-            let parts: Vec<&str> = rest.splitn(5, '\x1f').collect();
-            if parts.len() == 5 {
-                current = Some(GitCommitInfo {
-                    hash: parts[0].to_string(),
-                    short_hash: parts[1].to_string(),
-                    author: parts[2].to_string(),
-                    timestamp: parts[3].parse::<i64>().unwrap_or(0),
-                    message: parts[4].to_string(),
-                    file_path_at_commit: None,
-                });
-            }
-        } else if !trimmed.is_empty()
-            && let Some(ref mut commit) = current
-            && commit.file_path_at_commit.is_none()
-        {
-            commit.file_path_at_commit = Some(trimmed.to_string());
         }
-    }
-
-    if let Some(last) = current.take() {
-        commits.push(last);
     }
 
     Ok(commits)
@@ -329,8 +384,23 @@ pub fn read_file_at_commit(
     rel_path: &str,
     commit_hash: &str,
 ) -> Result<String, StorageError> {
-    let spec = format!("{commit_hash}:{rel_path}");
-    run_git_checked(workspace_root, &["show", &spec])
+    let repo = open_repo(workspace_root)?;
+    let oid = gix::ObjectId::from_hex(commit_hash.as_bytes())
+        .map_err(|e| git_err("invalid commit hash", e))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|e| git_err("commit not found", e))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| git_err("failed loading commit tree", e))?;
+    let entry = tree
+        .lookup_entry_by_path(rel_path)
+        .map_err(|e| git_err("failed looking up path in tree", e))?
+        .ok_or_else(|| StorageError::Git(format!("path `{rel_path}` not found in {commit_hash}")))?;
+    let obj = entry
+        .object()
+        .map_err(|e| git_err("failed reading blob object", e))?;
+    Ok(String::from_utf8_lossy(&obj.data).to_string())
 }
 
 /// Restores `target_file_path` to its content at `commit_hash` and commits the restoration.
@@ -376,21 +446,13 @@ pub fn collect_workspace_tracked_files(
         ensure_workspace_git_repo(workspace_root)?;
     }
 
-    // Stage any untracked non-ignored files so ls-files sees the complete current workspace.
-    run_git_checked(workspace_root, &["add", "-A"])?;
-    let out = run_git_checked(workspace_root, &["ls-files"])?;
+    let mut raw_files = BTreeMap::new();
+    collect_workspace_files_raw(workspace_root, workspace_root, &mut raw_files)?;
 
     let mut files = BTreeMap::new();
-    for line in out.lines() {
-        let rel = line.trim();
-        if rel.is_empty() || is_ephemeral_rel_path(rel) {
-            continue;
-        }
-        let abs = workspace_root.join(rel);
-        if abs.is_file()
-            && let Ok(content) = fs::read_to_string(&abs)
-        {
-            files.insert(rel.to_string(), content);
+    for (rel, bytes) in raw_files {
+        if let Ok(text) = String::from_utf8(bytes) {
+            files.insert(rel, text);
         }
     }
     Ok(files)
@@ -404,7 +466,7 @@ fn is_ephemeral_rel_path(rel: &str) -> bool {
         || rel.ends_with("/.DS_Store")
 }
 
-/// Performs a 3-way text merge using `git merge-file`.
+/// Performs an in-memory pure-Rust 3-way text merge using `gix::merge`.
 ///
 /// Returns `(merged_content, has_conflicts)`.
 pub fn merge_file_three_way(
@@ -412,52 +474,34 @@ pub fn merge_file_three_way(
     local: &str,
     remote: &str,
 ) -> Result<(String, bool), StorageError> {
-    let dir = tempfile::tempdir().map_err(|e| StorageError::Git(format!("tempdir error: {e}")))?;
-    let local_p = dir.path().join("local");
-    let base_p = dir.path().join("base");
-    let remote_p = dir.path().join("remote");
+    use gix::merge::blob::{
+        Resolution,
+        builtin_driver::{
+            text,
+            text::{Labels, Options},
+        },
+    };
 
-    fs::write(&local_p, local.as_bytes()).map_err(|source| StorageError::Io {
-        path: local_p.clone(),
-        source,
-    })?;
-    fs::write(&base_p, base.as_bytes()).map_err(|source| StorageError::Io {
-        path: base_p.clone(),
-        source,
-    })?;
-    fs::write(&remote_p, remote.as_bytes()).map_err(|source| StorageError::Io {
-        path: remote_p.clone(),
-        source,
-    })?;
+    let mut out = Vec::new();
+    let mut input = gix::diff::blob::InternedInput::new(base.as_bytes(), local.as_bytes());
+    let labels = Labels {
+        ancestor: Some("base".into()),
+        current: Some("local".into()),
+        other: Some("remote".into()),
+    };
 
-    let output = Command::new("git")
-        .args([
-            "merge-file",
-            "-p",
-            "-L",
-            "local",
-            "-L",
-            "base",
-            "-L",
-            "remote",
-        ])
-        .arg(&local_p)
-        .arg(&base_p)
-        .arg(&remote_p)
-        .output()
-        .map_err(|e| StorageError::Git(format!("failed to invoke git merge-file: {e}")))?;
+    let resolution = text(
+        &mut out,
+        &mut input,
+        labels,
+        local.as_bytes(),
+        base.as_bytes(),
+        remote.as_bytes(),
+        Options::default(),
+    );
 
-    let code = output.status.code().unwrap_or(-1);
-    if code == 0 {
-        Ok((String::from_utf8_lossy(&output.stdout).to_string(), false))
-    } else if code > 0 && code < 128 {
-        Ok((String::from_utf8_lossy(&output.stdout).to_string(), true))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(StorageError::Git(format!(
-            "git merge-file failed (exit {code}): {stderr}"
-        )))
-    }
+    let has_conflicts = matches!(resolution, Resolution::Conflict);
+    Ok((String::from_utf8_lossy(&out).to_string(), has_conflicts))
 }
 
 /// Applies a merged file map and deletions to `workspace_root` and commits the result.
@@ -525,7 +569,7 @@ pub struct ThreeWayMergeResult {
 }
 
 fn sync_base_file_path(workspace_root: &Path, repo_slug: &str) -> Result<PathBuf, StorageError> {
-    let git_dir = resolve_git_dir(workspace_root)?;
+    let repo = open_repo(workspace_root)?;
     let safe_slug: String = repo_slug
         .chars()
         .map(|c| {
@@ -541,7 +585,7 @@ fn sync_base_file_path(workspace_root: &Path, repo_slug: &str) -> Result<PathBuf
     } else {
         safe_slug
     };
-    Ok(git_dir.join("testrix-sync").join(format!("{name}.json")))
+    Ok(repo.git_dir().join("testrix-sync").join(format!("{name}.json")))
 }
 
 /// Loads the last-synced base snapshot for `repo_slug` in `workspace_root`, if any.
