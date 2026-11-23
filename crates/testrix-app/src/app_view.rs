@@ -5643,9 +5643,14 @@ impl TestrixApp {
                 .map_err(|e| format!("Failed reading local files: {e}"))?;
             let base_snap = load_sync_base(&workspace_root, &repo_slug)
                 .map_err(|e| format!("Failed loading sync base: {e}"))?;
-            let base_files = base_snap.map(|s| s.files).unwrap_or_default();
-
             let remote = fetch_remote_sync_state(&server_url, &token, &repo_slug).await?;
+            // If the remote repository has no commits yet (empty/newly created or recreated),
+            // do not treat a stale local sync base as remote deletions.
+            let base_files = if remote.head_oid.is_none() {
+                std::collections::BTreeMap::new()
+            } else {
+                base_snap.map(|s| s.files).unwrap_or_default()
+            };
             let merge = three_way_merge_trees(&base_files, &local_files, &remote.files)
                 .map_err(|e| format!("3-way merge failed: {e}"))?;
 
