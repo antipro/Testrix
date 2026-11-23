@@ -4,6 +4,19 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v0.8.0] - 2026-11-23
+
+### Added
+- Add workspace Git history and bidirectional `node-web` sync, auto-starting global Git sync using the shared `node-web` account.
+- Prompt to sync on workspace switch and ask whether to delete cloud data on logout.
+- Add Windows single-instance system tray support.
+
+### Fixed
+- Semantically merge environment YAML variables during Git sync, keep valid YAML on 3-way merge conflicts instead of writing conflict markers, and preserve local files when syncing with an empty remote Git repository.
+- Prevent Sign Out dialog footer buttons from overflowing and keep them in a single row.
+- Auto-start the `optional/node-web` server when required by Passenger/LiteSpeed.
+- Fix compiler warnings in `tray` and `app_view`.
+
 ## [v0.7.0] - 2026-11-21
 
 ### Added
