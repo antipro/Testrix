@@ -2043,6 +2043,7 @@ impl TestrixApp {
                         tab.update(cx, |view, cx| view.mark_saved(cx));
                     }
                     self.sync_sidebars(None, cx);
+                    self.sync_all_tabs(window, cx);
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.refresh_dirty_indicators(cx);
                     self.sync_shared_project_after_save(&project_id, changed_file, window, cx);
@@ -2488,6 +2489,7 @@ impl TestrixApp {
                     };
                     self.commit_git_change(&format!("Update project: {proj_name}"));
                     self.sync_sidebars(None, cx);
+                    self.sync_all_tabs(window, cx);
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);
@@ -2520,6 +2522,7 @@ impl TestrixApp {
                     let changed_file = share_file_from_disk(&proj.root_dir, &folder_manifest_path);
                     self.commit_git_change(&format!("Update folder: {folder_name}"));
                     self.sync_sidebars(None, cx);
+                    self.sync_all_tabs(window, cx);
                     self.reveal_and_select_in_explorers(&target_key, cx);
                     self.sync_all_tabs(window, cx);
                     self.refresh_dirty_indicators(cx);

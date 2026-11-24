@@ -2429,6 +2429,53 @@ impl PackageTabView {
                             ),
                     ),
             )
+            .when(!collapsed, |panel| {
+                panel.child(
+                    div()
+                        .id("dag-console-scroll")
+                        .w_full()
+                        .h(px(180.))
+                        .overflow_y_scrollbar()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .when(self.console_logs.is_empty(), |list| {
+                            list.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("No execution logs yet. Click Play to run the DAG."),
+                            )
+                        })
+                        .children(self.console_logs.iter().enumerate().map(|(ix, entry)| {
+                            let color = match entry.level {
+                                ConsoleLogLevel::Info => cx.theme().muted_foreground,
+                                ConsoleLogLevel::Success => gpui_kit::rgb(0x16a34a).into(),
+                                ConsoleLogLevel::Error => cx.theme().danger,
+                            };
+                            let is_active_match = active_match_log_ix == Some(ix);
+                            let is_match = !query.is_empty() && matching_indices.contains(&ix);
+                            div()
+                                .w_full()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(cx.theme().radius)
+                                .when(is_active_match, |d| {
+                                    d.bg(cx.theme().accent)
+                                        .border_1()
+                                        .border_color(cx.theme().primary)
+                                })
+                                .when(!is_active_match && is_match, |d| {
+                                    d.bg(cx.theme().secondary)
+                                })
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(color)
+                                .child(entry.message.clone())
+                        })),
+                )
+            })
             .when(self.console_find_open && !collapsed, |panel| {
                 let match_label = if query.is_empty() {
                     String::new()
@@ -2444,6 +2491,7 @@ impl PackageTabView {
                         .absolute()
                         .top(px(34.))
                         .right_3()
+                        .occlude()
                         .items_center()
                         .gap_1()
                         .px_2()
@@ -2503,53 +2551,6 @@ impl PackageTabView {
                                     });
                                 }),
                         ),
-                )
-            })
-            .when(!collapsed, |panel| {
-                panel.child(
-                    div()
-                        .id("dag-console-scroll")
-                        .w_full()
-                        .h(px(180.))
-                        .overflow_y_scrollbar()
-                        .p_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .when(self.console_logs.is_empty(), |list| {
-                            list.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("No execution logs yet. Click Play to run the DAG."),
-                            )
-                        })
-                        .children(self.console_logs.iter().enumerate().map(|(ix, entry)| {
-                            let color = match entry.level {
-                                ConsoleLogLevel::Info => cx.theme().muted_foreground,
-                                ConsoleLogLevel::Success => gpui_kit::rgb(0x16a34a).into(),
-                                ConsoleLogLevel::Error => cx.theme().danger,
-                            };
-                            let is_active_match = active_match_log_ix == Some(ix);
-                            let is_match = !query.is_empty() && matching_indices.contains(&ix);
-                            div()
-                                .w_full()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(cx.theme().radius)
-                                .when(is_active_match, |d| {
-                                    d.bg(cx.theme().accent)
-                                        .border_1()
-                                        .border_color(cx.theme().primary)
-                                })
-                                .when(!is_active_match && is_match, |d| {
-                                    d.bg(cx.theme().secondary)
-                                })
-                                .text_xs()
-                                .whitespace_normal()
-                                .text_color(color)
-                                .child(entry.message.clone())
-                        })),
                 )
             })
             .into_any_element()
