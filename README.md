@@ -1,3 +1,5 @@
+[![Release](https://github.com/antipro/Testrix/actions/workflows/release.yml/badge.svg)](https://github.com/antipro/Testrix/actions/workflows/release.yml)
+
 # Testrix
 
 A native desktop API client and YAML-backed request workbench built with **Rust** (`1.100.0`) and **GPUI Kit (`v0.10.0`)**.
