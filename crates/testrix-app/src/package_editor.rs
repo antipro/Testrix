@@ -12,7 +12,7 @@ use gpui_kit::{
         WindowExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
-        input::{Editor, EditorState, Input, InputEvent, InputState},
+        input::{Editor, EditorState, InputEvent},
         scroll::ScrollableElement as _,
         tab::{Tab, TabBar},
         tag::{Tag, TagVariant},
@@ -92,6 +92,7 @@ pub(crate) enum DagNodeRunStatus {
     Skipped,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsoleLogLevel {
     Info,
@@ -101,6 +102,7 @@ enum ConsoleLogLevel {
 
 #[derive(Debug, Clone)]
 struct ConsoleLogEntry {
+    #[allow(dead_code)]
     level: ConsoleLogLevel,
     message: String,
 }
@@ -166,10 +168,7 @@ pub(crate) struct PackageTabView {
     run_summary: Option<Result<String, String>>,
     console_logs: Vec<ConsoleLogEntry>,
     console_collapsed: bool,
-    console_find_open: bool,
-    console_find_input: Entity<InputState>,
-    console_find_query: String,
-    console_find_match_ix: usize,
+    console_editor: Entity<EditorState>,
     last_thread_vars: BTreeMap<String, String>,
     node_drawer: Option<NodeOverrideDrawer>,
     _subscriptions: Vec<Subscription>,
@@ -195,8 +194,14 @@ impl PackageTabView {
                 .default_value(yaml_text)
         });
 
-        let console_find_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Find in console…")
+        let console_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("text")
+                .folding(false)
+                .searchable(true)
+                .replaceable(false)
+                .soft_wrap(true)
+                .default_value("")
         });
 
         let sub = cx.subscribe_in(
@@ -205,23 +210,6 @@ impl PackageTabView {
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) && !this.suppress_yaml_sync {
                     this.on_yaml_changed(cx);
-                }
-            },
-        );
-        let sub_find = cx.subscribe_in(
-            &console_find_input,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                match event {
-                    InputEvent::Change => {
-                        this.console_find_query = input.read(cx).value().to_string();
-                        this.console_find_match_ix = 0;
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { .. } => {
-                        this.step_console_find(1, cx);
-                    }
-                    _ => {}
                 }
             },
         );
@@ -249,13 +237,10 @@ impl PackageTabView {
             run_summary: None,
             console_logs: Vec::new(),
             console_collapsed: true,
-            console_find_open: false,
-            console_find_input,
-            console_find_query: String::new(),
-            console_find_match_ix: 0,
+            console_editor,
             last_thread_vars: BTreeMap::new(),
             node_drawer: None,
-            _subscriptions: vec![sub, sub_find],
+            _subscriptions: vec![sub],
         }
     }
 
@@ -529,6 +514,18 @@ impl PackageTabView {
         cx.notify();
     }
 
+    fn sync_console_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .console_logs
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.console_editor.update(cx, |ed, cx| {
+            ed.set_value(text, window, cx);
+        });
+    }
+
     fn run_dag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_running {
             return;
@@ -557,6 +554,7 @@ impl PackageTabView {
             level: ConsoleLogLevel::Info,
             message: format!("Starting DAG run ({} node(s))…", order.len()),
         });
+        self.sync_console_editor(window, cx);
         self.node_statuses.clear();
         for id in &order {
             self.node_statuses
@@ -588,7 +586,7 @@ impl PackageTabView {
                 };
 
                 // Mark current node Running and snapshot workspace/env from main view.
-                let prep_result = weak_self.update_in(cx, |this, _, cx| {
+                let prep_result = weak_self.update_in(cx, |this, window, cx| {
                     if this.run_revision != revision {
                         return Err("stale run".to_string());
                     }
@@ -659,6 +657,7 @@ impl PackageTabView {
                             message: format!("  Req Body: {body_preview}"),
                         });
                     }
+                    this.sync_console_editor(window, cx);
                     cx.notify();
 
                     Ok((
@@ -674,7 +673,7 @@ impl PackageTabView {
                     Ok(Ok(data)) => data,
                     Ok(Err(err)) => {
                         failure_message = Some(format!("{}: {err}", node.name));
-                        let _ = weak_self.update(cx, |this, cx| {
+                        let _ = weak_self.update_in(cx, |this, window, cx| {
                             if this.run_revision == revision {
                                 this.node_statuses.insert(
                                     node_id.clone(),
@@ -684,6 +683,7 @@ impl PackageTabView {
                                     level: ConsoleLogLevel::Error,
                                     message: format!("✗ {}: {err}", node.name),
                                 });
+                                this.sync_console_editor(window, cx);
                                 cx.notify();
                             }
                         });
@@ -748,7 +748,7 @@ impl PackageTabView {
 
                         if let Some(err) = script_err {
                             failure_message = Some(format!("{}: {err}", node.name));
-                            let _ = weak_self.update(cx, |this, cx| {
+                            let _ = weak_self.update_in(cx, |this, window, cx| {
                                 if this.run_revision == revision {
                                     this.console_logs.push(ConsoleLogEntry {
                                         level: ConsoleLogLevel::Error,
@@ -756,6 +756,7 @@ impl PackageTabView {
                                     });
                                     this.node_statuses
                                         .insert(node_id.clone(), DagNodeRunStatus::Failed(err));
+                                    this.sync_console_editor(window, cx);
                                     cx.notify();
                                 }
                             });
@@ -771,7 +772,7 @@ impl PackageTabView {
                         } else {
                             completed_count += 1;
                         }
-                        let _ = weak_self.update(cx, |this, cx| {
+                        let _ = weak_self.update_in(cx, |this, window, cx| {
                             if this.run_revision == revision {
                                 if is_http_error {
                                     this.node_statuses.insert(
@@ -823,6 +824,7 @@ impl PackageTabView {
                                         message: format!("  Resp Body: {resp_body}"),
                                     });
                                 }
+                                this.sync_console_editor(window, cx);
                                 cx.notify();
                             }
                         });
@@ -833,7 +835,7 @@ impl PackageTabView {
                     Ok(Err(err)) => {
                         let msg = err.to_string();
                         failure_message = Some(format!("{}: {msg}", node.name));
-                        let _ = weak_self.update(cx, |this, cx| {
+                        let _ = weak_self.update_in(cx, |this, window, cx| {
                             if this.run_revision == revision {
                                 this.console_logs.push(ConsoleLogEntry {
                                     level: ConsoleLogLevel::Error,
@@ -841,6 +843,7 @@ impl PackageTabView {
                                 });
                                 this.node_statuses
                                     .insert(node_id.clone(), DagNodeRunStatus::Failed(msg));
+                                this.sync_console_editor(window, cx);
                                 cx.notify();
                             }
                         });
@@ -854,7 +857,7 @@ impl PackageTabView {
             }
 
             let cancelled = cancel_token.is_cancelled();
-            let _ = weak_self.update(cx, |this, cx| {
+            let _ = weak_self.update_in(cx, |this, window, cx| {
                 if this.run_revision != revision {
                     return;
                 }
@@ -891,6 +894,7 @@ impl PackageTabView {
                     });
                     this.run_summary = Some(Ok(msg));
                 }
+                this.sync_console_editor(window, cx);
                 cx.notify();
             });
         })
@@ -2293,64 +2297,15 @@ impl PackageTabView {
             )
             .into_any_element()
     }
-    fn step_console_find(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let q = self.console_find_query.trim().to_ascii_lowercase();
-        if q.is_empty() {
-            self.console_find_match_ix = 0;
-            cx.notify();
-            return;
-        }
-        let match_count = self
-            .console_logs
-            .iter()
-            .filter(|e| e.message.to_ascii_lowercase().contains(&q))
-            .count();
-        if match_count == 0 {
-            self.console_find_match_ix = 0;
-        } else {
-            let cur = self.console_find_match_ix.min(match_count - 1) as isize;
-            let next = (cur + delta).rem_euclid(match_count as isize) as usize;
-            self.console_find_match_ix = next;
-        }
-        cx.notify();
-    }
-
     fn render_console_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let view = cx.entity();
         let view_toggle = view.clone();
         let view_clear = view.clone();
         let view_find = view.clone();
-        let view_prev = view.clone();
-        let view_next = view.clone();
-        let view_find_close = view.clone();
         let collapsed = self.console_collapsed;
         let log_count = self.console_logs.len();
 
-        let query = self.console_find_query.trim().to_ascii_lowercase();
-        let matching_indices: Vec<usize> = if query.is_empty() {
-            Vec::new()
-        } else {
-            self.console_logs
-                .iter()
-                .enumerate()
-                .filter_map(|(ix, entry)| {
-                    if entry.message.to_ascii_lowercase().contains(&query) {
-                        Some(ix)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        let active_match_log_ix = if matching_indices.is_empty() {
-            None
-        } else {
-            let clamped = self.console_find_match_ix.min(matching_indices.len() - 1);
-            Some(matching_indices[clamped])
-        };
-
         v_flex()
-            .relative()
             .w_full()
             .border_t_1()
             .border_color(cx.theme().border)
@@ -2401,14 +2356,11 @@ impl PackageTabView {
                                     .xsmall()
                                     .icon(Icon::new(IconName::Search))
                                     .tooltip("Find in console")
-                                    .on_click(move |_, window, cx| {
+                                    .on_click(move |_, _, cx| {
                                         view_find.update(cx, |this, cx| {
-                                            this.console_find_open = !this.console_find_open;
-                                            if this.console_find_open {
-                                                this.console_collapsed = false;
-                                                this.console_find_input
-                                                    .update(cx, |input, cx| input.focus(window, cx));
-                                            }
+                                            this.console_collapsed = false;
+                                            this.console_editor
+                                                .update(cx, |ed, cx| ed.open_search(false, cx));
                                             cx.notify();
                                         });
                                     }),
@@ -2419,10 +2371,10 @@ impl PackageTabView {
                                     .xsmall()
                                     .label("Clear")
                                     .disabled(self.console_logs.is_empty())
-                                    .on_click(move |_, _, cx| {
+                                    .on_click(move |_, window, cx| {
                                         view_clear.update(cx, |this, cx| {
                                             this.console_logs.clear();
-                                            this.console_find_match_ix = 0;
+                                            this.sync_console_editor(window, cx);
                                             cx.notify();
                                         });
                                     }),
@@ -2432,125 +2384,10 @@ impl PackageTabView {
             .when(!collapsed, |panel| {
                 panel.child(
                     div()
-                        .id("dag-console-scroll")
                         .w_full()
-                        .h(px(180.))
-                        .overflow_y_scrollbar()
-                        .p_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .when(self.console_logs.is_empty(), |list| {
-                            list.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("No execution logs yet. Click Play to run the DAG."),
-                            )
-                        })
-                        .children(self.console_logs.iter().enumerate().map(|(ix, entry)| {
-                            let color = match entry.level {
-                                ConsoleLogLevel::Info => cx.theme().muted_foreground,
-                                ConsoleLogLevel::Success => gpui_kit::rgb(0x16a34a).into(),
-                                ConsoleLogLevel::Error => cx.theme().danger,
-                            };
-                            let is_active_match = active_match_log_ix == Some(ix);
-                            let is_match = !query.is_empty() && matching_indices.contains(&ix);
-                            div()
-                                .w_full()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(cx.theme().radius)
-                                .when(is_active_match, |d| {
-                                    d.bg(cx.theme().accent)
-                                        .border_1()
-                                        .border_color(cx.theme().primary)
-                                })
-                                .when(!is_active_match && is_match, |d| {
-                                    d.bg(cx.theme().secondary)
-                                })
-                                .text_xs()
-                                .whitespace_normal()
-                                .text_color(color)
-                                .child(entry.message.clone())
-                        })),
-                )
-            })
-            .when(self.console_find_open && !collapsed, |panel| {
-                let match_label = if query.is_empty() {
-                    String::new()
-                } else if matching_indices.is_empty() {
-                    "0/0".to_string()
-                } else {
-                    let cur = self.console_find_match_ix.min(matching_indices.len() - 1) + 1;
-                    format!("{cur}/{}", matching_indices.len())
-                };
-                panel.child(
-                    h_flex()
-                        .id("dag-console-find-float")
-                        .absolute()
-                        .top(px(34.))
-                        .right_3()
-                        .occlude()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .rounded(cx.theme().radius)
-                        .bg(cx.theme().popover)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .shadow_md()
-                        .child(
-                            div()
-                                .w(px(190.))
-                                .child(Input::new(&self.console_find_input).xsmall()),
-                        )
-                        .when(!match_label.is_empty(), |row| {
-                            row.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .px_1()
-                                    .child(match_label),
-                            )
-                        })
-                        .child(
-                            Button::new("dag-console-find-prev")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::ChevronUp))
-                                .disabled(matching_indices.is_empty())
-                                .on_click(move |_, _, cx| {
-                                    view_prev.update(cx, |this, cx| {
-                                        this.step_console_find(-1, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("dag-console-find-next")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::ChevronDown))
-                                .disabled(matching_indices.is_empty())
-                                .on_click(move |_, _, cx| {
-                                    view_next.update(cx, |this, cx| {
-                                        this.step_console_find(1, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("dag-console-find-close")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::Close))
-                                .on_click(move |_, _, cx| {
-                                    view_find_close.update(cx, |this, cx| {
-                                        this.console_find_open = false;
-                                        cx.notify();
-                                    });
-                                }),
-                        ),
+                        .h(px(190.))
+                        .overflow_hidden()
+                        .child(Editor::new(&self.console_editor).h_full().w_full()),
                 )
             })
             .into_any_element()

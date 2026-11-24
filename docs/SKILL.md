@@ -203,7 +203,7 @@ Key field rules:
 - `request.url`: full URL or `/path` relative to `Project.baseUrl`.
 - `request.params` / `request.headers`: list of `{ name, value, enabled, description }` (`enabled` defaults to `true`).
 - `request.settings.timeoutMs`: must be `>= 1` (default `30000`).
-- `request.postScript`: optional QuickJS script with `environment`, `request`, and `response` globals (see [post-script.md](./post-script.md)).
+- `request.postScript`: optional QuickJS script with `environment`, `request`, `response`, and `thread` globals (see [post-script.md](./post-script.md)).
 - `request.responseExamples`: optional list of saved response snapshots (`{ id, name, statusCode, reason, contentType, headers, body }`).
 - `request.responseMeta`: optional extracted JSON/XML schema tree (`{ name, type, example, description, children }`) with editable field descriptions.
 
@@ -288,6 +288,71 @@ variables:
 - `bearer`: `token`, `prefix` (optional, default `"Bearer"`)
 - `basic`: `username`, `password`
 - `apiKey`: `key`, `value`, `in` (`header` or `query`)
+
+### 4.6 `Package` & Execution DAG (`.testrix-sets.yaml`)
+
+Packages (`RequestSet`) are stored in `<workspace-root>/.testrix-sets.yaml`. Use `testrix package ...` CLI commands to create/manage packages and items, and edit `.testrix-sets.yaml` (followed by `testrix notify reload`) to define or update a package's execution `dag`:
+
+```yaml
+sets:
+  - id: set-checkout-flow
+    name: Checkout Flow
+    requests:
+      - id: seti-login
+        projectId: proj-starter
+        requestId: req-login
+        name: Login
+        method: POST
+        url: /auth/login
+      - id: seti-create-order
+        projectId: proj-starter
+        requestId: req-create-order
+        name: Create Order
+        method: POST
+        url: /orders
+    dag:
+      nodes:
+        - id: node-login
+          projectId: proj-starter
+          requestId: req-login
+          name: Login
+          x: 60
+          y: 120
+        - id: node-create-order
+          projectId: proj-starter
+          requestId: req-create-order
+          name: Create Order
+          needs:
+            - node-login
+          overrides:
+            headers:
+              - name: Authorization
+                value: "Bearer {{thread.authToken}}"
+                enabled: true
+            postScript: |
+              thread.orderId = String(response.json().id);
+          x: 340
+          y: 120
+```
+
+#### Package DAG Rules for Agents
+
+1. **Dependencies use `needs` on `DagNode`** (not a separate `edges` list): list upstream `DagNode.id` values in `node.needs`.
+2. **No loops allowed**:
+   - Every `dep` in `node.needs` must reference an existing `DagNode.id` in the same `dag.nodes`.
+   - Self-loops (`node.id` in `node.needs`), duplicate entries in `needs`, and cycles of any length are invalid.
+3. **Coordinates (`x`, `y`)**: optional (`0` by default); if all nodes are `(0, 0)`, Testrix auto-lays out the DAG left-to-right by topological layer.
+4. **Float-layer `overrides`** (optional on `DagNode`):
+   - Supported fields: `params`, `pathParams`, `headers`, `body`, `auth`, `postScript`.
+   - Applied **only** during DAG execution without modifying the base `*.request.yaml` file.
+5. **DAG-scoped `thread` variables**:
+   - Upstream `postScript` (base or `overrides.postScript`) can write `thread.<key> = value`.
+   - Downstream nodes can reference `{{thread.<key>}}` in URLs, `params`, `pathParams`, `headers`, `body`, or `auth`, and read `thread.<key>` in downstream `postScript`.
+   - `thread` is ephemeral and only exists for the duration of a single DAG run.
+6. **Reload GUI after editing `.testrix-sets.yaml`**:
+   ```bash
+   testrix notify reload
+   ```
 
 ---
 
