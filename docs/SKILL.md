@@ -35,12 +35,22 @@ testrix folder   <list|create|update|delete>     --project <id-or-name> [--folde
 testrix item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
 testrix profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
 testrix var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
+testrix package  <list|get|create|update|delete|add-folder|update-folder|delete-folder|add-item|remove-item> [--package <id-or-name>] [--name <name>] [--folder <id-or-name>] [--parent <id-or-name>] [--project <id-or-name>] [--item <id-or-name>]
 testrix share    <list|status|config-set|login|publish|revoke> [--project <id-or-name>] [--channel <server|r2>] [--share <id>] [--access-token <token>]
 testrix notify   reload
 ```
 
 - Run `testrix <resource> --help` (or `testrix --help`) to see all supported resources and actions.
-- Mutating CLI CRUD commands (`create`, `update`, `delete`, `set`, `merge`) automatically notify any running Testrix GUI instance via IPC (Unix Domain Socket on macOS/Linux, Named Pipe on Windows) to reload the workspace.
+- Mutating CLI CRUD commands (`create`, `update`, `delete`, `set`, `merge`, `add-folder`, `update-folder`, `delete-folder`, `add-item`, `remove-item`) automatically notify any running Testrix GUI instance via IPC (Unix Domain Socket on macOS/Linux, Named Pipe on Windows) to reload the workspace.
+- Package examples:
+  ```bash
+  testrix package list
+  testrix package create --name "Smoke Suite"
+  testrix package add-folder --package "Smoke Suite" --name "Auth"
+  testrix package add-item --package "Smoke Suite" --folder "Auth" --project <project-id-or-name> --item <item-id-or-name>
+  testrix package remove-item --package "Smoke Suite" --folder "Auth" --item <item-id-or-name>
+  testrix package delete --package "Smoke Suite"
+  ```
 - Sharing examples:
   ```bash
   testrix share status

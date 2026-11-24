@@ -179,7 +179,25 @@ pub(crate) fn effective_shortcut(
 /// Registers keyboard shortcuts before menu construction.
 pub(crate) fn init_keybindings(cx: &mut App) {
     if !cx.has_global::<BaseKeyBindings>() {
-        let base = cx.key_bindings().borrow().bindings().cloned().collect();
+        let mut seen = HashSet::new();
+        let base = cx
+            .key_bindings()
+            .borrow()
+            .bindings()
+            .filter(|binding| {
+                // Both `gpui_kit::init` and `gpui_shell::init` call `gpui_base::init`,
+                // registering duplicate base keybindings (e.g. `down -> MoveDown`),
+                // which would otherwise dispatch twice in completion popovers.
+                let key = (
+                    format!("{:?}", binding.keystrokes()),
+                    binding.action().name(),
+                    format!("{:?}", binding.predicate()),
+                    binding.action_input(),
+                );
+                seen.insert(key)
+            })
+            .cloned()
+            .collect();
         cx.set_global(BaseKeyBindings(base));
     }
     apply_keybindings(&BTreeMap::new(), cx);

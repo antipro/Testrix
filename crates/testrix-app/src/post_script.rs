@@ -863,4 +863,97 @@ mod tests {
         );
         assert_eq!(result.changed_global_keys, vec!["global_token".to_string()]);
     }
+
+    #[gpui_kit::gpui::test]
+    fn post_script_completion_menu_down_moves_one_step(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{
+            AppContext as _, Focusable, IntoElement, ParentElement, Render, Styled,
+            VisualTestContext,
+            component::{
+                Root,
+                input::{Editor, EditorState},
+            },
+        };
+
+        struct EditorTestView {
+            editor: gpui_kit::Entity<EditorState>,
+        }
+
+        impl Render for EditorTestView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut gpui_kit::Context<Self>,
+            ) -> impl IntoElement {
+                gpui_kit::div()
+                    .size_full()
+                    .child(Editor::new(&self.editor).size_full())
+            }
+        }
+
+        cx.update(|cx| {
+            crate::app_view::init_app(cx);
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let provider = Rc::new(PostScriptCompletionProvider::new(None, None));
+            let editor = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).language("javascript");
+                state.lsp_mut().completion_provider = Some(provider);
+                state
+            });
+            let view = cx.new(|_| EditorTestView { editor });
+            Root::new(view, window, cx)
+        });
+        let mut visual_cx = VisualTestContext::from_window(window.into(), cx);
+        visual_cx.run_until_parked();
+
+        let editor = window
+            .read_with(&visual_cx, |root, cx| {
+                root.view()
+                    .clone()
+                    .downcast::<EditorTestView>()
+                    .expect("root view")
+                    .read(cx)
+                    .editor
+                    .clone()
+            })
+            .expect("read editor");
+
+        visual_cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.focus_handle(cx).focus(window, cx);
+            });
+        });
+        visual_cx.run_until_parked();
+
+        // Type "re" -> completions are ["request", "response"]; Down once selects "response".
+        visual_cx.simulate_input("re");
+        visual_cx.run_until_parked();
+        visual_cx.simulate_keystrokes("down");
+        visual_cx.run_until_parked();
+        visual_cx.simulate_keystrokes("enter");
+        visual_cx.run_until_parked();
+
+        let value = visual_cx.read(|cx| editor.read(cx).value().to_string());
+        assert_eq!(value, "response\n");
+
+        // Type ".": completions for "response." are ["status", "reason", "headers", "body", ...].
+        // Down once selects "reason", Up once returns to "status".
+        visual_cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        });
+        visual_cx.run_until_parked();
+        visual_cx.simulate_input("request.");
+        visual_cx.run_until_parked();
+        visual_cx.simulate_keystrokes("down");
+        visual_cx.run_until_parked();
+        visual_cx.simulate_keystrokes("enter");
+        visual_cx.run_until_parked();
+
+        let value = visual_cx.read(|cx| editor.read(cx).value().to_string());
+        assert_eq!(value, "request.name\n");
+    }
 }

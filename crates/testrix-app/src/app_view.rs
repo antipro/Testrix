@@ -1520,6 +1520,7 @@ impl TestrixApp {
                         self.env_editor.update(cx, |editor, cx| {
                             editor.focus_profile(&new_id, window, cx);
                         });
+                        self.maybe_auto_git_sync(window, cx);
                     }
                     Err(err) => {
                         window.push_notification(format!("Failed creating profile: {err}"), cx);
@@ -1527,36 +1528,69 @@ impl TestrixApp {
                 }
             }
             EnvEditorEvent::Delete { env_id } => {
-                let Some(pos) = self
+                let Some(env_name) = self
                     .workspace
                     .environments
                     .iter()
-                    .position(|e| e.doc.id == env_id)
+                    .find(|e| e.doc.id == env_id)
+                    .map(|e| e.doc.name.clone())
                 else {
                     return;
                 };
-                let removed = self.workspace.environments.remove(pos);
-                if let Err(err) = delete_environment(&removed.file_path) {
-                    window.push_notification(format!("Failed deleting profile: {err}"), cx);
-                    self.workspace.environments.insert(pos, removed);
-                    return;
-                }
-                self.commit_git_change(&format!("Delete environment: {}", removed.doc.name));
-                if self.workspace.active_environment_id.as_deref() == Some(&env_id) {
-                    self.workspace.active_environment_id = self
-                        .workspace
-                        .environments
-                        .first()
-                        .map(|e| e.doc.id.clone());
-                    let _ = save_workspace_state(
-                        &self.workspace_dir,
-                        self.workspace.active_project_id.as_deref(),
-                        self.workspace.active_environment_id.as_deref(),
-                    );
-                }
-                self.refresh_profile_selector(window, cx);
-                self.sync_env_editor(window, cx);
-                self.sync_all_tabs(window, cx);
+                let app_entity = cx.entity();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let app_ok = app_entity.clone();
+                    let eid = env_id.clone();
+                    let title_name = env_name.clone();
+                    alert
+                        .title(format!("Delete profile \"{title_name}\"?"))
+                        .description("This permanently removes the profile YAML file from disk.")
+                        .confirm()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            app_ok.update(cx, |this, cx| {
+                                let Some(pos) = this
+                                    .workspace
+                                    .environments
+                                    .iter()
+                                    .position(|e| e.doc.id == eid)
+                                else {
+                                    return;
+                                };
+                                let removed = this.workspace.environments.remove(pos);
+                                if let Err(err) = delete_environment(&removed.file_path) {
+                                    window.push_notification(
+                                        format!("Failed deleting profile: {err}"),
+                                        cx,
+                                    );
+                                    this.workspace.environments.insert(pos, removed);
+                                    return;
+                                }
+                                this.commit_git_change(&format!(
+                                    "Delete environment: {}",
+                                    removed.doc.name
+                                ));
+                                if this.workspace.active_environment_id.as_deref() == Some(&eid) {
+                                    this.workspace.active_environment_id = this
+                                        .workspace
+                                        .environments
+                                        .first()
+                                        .map(|e| e.doc.id.clone());
+                                    let _ = save_workspace_state(
+                                        &this.workspace_dir,
+                                        this.workspace.active_project_id.as_deref(),
+                                        this.workspace.active_environment_id.as_deref(),
+                                    );
+                                }
+                                this.refresh_profile_selector(window, cx);
+                                this.sync_env_editor(window, cx);
+                                this.sync_all_tabs(window, cx);
+                                this.maybe_auto_git_sync(window, cx);
+                            });
+                            true
+                        })
+                });
             }
             EnvEditorEvent::SelectActive { env_id } => {
                 self.select_environment(env_id, window, cx);

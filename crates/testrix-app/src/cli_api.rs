@@ -4,7 +4,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use testrix_core::{
     AuthConfig, EnvVariable, EnvironmentNode, FolderNode, HttpMethod, HttpRequestSpec,
-    ProjectNode, RequestNode, generate_id, parse_request_script,
+    ProjectNode, RequestNode, RequestSet, RequestSetFolder, RequestSetItem, generate_id,
+    parse_request_script,
 };
 use testrix_http::{
     ShareChannel, collect_project_yaml_files, dispatch_share_future, login_testrix_server,
@@ -14,8 +15,9 @@ use testrix_http::{
 use testrix_storage::{
     PersistedShareRecord, ShareSettings, create_environment, create_folder, create_project,
     create_request, delete_environment, delete_folder, delete_project, delete_request,
-    init_or_load_config, load_workspace, save_config_share_settings, save_config_shared_projects,
-    save_environment, save_folder, save_project, save_request, validate_yaml_file,
+    init_or_load_config, load_workspace, load_workspace_sets, save_config_share_settings,
+    save_config_shared_projects, save_environment, save_folder, save_project, save_request,
+    save_workspace_sets, validate_yaml_file,
 };
 
 #[derive(Debug, Serialize)]
@@ -50,6 +52,10 @@ pub fn is_api_resource(arg: &str) -> bool {
             | "vars"
             | "variable"
             | "variables"
+            | "package"
+            | "packages"
+            | "set"
+            | "sets"
             | "share"
             | "shares"
             | "notify"
@@ -62,7 +68,16 @@ pub fn execute_cli_api(workspace_dir: &Path, args: &[String]) -> Result<String, 
     let value = dispatch_api(workspace_dir, &parsed)?;
     if matches!(
         parsed.action.as_str(),
-        "create" | "update" | "delete" | "set" | "merge"
+        "create"
+            | "update"
+            | "delete"
+            | "set"
+            | "merge"
+            | "add-folder"
+            | "update-folder"
+            | "delete-folder"
+            | "add-item"
+            | "remove-item"
     ) && !matches!(parsed.resource.as_str(), "share" | "shares" | "notify" | "reload")
     {
         let _ = crate::ipc::send_reload_notification(Some(workspace_dir));
@@ -356,6 +371,7 @@ fn dispatch_api(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Strin
             handle_profile(workspace_dir, cmd)
         }
         "var" | "vars" | "variable" | "variables" => handle_var(workspace_dir, cmd),
+        "package" | "packages" | "set" | "sets" => handle_package(workspace_dir, cmd),
         "share" | "shares" => handle_share(workspace_dir, cmd),
         "notify" | "reload" => handle_notify(workspace_dir, cmd),
         other => Err(format!("Unknown resource `{other}`")),
@@ -938,6 +954,208 @@ fn resolve_default_share_channel(settings: &ShareSettings) -> ShareChannel {
     }
 }
 
+fn count_set_requests(folders: &[RequestSetFolder], requests: &[RequestSetItem]) -> usize {
+    requests.len()
+        + folders
+            .iter()
+            .map(|f| count_set_requests(&f.folders, &f.requests))
+            .sum::<usize>()
+}
+
+fn find_set<'a>(sets: &'a [RequestSet], id_or_name: &str) -> Result<&'a RequestSet, String> {
+    sets.iter()
+        .find(|s| s.id == id_or_name || s.name == id_or_name)
+        .ok_or_else(|| format!("Package `{id_or_name}` not found"))
+}
+
+fn find_set_mut<'a>(
+    sets: &'a mut [RequestSet],
+    id_or_name: &str,
+) -> Result<&'a mut RequestSet, String> {
+    sets.iter_mut()
+        .find(|s| s.id == id_or_name || s.name == id_or_name)
+        .ok_or_else(|| format!("Package `{id_or_name}` not found"))
+}
+
+fn find_set_folder_mut<'a>(
+    folders: &'a mut [RequestSetFolder],
+    id_or_name: &str,
+) -> Result<&'a mut RequestSetFolder, String> {
+    for folder in folders {
+        if folder.id == id_or_name || folder.name == id_or_name {
+            return Ok(folder);
+        }
+        if let Ok(found) = find_set_folder_mut(&mut folder.folders, id_or_name) {
+            return Ok(found);
+        }
+    }
+    Err(format!("Package folder `{id_or_name}` not found"))
+}
+
+fn remove_set_folder(folders: &mut Vec<RequestSetFolder>, id_or_name: &str) -> Option<String> {
+    if let Some(pos) = folders
+        .iter()
+        .position(|f| f.id == id_or_name || f.name == id_or_name)
+    {
+        return Some(folders.remove(pos).id);
+    }
+    for folder in folders {
+        if let Some(removed) = remove_set_folder(&mut folder.folders, id_or_name) {
+            return Some(removed);
+        }
+    }
+    None
+}
+
+fn remove_set_item(requests: &mut Vec<RequestSetItem>, item_ref: &str) -> Option<String> {
+    let pos = requests
+        .iter()
+        .position(|r| r.id == item_ref || r.request_id == item_ref || r.name == item_ref)?;
+    Some(requests.remove(pos).id)
+}
+
+fn handle_package(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
+    let mut sets = load_workspace_sets(workspace_dir);
+
+    match cmd.action.as_str() {
+        "list" => {
+            let out: Vec<Value> = sets
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "name": s.name,
+                        "folderCount": s.folders.len(),
+                        "requestCount": s.requests.len(),
+                        "totalRequestCount": count_set_requests(&s.folders, &s.requests),
+                    })
+                })
+                .collect();
+            Ok(json!(out))
+        }
+        "get" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let pkg = find_set(&sets, pkg_ref)?;
+            serde_json::to_value(pkg).map_err(|e| e.to_string())
+        }
+        "create" => {
+            let name = validate_non_empty_name(req_flag(cmd, "name")?, "Package")?;
+            let pkg = RequestSet {
+                id: generate_id("set"),
+                name,
+                folders: Vec::new(),
+                requests: Vec::new(),
+            };
+            sets.push(pkg.clone());
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&pkg).map_err(|e| e.to_string())
+        }
+        "update" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let name = validate_non_empty_name(req_flag(cmd, "name")?, "Package")?;
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            pkg.name = name;
+            let updated = pkg.clone();
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&updated).map_err(|e| e.to_string())
+        }
+        "delete" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let pos = sets
+                .iter()
+                .position(|s| s.id == pkg_ref || s.name == pkg_ref)
+                .ok_or_else(|| format!("Package `{pkg_ref}` not found"))?;
+            let removed = sets.remove(pos);
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": removed.id }))
+        }
+        "add-folder" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let name = validate_non_empty_name(req_flag(cmd, "name")?, "Package folder")?;
+            let parent_ref = opt_flag(cmd, "parent").map(str::to_string);
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            let folder = RequestSetFolder {
+                id: generate_id("setf"),
+                name,
+                folders: Vec::new(),
+                requests: Vec::new(),
+            };
+            if let Some(parent) = parent_ref.as_deref() {
+                let target = find_set_folder_mut(&mut pkg.folders, parent)?;
+                target.folders.push(folder.clone());
+            } else {
+                pkg.folders.push(folder.clone());
+            }
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&folder).map_err(|e| e.to_string())
+        }
+        "update-folder" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let folder_ref = req_flag(cmd, "folder")?;
+            let name = validate_non_empty_name(req_flag(cmd, "name")?, "Package folder")?;
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            let folder = find_set_folder_mut(&mut pkg.folders, folder_ref)?;
+            folder.name = name;
+            let updated = folder.clone();
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&updated).map_err(|e| e.to_string())
+        }
+        "delete-folder" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let folder_ref = req_flag(cmd, "folder")?;
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            let removed_id = remove_set_folder(&mut pkg.folders, folder_ref)
+                .ok_or_else(|| format!("Package folder `{folder_ref}` not found"))?;
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": removed_id }))
+        }
+        "add-item" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let project_ref = req_flag(cmd, "project")?;
+            let item_ref = req_flag(cmd, "item")?;
+            let folder_ref = opt_flag(cmd, "folder").map(str::to_string);
+
+            let tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
+            let proj = find_project(&tree.projects, project_ref)?;
+            let req = find_request_in_project(proj, item_ref)?;
+            let set_item = RequestSetItem {
+                id: generate_id("seti"),
+                project_id: proj.doc.id.clone(),
+                request_id: req.doc.id.clone(),
+                name: req.doc.name.clone(),
+                method: req.doc.request.method,
+                url: req.doc.request.url.clone(),
+            };
+
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            if let Some(folder_name) = folder_ref.as_deref() {
+                let target = find_set_folder_mut(&mut pkg.folders, folder_name)?;
+                target.requests.push(set_item.clone());
+            } else {
+                pkg.requests.push(set_item.clone());
+            }
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&set_item).map_err(|e| e.to_string())
+        }
+        "remove-item" => {
+            let pkg_ref = req_flag(cmd, "package")?;
+            let item_ref = req_flag(cmd, "item")?;
+            let folder_ref = opt_flag(cmd, "folder").map(str::to_string);
+            let pkg = find_set_mut(&mut sets, pkg_ref)?;
+            let removed_id = if let Some(folder_name) = folder_ref.as_deref() {
+                let target = find_set_folder_mut(&mut pkg.folders, folder_name)?;
+                remove_set_item(&mut target.requests, item_ref)
+            } else {
+                remove_set_item(&mut pkg.requests, item_ref)
+            }
+            .ok_or_else(|| format!("Package item `{item_ref}` not found"))?;
+            save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": removed_id }))
+        }
+        other => Err(format!("Unknown package action `{other}`")),
+    }
+}
+
 fn handle_share(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
     match cmd.action.as_str() {
         "list" => {
@@ -1384,5 +1602,131 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let bad = execute_cli_api(dir.path(), &s(&["share", "revoke"]));
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn package_crud_and_folder_item_management() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+
+        execute_cli_api(ws, &s(&["project", "create", "--name", "Orders"])).unwrap();
+        execute_cli_api(
+            ws,
+            &s(&[
+                "item",
+                "create",
+                "--project",
+                "Orders",
+                "--name",
+                "List Orders",
+                "--method",
+                "GET",
+                "--url",
+                "{{base_url}}/orders",
+            ]),
+        )
+        .unwrap();
+
+        let created = execute_cli_api(ws, &s(&["package", "create", "--name", "Smoke"])).unwrap();
+        assert!(created.contains(r#""name": "Smoke""#));
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "update",
+                "--package",
+                "Smoke",
+                "--name",
+                "Regression",
+            ]),
+        )
+        .unwrap();
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "add-folder",
+                "--package",
+                "Regression",
+                "--name",
+                "Auth",
+            ]),
+        )
+        .unwrap();
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "update-folder",
+                "--package",
+                "Regression",
+                "--folder",
+                "Auth",
+                "--name",
+                "Core",
+            ]),
+        )
+        .unwrap();
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "add-item",
+                "--package",
+                "Regression",
+                "--folder",
+                "Core",
+                "--project",
+                "Orders",
+                "--item",
+                "List Orders",
+            ]),
+        )
+        .unwrap();
+
+        let list = execute_cli_api(ws, &s(&["package", "list"])).unwrap();
+        assert!(list.contains(r#""name": "Regression""#));
+        assert!(list.contains(r#""totalRequestCount": 1"#));
+
+        let fetched =
+            execute_cli_api(ws, &s(&["package", "get", "--package", "Regression"])).unwrap();
+        assert!(fetched.contains("List Orders"));
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "remove-item",
+                "--package",
+                "Regression",
+                "--folder",
+                "Core",
+                "--item",
+                "List Orders",
+            ]),
+        )
+        .unwrap();
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "delete-folder",
+                "--package",
+                "Regression",
+                "--folder",
+                "Core",
+            ]),
+        )
+        .unwrap();
+
+        execute_cli_api(ws, &s(&["package", "delete", "--package", "Regression"])).unwrap();
+
+        let empty_list = execute_cli_api(ws, &s(&["package", "list"])).unwrap();
+        assert!(empty_list.contains("[]"));
     }
 }
