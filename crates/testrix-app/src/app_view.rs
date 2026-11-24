@@ -4161,6 +4161,8 @@ impl TestrixApp {
                                 .gap_3()
                                 .child(
                                     v_flex()
+                                        .flex_1()
+                                        .min_w_0()
                                         .gap_0p5()
                                         .child(
                                             div()
@@ -4176,7 +4178,7 @@ impl TestrixApp {
                                         ),
                                 )
                                 .child(
-                                    div().w(px(196.)).flex_none().child(
+                                    div().w(px(230.)).flex_none().child(
                                         Select::new(&close_behavior_select)
                                             .id("pref-close-behavior-select")
                                             .small(),
