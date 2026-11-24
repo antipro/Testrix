@@ -21,7 +21,7 @@ pub use auth::{
     resolve_project_auth, resolve_request_auth, resolve_request_doc_auth,
 };
 pub use codegen::{CodegenTarget, generate_request_code, parse_request_script};
-pub use dag::{DagEdge, DagNode, DagValidationError, PackageDag};
+pub use dag::{DagNode, DagValidationError, PackageDag};
 pub use error::CoreError;
 pub use materialize::{
     PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,

@@ -1365,6 +1365,13 @@ impl TestrixApp {
                     self.refresh_dirty_indicators(cx);
                 }
             }
+            PackageTabEvent::AddRequestToSet { set_id, item } => {
+                if let Some(set) = self.request_sets.iter_mut().find(|s| s.id == set_id) {
+                    set.requests.push(item);
+                    let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                    self.sync_sidebars(None, cx);
+                }
+            }
             PackageTabEvent::OpenRequest {
                 project_id,
                 request_id,

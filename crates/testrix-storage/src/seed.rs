@@ -1,11 +1,15 @@
 use std::path::Path;
 
 use testrix_core::{
-    ApiKeyLocation, AuthConfig, EnvVariable, EnvironmentDoc, FolderDoc, HttpMethod, HttpRequestDoc,
-    KeyValueRow, MultipartField, ProjectDoc, RawBodyFormat, RequestBody,
+    ApiKeyLocation, AuthConfig, DagNode, EnvVariable, EnvironmentDoc, FolderDoc, HttpMethod,
+    HttpRequestDoc, KeyValueRow, MultipartField, PackageDag, ProjectDoc, RawBodyFormat,
+    RequestBody, RequestSet, RequestSetItem,
 };
 
-use crate::{error::StorageError, workspace::write_yaml_atomic};
+use crate::{
+    error::StorageError,
+    workspace::{save_workspace_sets, write_yaml_atomic},
+};
 
 /// Populates `workspace_root` with an example multi-folder API project conforming to `testrix.io/v1`.
 pub fn seed_starter_workspace(workspace_root: &Path) -> Result<(), StorageError> {
@@ -252,6 +256,71 @@ pub fn seed_starter_workspace(workspace_root: &Path) -> Result<(), StorageError>
         &security_dir.join("public-health-check.request.yaml"),
         &public_ping,
     )?;
+
+    // Demo Package with a simple 3-node DAG
+    let demo_package = RequestSet {
+        id: "set-starter-demo".to_string(),
+        name: "Demo Flow".to_string(),
+        folders: Vec::new(),
+        requests: vec![
+            RequestSetItem {
+                id: "seti-demo-inspect".to_string(),
+                project_id: project.id.clone(),
+                request_id: inspect_request.id.clone(),
+                name: inspect_request.name.clone(),
+                method: inspect_request.request.method,
+                url: inspect_request.request.url.clone(),
+            },
+            RequestSetItem {
+                id: "seti-demo-list-users".to_string(),
+                project_id: project.id.clone(),
+                request_id: list_users.id.clone(),
+                name: list_users.name.clone(),
+                method: list_users.request.method,
+                url: list_users.request.url.clone(),
+            },
+            RequestSetItem {
+                id: "seti-demo-create-user".to_string(),
+                project_id: project.id.clone(),
+                request_id: create_user.id.clone(),
+                name: create_user.name.clone(),
+                method: create_user.request.method,
+                url: create_user.request.url.clone(),
+            },
+        ],
+        dag: PackageDag {
+            nodes: vec![
+                DagNode {
+                    id: "node-inspect".to_string(),
+                    project_id: project.id.clone(),
+                    request_id: inspect_request.id.clone(),
+                    name: inspect_request.name.clone(),
+                    needs: Vec::new(),
+                    x: 60.0,
+                    y: 120.0,
+                },
+                DagNode {
+                    id: "node-list-users".to_string(),
+                    project_id: project.id.clone(),
+                    request_id: list_users.id.clone(),
+                    name: list_users.name.clone(),
+                    needs: vec!["node-inspect".to_string()],
+                    x: 340.0,
+                    y: 60.0,
+                },
+                DagNode {
+                    id: "node-create-user".to_string(),
+                    project_id: project.id.clone(),
+                    request_id: create_user.id.clone(),
+                    name: create_user.name.clone(),
+                    needs: vec!["node-inspect".to_string()],
+                    x: 340.0,
+                    y: 180.0,
+                },
+            ],
+        },
+    };
+    save_workspace_sets(workspace_root, &[demo_package])?;
 
     Ok(())
 }

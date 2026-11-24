@@ -354,11 +354,10 @@ sets:
           projectId: proj-starter
           requestId: req-create-order
           name: Create Order
+          needs:
+            - node-login
           x: 340
           y: 120
-      edges:
-        - from: node-login
-          to: node-create-order
 ```
 
 ### 7.1 `PackageDag` Schema
@@ -366,7 +365,6 @@ sets:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `nodes` | `DagNode[]` | No | List of request nodes in the DAG. |
-| `edges` | `DagEdge[]` | No | List of directed dependency edges (`from` -> `to`). |
 
 #### `DagNode`
 
@@ -376,20 +374,14 @@ sets:
 | `projectId` | `string` | No | Owning project ID (recommended; if omitted, resolved by `requestId`). |
 | `requestId` | `string` | Yes | Target `HttpRequest.id` to execute. |
 | `name` | `string` | No | Display label in the DAG canvas. |
+| `needs` | `string[]` | No | Upstream `DagNode.id` dependencies that must complete before this node runs. |
 | `x` | `number` | No | Canvas X coordinate in pixels (default `0`). |
 | `y` | `number` | No | Canvas Y coordinate in pixels (default `0`). |
-
-#### `DagEdge`
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `from` | `string` | Yes | Upstream `DagNode.id` that must complete first. |
-| `to` | `string` | Yes | Downstream `DagNode.id` that runs after `from`. |
 
 ### 7.2 DAG Validation Rules
 
 1. Node `id` values must be non-empty and unique within the DAG.
 2. Node `requestId` must be non-empty.
-3. Every edge's `from` and `to` must reference an existing `DagNode.id`.
-4. **No loops**: Self-loops (`from == to`), duplicate edges, and cycles of any length are rejected.
+3. Every entry in `node.needs` must reference an existing `DagNode.id` in the same DAG.
+4. **No loops**: Self-loops (`node.needs` containing `node.id`), duplicate entries in `needs`, and cycles of any length are rejected.
 5. Downstream nodes may reference ephemeral `thread` variables written by upstream post-scripts via `{{thread.<key>}}` in request templates or `thread.<key>` in post-scripts.

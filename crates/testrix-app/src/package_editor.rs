@@ -12,8 +12,10 @@ use gpui_kit::{
         button::{Button, ButtonVariants as _},
         h_flex,
         input::{Editor, EditorState, InputEvent},
+        scroll::ScrollableElement as _,
         tab::{Tab, TabBar},
         tag::{Tag, TagVariant},
+        tooltip::Tooltip,
         v_flex,
     },
     div,
@@ -21,8 +23,9 @@ use gpui_kit::{
     px,
 };
 use testrix_core::{
-    DagEdge, DagNode, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag, ProjectNode,
-    RequestSet, WorkspaceTree, generate_id, materialize_request_doc_with_extra_vars,
+    DagNode, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag, ProjectNode, RequestSet,
+    RequestSetFolder, RequestSetItem, WorkspaceTree, generate_id,
+    materialize_request_doc_with_extra_vars,
 };
 use testrix_http::{CancellationToken, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -52,6 +55,19 @@ pub(crate) enum DagNodeRunStatus {
     Skipped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleLogLevel {
+    Info,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleLogEntry {
+    level: ConsoleLogLevel,
+    message: String,
+}
+
 #[derive(Debug, Clone)]
 struct NodeDragState {
     node_id: String,
@@ -71,6 +87,10 @@ pub(crate) enum PackageTabEvent {
     SaveSet {
         set_id: String,
         set: RequestSet,
+    },
+    AddRequestToSet {
+        set_id: String,
+        item: RequestSetItem,
     },
     OpenRequest {
         project_id: String,
@@ -107,6 +127,8 @@ pub(crate) struct PackageTabView {
     active_cancel: Option<CancellationToken>,
     node_statuses: HashMap<String, DagNodeRunStatus>,
     run_summary: Option<Result<String, String>>,
+    console_logs: Vec<ConsoleLogEntry>,
+    console_collapsed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -161,6 +183,8 @@ impl PackageTabView {
             active_cancel: None,
             node_statuses: HashMap::new(),
             run_summary: None,
+            console_logs: Vec::new(),
+            console_collapsed: true,
             _subscriptions: vec![sub],
         }
     }
@@ -324,12 +348,29 @@ impl PackageTabView {
 
         self.set.dag.nodes.push(DagNode {
             id: node_id.clone(),
-            project_id,
-            request_id,
+            project_id: project_id.clone(),
+            request_id: request_id.clone(),
             name: drag.name.clone(),
+            needs: Vec::new(),
             x,
             y,
         });
+        if !project_id.is_empty() && !set_contains_request(&self.set, &project_id, &request_id) {
+            let item = RequestSetItem {
+                id: generate_id("seti"),
+                project_id,
+                request_id,
+                name: drag.name.clone(),
+                method: drag.method,
+                url: drag.url.clone(),
+            };
+            self.set.requests.push(item.clone());
+            self.saved_set.requests.push(item.clone());
+            cx.emit(PackageTabEvent::AddRequestToSet {
+                set_id: self.set.id.clone(),
+                item,
+            });
+        }
         self.selected_node_id = Some(node_id);
         self.selected_edge = None;
         self.sync_yaml_from_dag(window, cx);
@@ -351,9 +392,9 @@ impl PackageTabView {
         if self
             .set
             .dag
-            .edges
+            .nodes
             .iter()
-            .any(|e| e.from == from_id && e.to == to_id)
+            .any(|n| n.id == to_id && n.needs.iter().any(|d| d == from_id))
         {
             return;
         }
@@ -364,10 +405,9 @@ impl PackageTabView {
             );
             return;
         }
-        self.set.dag.edges.push(DagEdge {
-            from: from_id.to_string(),
-            to: to_id.to_string(),
-        });
+        if let Some(target) = self.set.dag.nodes.iter_mut().find(|n| n.id == to_id) {
+            target.needs.push(from_id.to_string());
+        }
         self.selected_edge = Some((from_id.to_string(), to_id.to_string()));
         self.selected_node_id = None;
         self.sync_yaml_from_dag(window, cx);
@@ -377,10 +417,9 @@ impl PackageTabView {
 
     fn delete_node(&mut self, node_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.set.dag.nodes.retain(|n| n.id != node_id);
-        self.set
-            .dag
-            .edges
-            .retain(|e| e.from != node_id && e.to != node_id);
+        for node in &mut self.set.dag.nodes {
+            node.needs.retain(|d| d != node_id);
+        }
         if self.selected_node_id.as_deref() == Some(node_id) {
             self.selected_node_id = None;
         }
@@ -397,10 +436,9 @@ impl PackageTabView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set
-            .dag
-            .edges
-            .retain(|e| !(e.from == from && e.to == to));
+        if let Some(target) = self.set.dag.nodes.iter_mut().find(|n| n.id == to) {
+            target.needs.retain(|d| d != from);
+        }
         if self
             .selected_edge
             .as_ref()
@@ -436,6 +474,11 @@ impl PackageTabView {
         self.active_cancel = Some(cancel_token.clone());
         self.is_running = true;
         self.run_summary = None;
+        self.console_collapsed = false;
+        self.console_logs.push(ConsoleLogEntry {
+            level: ConsoleLogLevel::Info,
+            message: format!("Starting DAG run ({} node(s))…", order.len()),
+        });
         self.node_statuses.clear();
         for id in &order {
             self.node_statuses
@@ -514,6 +557,10 @@ impl PackageTabView {
                                     node_id.clone(),
                                     DagNodeRunStatus::Failed(err.clone()),
                                 );
+                                this.console_logs.push(ConsoleLogEntry {
+                                    level: ConsoleLogLevel::Error,
+                                    message: format!("✗ {}: {err}", node.name),
+                                });
                                 cx.notify();
                             }
                         });
@@ -570,6 +617,10 @@ impl PackageTabView {
                             failure_message = Some(format!("{}: {err}", node.name));
                             let _ = weak_self.update(cx, |this, cx| {
                                 if this.run_revision == revision {
+                                    this.console_logs.push(ConsoleLogEntry {
+                                        level: ConsoleLogLevel::Error,
+                                        message: format!("✗ {}: {err}", node.name),
+                                    });
                                     this.node_statuses
                                         .insert(node_id.clone(), DagNodeRunStatus::Failed(err));
                                     cx.notify();
@@ -590,6 +641,13 @@ impl PackageTabView {
                                         duration_ms,
                                     },
                                 );
+                                this.console_logs.push(ConsoleLogEntry {
+                                    level: ConsoleLogLevel::Success,
+                                    message: format!(
+                                        "✓ {}: {status_code} · {duration_ms}ms",
+                                        node.name
+                                    ),
+                                });
                                 cx.notify();
                             }
                         });
@@ -599,6 +657,10 @@ impl PackageTabView {
                         failure_message = Some(format!("{}: {msg}", node.name));
                         let _ = weak_self.update(cx, |this, cx| {
                             if this.run_revision == revision {
+                                this.console_logs.push(ConsoleLogEntry {
+                                    level: ConsoleLogLevel::Error,
+                                    message: format!("✗ {}: {msg}", node.name),
+                                });
                                 this.node_statuses
                                     .insert(node_id.clone(), DagNodeRunStatus::Failed(msg));
                                 cx.notify();
@@ -629,13 +691,27 @@ impl PackageTabView {
                             .insert(id.clone(), DagNodeRunStatus::Skipped);
                     }
                 }
-                this.run_summary = Some(if cancelled {
-                    Err(format!("Stopped ({completed_count}/{total_count} completed)"))
+                if cancelled {
+                    let msg = format!("Stopped ({completed_count}/{total_count} completed)");
+                    this.console_logs.push(ConsoleLogEntry {
+                        level: ConsoleLogLevel::Error,
+                        message: msg.clone(),
+                    });
+                    this.run_summary = Some(Err(msg));
                 } else if let Some(err) = failure_message {
-                    Err(err)
+                    this.console_logs.push(ConsoleLogEntry {
+                        level: ConsoleLogLevel::Error,
+                        message: format!("DAG run failed: {err}"),
+                    });
+                    this.run_summary = Some(Err(format!("Failed ({completed_count}/{total_count})")));
                 } else {
-                    Ok(format!("Completed {completed_count}/{total_count} nodes"))
-                });
+                    let msg = format!("Completed {completed_count}/{total_count} nodes");
+                    this.console_logs.push(ConsoleLogEntry {
+                        level: ConsoleLogLevel::Success,
+                        message: msg.clone(),
+                    });
+                    this.run_summary = Some(Ok(msg));
+                }
                 cx.notify();
             });
         })
@@ -661,7 +737,10 @@ impl PackageTabView {
         let view_canvas = view.clone();
 
         let nodes = self.set.dag.nodes.clone();
-        let edges = self.set.dag.edges.clone();
+        let edges: Vec<(String, String)> = nodes
+            .iter()
+            .flat_map(|n| n.needs.iter().map(move |dep| (dep.clone(), n.id.clone())))
+            .collect();
         let connecting = self.connecting_from.clone();
         let selected_edge = self.selected_edge.clone();
         let node_statuses = self.node_statuses.clone();
@@ -675,9 +754,9 @@ impl PackageTabView {
 
         // Collect edge midpoint coordinates for delete pills.
         let mut edge_midpoints: Vec<(String, String, f32, f32, bool)> = Vec::new();
-        for edge in &edges {
+        for (from_id, to_id) in &edges {
             if let (Some(from_n), Some(to_n)) =
-                (nodes_map.get(edge.from.as_str()), nodes_map.get(edge.to.as_str()))
+                (nodes_map.get(from_id.as_str()), nodes_map.get(to_id.as_str()))
             {
                 let x1 = from_n.x + NODE_WIDTH;
                 let y1 = from_n.y + NODE_HEIGHT * 0.5;
@@ -685,10 +764,10 @@ impl PackageTabView {
                 let y2 = to_n.y + NODE_HEIGHT * 0.5;
                 let is_sel = selected_edge
                     .as_ref()
-                    .is_some_and(|(f, t)| f == &edge.from && t == &edge.to);
+                    .is_some_and(|(f, t)| f == from_id && t == to_id);
                 edge_midpoints.push((
-                    edge.from.clone(),
-                    edge.to.clone(),
+                    from_id.clone(),
+                    to_id.clone(),
                     (x1 + x2) * 0.5,
                     (y1 + y2) * 0.5,
                     is_sel,
@@ -770,9 +849,9 @@ impl PackageTabView {
                         let map: HashMap<&str, &DagNode> =
                             canvas_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-                        for edge in &canvas_edges {
+                        for (from_id, to_id) in &canvas_edges {
                             let (Some(from_n), Some(to_n)) =
-                                (map.get(edge.from.as_str()), map.get(edge.to.as_str()))
+                                (map.get(from_id.as_str()), map.get(to_id.as_str()))
                             else {
                                 continue;
                             };
@@ -786,11 +865,11 @@ impl PackageTabView {
                             );
                             let color = if selected_edge
                                 .as_ref()
-                                .is_some_and(|(f, t)| f == &edge.from && t == &edge.to)
+                                .is_some_and(|(f, t)| f == from_id && t == to_id)
                             {
                                 active_edge_color
                             } else if matches!(
-                                node_statuses.get(&edge.from),
+                                node_statuses.get(from_id),
                                 Some(DagNodeRunStatus::Success { .. })
                             ) {
                                 success_edge_color.into()
@@ -1094,20 +1173,60 @@ impl PackageTabView {
             .child(
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .items_center()
                     .justify_between()
+                    .gap_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(match &status {
-                        DagNodeRunStatus::Idle => "Ready".to_string(),
-                        DagNodeRunStatus::Pending => "Pending…".to_string(),
-                        DagNodeRunStatus::Running => "Running…".to_string(),
+                        DagNodeRunStatus::Idle => div().child("Ready").into_any_element(),
+                        DagNodeRunStatus::Pending => div().child("Pending…").into_any_element(),
+                        DagNodeRunStatus::Running => div().child("Running…").into_any_element(),
                         DagNodeRunStatus::Success {
                             status_code,
                             duration_ms,
-                        } => format!("{status_code} · {duration_ms}ms"),
-                        DagNodeRunStatus::Failed(err) => format!("Failed: {err}"),
-                        DagNodeRunStatus::Skipped => "Skipped".to_string(),
+                        } => div()
+                            .text_color(gpui_kit::rgb(0x16a34a))
+                            .child(format!("{status_code} · {duration_ms}ms"))
+                            .into_any_element(),
+                        DagNodeRunStatus::Failed(err) => {
+                            let err_msg = err.clone();
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().danger)
+                                        .font_medium()
+                                        .child("Failed"),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("dag-node-warn-{}", node.id)))
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .tooltip(move |window, cx| {
+                                            let msg = err_msg.clone();
+                                            Tooltip::element(move |_, _| {
+                                                div()
+                                                    .max_w(px(320.))
+                                                    .whitespace_normal()
+                                                    .text_xs()
+                                                    .child(msg.clone())
+                                            })
+                                            .build(window, cx)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .size(px(14.))
+                                                .text_color(cx.theme().warning),
+                                        ),
+                                )
+                                .into_any_element()
+                        }
+                        DagNodeRunStatus::Skipped => div().child("Skipped").into_any_element(),
                     }),
             )
             // Input Port (left)
@@ -1204,6 +1323,123 @@ impl PackageTabView {
             )
             .into_any_element()
     }
+    fn render_console_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let view_toggle = cx.entity();
+        let view_clear = cx.entity();
+        let collapsed = self.console_collapsed;
+        let log_count = self.console_logs.len();
+
+        v_flex()
+            .w_full()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .items_center()
+                    .justify_between()
+                    .bg(cx.theme().secondary)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Button::new("dag-console-toggle-btn")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    }))
+                                    .on_click(move |_, _, cx| {
+                                        view_toggle.update(cx, |this, cx| {
+                                            this.console_collapsed = !this.console_collapsed;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(format!("Console ({log_count})")),
+                            ),
+                    )
+                    .child(
+                        Button::new("dag-console-clear-btn")
+                            .ghost()
+                            .xsmall()
+                            .label("Clear")
+                            .disabled(self.console_logs.is_empty())
+                            .on_click(move |_, _, cx| {
+                                view_clear.update(cx, |this, cx| {
+                                    this.console_logs.clear();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .when(!collapsed, |panel| {
+                panel.child(
+                    div()
+                        .id("dag-console-scroll")
+                        .w_full()
+                        .h(px(150.))
+                        .overflow_y_scrollbar()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .when(self.console_logs.is_empty(), |list| {
+                            list.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("No execution logs yet. Click Play to run the DAG."),
+                            )
+                        })
+                        .children(self.console_logs.iter().map(|entry| {
+                            let color = match entry.level {
+                                ConsoleLogLevel::Info => cx.theme().muted_foreground,
+                                ConsoleLogLevel::Success => gpui_kit::rgb(0x16a34a).into(),
+                                ConsoleLogLevel::Error => cx.theme().danger,
+                            };
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(color)
+                                .child(entry.message.clone())
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+fn set_contains_request(set: &RequestSet, project_id: &str, request_id: &str) -> bool {
+    fn folder_contains(folder: &RequestSetFolder, project_id: &str, request_id: &str) -> bool {
+        folder
+            .requests
+            .iter()
+            .any(|r| r.project_id == project_id && r.request_id == request_id)
+            || folder
+                .folders
+                .iter()
+                .any(|f| folder_contains(f, project_id, request_id))
+    }
+    set.requests
+        .iter()
+        .any(|r| r.project_id == project_id && r.request_id == request_id)
+        || set
+            .folders
+            .iter()
+            .any(|f| folder_contains(f, project_id, request_id))
 }
 
 fn paint_arrow_curve(
@@ -1326,9 +1562,16 @@ impl Render for PackageTabView {
                             ),
                     ),
             )
-            .child(match self.active_section {
-                PackageSection::Dag => self.render_draw_pane(cx),
-                PackageSection::Yaml => self.render_yaml_pane(cx),
-            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(match self.active_section {
+                        PackageSection::Dag => self.render_draw_pane(cx),
+                        PackageSection::Yaml => self.render_yaml_pane(cx),
+                    }),
+            )
+            .child(self.render_console_panel(cx))
     }
 }

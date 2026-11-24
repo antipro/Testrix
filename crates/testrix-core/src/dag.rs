@@ -13,6 +13,8 @@ pub struct DagNode {
     pub request_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
     #[serde(default)]
     pub x: f32,
     #[serde(default)]
@@ -25,6 +27,7 @@ impl PartialEq for DagNode {
             && self.project_id == other.project_id
             && self.request_id == other.request_id
             && self.name == other.name
+            && self.needs == other.needs
             && self.x.to_bits() == other.x.to_bits()
             && self.y.to_bits() == other.y.to_bits()
     }
@@ -32,22 +35,12 @@ impl PartialEq for DagNode {
 
 impl Eq for DagNode {}
 
-/// A directed dependency edge from `from` (upstream) to `to` (downstream).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DagEdge {
-    pub from: String,
-    pub to: String,
-}
-
 /// Directed Acyclic Graph (DAG) defining request execution order inside a Package (`RequestSet`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageDag {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<DagNode>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub edges: Vec<DagEdge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -58,26 +51,22 @@ pub enum DagValidationError {
     DuplicateNodeId(String),
     #[error("DAG node `{node_id}` must specify a non-empty requestId")]
     EmptyRequestId { node_id: String },
-    #[error("edge `{edge_from} -> {edge_to}` references unknown node `{missing}`")]
-    MissingNodeReference {
-        edge_from: String,
-        edge_to: String,
-        missing: String,
-    },
+    #[error("node `{node_id}` needs unknown node `{missing}`")]
+    MissingDependency { node_id: String, missing: String },
     #[error("self-loop detected on node `{0}` (loops are not allowed in a DAG)")]
     SelfLoop(String),
-    #[error("duplicate edge `{from} -> {to}`")]
-    DuplicateEdge { from: String, to: String },
+    #[error("node `{node_id}` lists duplicate dependency `{dependency}` in needs")]
+    DuplicateDependency { node_id: String, dependency: String },
     #[error("cycle detected in DAG involving: {}", .0.join(" -> "))]
     CycleDetected(Vec<String>),
 }
 
 impl PackageDag {
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.edges.is_empty()
+        self.nodes.is_empty()
     }
 
-    /// Validates node uniqueness, edge references, and acyclicity (no loops).
+    /// Validates node uniqueness, `needs` references, and acyclicity (no loops).
     pub fn validate(&self) -> Result<(), DagValidationError> {
         let mut node_ids = BTreeSet::new();
         for node in &self.nodes {
@@ -95,32 +84,26 @@ impl PackageDag {
             }
         }
 
-        let mut seen_edges = BTreeSet::new();
-        for edge in &self.edges {
-            let from = edge.from.trim();
-            let to = edge.to.trim();
-            if !node_ids.contains(from) {
-                return Err(DagValidationError::MissingNodeReference {
-                    edge_from: from.to_string(),
-                    edge_to: to.to_string(),
-                    missing: from.to_string(),
-                });
-            }
-            if !node_ids.contains(to) {
-                return Err(DagValidationError::MissingNodeReference {
-                    edge_from: from.to_string(),
-                    edge_to: to.to_string(),
-                    missing: to.to_string(),
-                });
-            }
-            if from == to {
-                return Err(DagValidationError::SelfLoop(from.to_string()));
-            }
-            if !seen_edges.insert((from.to_string(), to.to_string())) {
-                return Err(DagValidationError::DuplicateEdge {
-                    from: from.to_string(),
-                    to: to.to_string(),
-                });
+        for node in &self.nodes {
+            let to = node.id.trim();
+            let mut seen_needs = BTreeSet::new();
+            for raw_dep in &node.needs {
+                let from = raw_dep.trim();
+                if !node_ids.contains(from) {
+                    return Err(DagValidationError::MissingDependency {
+                        node_id: to.to_string(),
+                        missing: from.to_string(),
+                    });
+                }
+                if from == to {
+                    return Err(DagValidationError::SelfLoop(to.to_string()));
+                }
+                if !seen_needs.insert(from.to_string()) {
+                    return Err(DagValidationError::DuplicateDependency {
+                        node_id: to.to_string(),
+                        dependency: from.to_string(),
+                    });
+                }
             }
         }
 
@@ -128,20 +111,28 @@ impl PackageDag {
         Ok(())
     }
 
-    /// Returns `true` if adding `from -> to` would create a self-loop, duplicate edge, or cycle.
+    /// Returns `true` if adding dependency `from -> to` (`to` needs `from`) would create a
+    /// self-loop, duplicate dependency, or cycle.
     pub fn would_create_cycle(&self, from: &str, to: &str) -> bool {
         if from == to {
             return true;
         }
-        if self.edges.iter().any(|e| e.from == from && e.to == to) {
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.id == to && n.needs.iter().any(|d| d == from))
+        {
             return true;
         }
-        // Check if `from` is reachable from `to` via existing edges.
+        // Build forward adjacency: dep -> node.id.
+        // Adding `from -> to` creates a cycle iff `from` is reachable from `to`.
         let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for edge in &self.edges {
-            adj.entry(edge.from.as_str())
-                .or_default()
-                .push(edge.to.as_str());
+        for node in &self.nodes {
+            for dep in &node.needs {
+                adj.entry(dep.as_str())
+                    .or_default()
+                    .push(node.id.as_str());
+            }
         }
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
@@ -175,14 +166,16 @@ impl PackageDag {
             in_degree.entry(id.clone()).or_insert(0);
             adj.entry(id).or_default();
         }
-        for edge in &self.edges {
-            let from = edge.from.trim().to_string();
-            let to = edge.to.trim().to_string();
-            if let Some(deg) = in_degree.get_mut(&to) {
-                *deg += 1;
-            }
-            if let Some(neighbors) = adj.get_mut(&from) {
-                neighbors.push(to);
+        for node in &self.nodes {
+            let to = node.id.trim().to_string();
+            for raw_dep in &node.needs {
+                let from = raw_dep.trim().to_string();
+                if let Some(deg) = in_degree.get_mut(&to) {
+                    *deg += 1;
+                }
+                if let Some(neighbors) = adj.get_mut(&from) {
+                    neighbors.push(to.clone());
+                }
             }
         }
 
@@ -259,21 +252,15 @@ impl PackageDag {
 mod tests {
     use super::*;
 
-    fn node(id: &str, req: &str) -> DagNode {
+    fn node(id: &str, req: &str, needs: &[&str]) -> DagNode {
         DagNode {
             id: id.to_string(),
             project_id: "proj-1".to_string(),
             request_id: req.to_string(),
             name: id.to_string(),
+            needs: needs.iter().map(|s| (*s).to_string()).collect(),
             x: 0.0,
             y: 0.0,
-        }
-    }
-
-    fn edge(from: &str, to: &str) -> DagEdge {
-        DagEdge {
-            from: from.to_string(),
-            to: to.to_string(),
         }
     }
 
@@ -281,16 +268,10 @@ mod tests {
     fn validates_and_sorts_diamond_dag() {
         let dag = PackageDag {
             nodes: vec![
-                node("login", "req-1"),
-                node("profile", "req-2"),
-                node("settings", "req-3"),
-                node("logout", "req-4"),
-            ],
-            edges: vec![
-                edge("login", "profile"),
-                edge("login", "settings"),
-                edge("profile", "logout"),
-                edge("settings", "logout"),
+                node("login", "req-1", &[]),
+                node("profile", "req-2", &["login"]),
+                node("settings", "req-3", &["login"]),
+                node("logout", "req-4", &["profile", "settings"]),
             ],
         };
         assert!(dag.validate().is_ok());
@@ -308,8 +289,7 @@ mod tests {
     #[test]
     fn rejects_cycle_and_self_loop() {
         let self_loop = PackageDag {
-            nodes: vec![node("a", "req-1")],
-            edges: vec![edge("a", "a")],
+            nodes: vec![node("a", "req-1", &["a"])],
         };
         assert!(matches!(
             self_loop.validate(),
@@ -317,8 +297,11 @@ mod tests {
         ));
 
         let cycle = PackageDag {
-            nodes: vec![node("a", "req-1"), node("b", "req-2"), node("c", "req-3")],
-            edges: vec![edge("a", "b"), edge("b", "c"), edge("c", "a")],
+            nodes: vec![
+                node("a", "req-1", &["c"]),
+                node("b", "req-2", &["a"]),
+                node("c", "req-3", &["b"]),
+            ],
         };
         assert!(matches!(
             cycle.validate(),
@@ -330,8 +313,11 @@ mod tests {
     #[test]
     fn would_create_cycle_detects_transitive_back_edge() {
         let dag = PackageDag {
-            nodes: vec![node("a", "req-1"), node("b", "req-2"), node("c", "req-3")],
-            edges: vec![edge("a", "b"), edge("b", "c")],
+            nodes: vec![
+                node("a", "req-1", &[]),
+                node("b", "req-2", &["a"]),
+                node("c", "req-3", &["b"]),
+            ],
         };
         assert!(dag.would_create_cycle("c", "a"));
         assert!(dag.would_create_cycle("b", "a"));
