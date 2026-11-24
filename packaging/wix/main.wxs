@@ -76,8 +76,7 @@
           Name="Testrix"
           Description="Testrix — YAML API Workbench"
           Target="[INSTALLFOLDER]testrix.exe"
-          WorkingDirectory="INSTALLFOLDER"
-          Icon="AppIcon.ico" />
+          WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
           Root="HKCU"
@@ -97,8 +96,7 @@
           Name="Testrix"
           Description="Testrix — YAML API Workbench"
           Target="[INSTALLFOLDER]testrix.exe"
-          WorkingDirectory="INSTALLFOLDER"
-          Icon="AppIcon.ico" />
+          WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue
           Root="HKCU"
           Key="Software\Testrix"
