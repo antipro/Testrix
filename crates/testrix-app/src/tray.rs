@@ -253,10 +253,40 @@ fn win32_set_window_visibility(window: &Window, show: bool) {
 }
 
 fn load_tray_icon() -> Result<TrayIconImage, String> {
-    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+    let raw = image::load_from_memory(include_bytes!("../assets/icon.png"))
         .map_err(|err| err.to_string())?
-        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
-    let (w, h) = img.dimensions();
-    TrayIconImage::from_rgba(img.into_raw(), w, h).map_err(|err| err.to_string())
+    let (src_w, src_h) = raw.dimensions();
+
+    // Crop transparent padding and outer drop-shadow so the icon fills the tray slot.
+    let mut min_x = src_w;
+    let mut min_y = src_h;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    for (x, y, px) in raw.enumerate_pixels() {
+        if px[3] >= 180 {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+
+    let cropped = if min_x <= max_x && min_y <= max_y {
+        image::imageops::crop_imm(
+            &raw,
+            min_x,
+            min_y,
+            max_x - min_x + 1,
+            max_y - min_y + 1,
+        )
+        .to_image()
+    } else {
+        raw
+    };
+
+    let resized =
+        image::imageops::resize(&cropped, 64, 64, image::imageops::FilterType::Lanczos3);
+    let (w, h) = resized.dimensions();
+    TrayIconImage::from_rgba(resized.into_raw(), w, h).map_err(|err| err.to_string())
 }
