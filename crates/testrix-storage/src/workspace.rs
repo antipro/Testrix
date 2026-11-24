@@ -43,6 +43,8 @@ struct WorkspaceStateFile {
     active_tab_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     expanded_nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sidebar_panes: Vec<String>,
 }
 
 /// Persisted open-tab list and active tab key for a workspace.
@@ -282,6 +284,32 @@ pub fn save_workspace_explorer_state(
         WorkspaceStateFile::default()
     };
     state.expanded_nodes = expanded_nodes.to_vec();
+    write_yaml_atomic(&state_path, &state)
+}
+
+/// Loads the persisted right-sidebar split pane modes from `.testrix-state.yaml`.
+pub fn load_workspace_sidebar_panes(workspace_root: &Path) -> Vec<String> {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    if !state_path.is_file() {
+        return Vec::new();
+    }
+    read_yaml_file::<WorkspaceStateFile>(&state_path)
+        .map(|s| s.sidebar_panes)
+        .unwrap_or_default()
+}
+
+/// Persists the right-sidebar split pane modes in `.testrix-state.yaml`.
+pub fn save_workspace_sidebar_panes(
+    workspace_root: &Path,
+    panes: &[String],
+) -> Result<(), StorageError> {
+    let state_path = workspace_root.join(WORKSPACE_STATE_FILE);
+    let mut state = if state_path.is_file() {
+        read_yaml_file::<WorkspaceStateFile>(&state_path).unwrap_or_default()
+    } else {
+        WorkspaceStateFile::default()
+    };
+    state.sidebar_panes = panes.to_vec();
     write_yaml_atomic(&state_path, &state)
 }
 

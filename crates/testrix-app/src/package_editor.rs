@@ -12,7 +12,7 @@ use gpui_kit::{
         WindowExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
-        input::{Editor, EditorState, InputEvent},
+        input::{Editor, EditorState, Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
         tab::{Tab, TabBar},
         tag::{Tag, TagVariant},
@@ -166,6 +166,10 @@ pub(crate) struct PackageTabView {
     run_summary: Option<Result<String, String>>,
     console_logs: Vec<ConsoleLogEntry>,
     console_collapsed: bool,
+    console_find_open: bool,
+    console_find_input: Entity<InputState>,
+    console_find_query: String,
+    console_find_match_ix: usize,
     last_thread_vars: BTreeMap<String, String>,
     node_drawer: Option<NodeOverrideDrawer>,
     _subscriptions: Vec<Subscription>,
@@ -191,12 +195,33 @@ impl PackageTabView {
                 .default_value(yaml_text)
         });
 
+        let console_find_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Find in console…")
+        });
+
         let sub = cx.subscribe_in(
             &yaml_editor,
             window,
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) && !this.suppress_yaml_sync {
                     this.on_yaml_changed(cx);
+                }
+            },
+        );
+        let sub_find = cx.subscribe_in(
+            &console_find_input,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                match event {
+                    InputEvent::Change => {
+                        this.console_find_query = input.read(cx).value().to_string();
+                        this.console_find_match_ix = 0;
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.step_console_find(1, cx);
+                    }
+                    _ => {}
                 }
             },
         );
@@ -224,9 +249,13 @@ impl PackageTabView {
             run_summary: None,
             console_logs: Vec::new(),
             console_collapsed: true,
+            console_find_open: false,
+            console_find_input,
+            console_find_query: String::new(),
+            console_find_match_ix: 0,
             last_thread_vars: BTreeMap::new(),
             node_drawer: None,
-            _subscriptions: vec![sub],
+            _subscriptions: vec![sub, sub_find],
         }
     }
 
@@ -590,6 +619,48 @@ impl PackageTabView {
                     )
                     .map_err(|e| e.to_string())?;
 
+                    // Log detailed HTTP request info into Console
+                    this.console_logs.push(ConsoleLogEntry {
+                        level: ConsoleLogLevel::Info,
+                        message: format!(
+                            "→ [{}] {} {}",
+                            node.name,
+                            prepared.method.as_str(),
+                            prepared.url
+                        ),
+                    });
+                    if let Some((_, raw_query)) = prepared.url.split_once('?') {
+                        let query = raw_query.split('#').next().unwrap_or(raw_query);
+                        if !query.is_empty() {
+                            this.console_logs.push(ConsoleLogEntry {
+                                level: ConsoleLogLevel::Info,
+                                message: format!("  Params: {query}"),
+                            });
+                        }
+                    }
+                    if !prepared.headers.is_empty() {
+                        let hdrs: Vec<String> = prepared
+                            .headers
+                            .iter()
+                            .map(|h| {
+                                let val = if h.secret { "••••••" } else { h.value.as_str() };
+                                format!("{}: {val}", h.name)
+                            })
+                            .collect();
+                        this.console_logs.push(ConsoleLogEntry {
+                            level: ConsoleLogLevel::Info,
+                            message: format!("  Req Headers: {}", hdrs.join(" | ")),
+                        });
+                    }
+                    let body_preview = prepared.body.preview();
+                    if body_preview != "(empty)" {
+                        this.console_logs.push(ConsoleLogEntry {
+                            level: ConsoleLogLevel::Info,
+                            message: format!("  Req Body: {body_preview}"),
+                        });
+                    }
+                    cx.notify();
+
                     Ok((
                         this.runner.clone(),
                         prepared,
@@ -691,28 +762,73 @@ impl PackageTabView {
                             break;
                         }
 
-                        completed_count += 1;
                         let status_code = snapshot.status_code;
                         let duration_ms = snapshot.duration_ms;
+                        let is_http_error = status_code >= 400;
+                        let http_err_msg = format!("HTTP {status_code} {}", snapshot.reason);
+                        if is_http_error {
+                            failure_message = Some(format!("{}: {http_err_msg}", node.name));
+                        } else {
+                            completed_count += 1;
+                        }
                         let _ = weak_self.update(cx, |this, cx| {
                             if this.run_revision == revision {
-                                this.node_statuses.insert(
-                                    node_id.clone(),
-                                    DagNodeRunStatus::Success {
-                                        status_code,
-                                        duration_ms,
-                                    },
-                                );
-                                this.console_logs.push(ConsoleLogEntry {
-                                    level: ConsoleLogLevel::Success,
-                                    message: format!(
-                                        "✓ {}: {status_code} · {duration_ms}ms",
-                                        node.name
-                                    ),
-                                });
+                                if is_http_error {
+                                    this.node_statuses.insert(
+                                        node_id.clone(),
+                                        DagNodeRunStatus::Failed(http_err_msg.clone()),
+                                    );
+                                    this.console_logs.push(ConsoleLogEntry {
+                                        level: ConsoleLogLevel::Error,
+                                        message: format!(
+                                            "✗ {}: {status_code} {} · {duration_ms}ms ({} B)",
+                                            node.name, snapshot.reason, snapshot.size_bytes
+                                        ),
+                                    });
+                                } else {
+                                    this.node_statuses.insert(
+                                        node_id.clone(),
+                                        DagNodeRunStatus::Success {
+                                            status_code,
+                                            duration_ms,
+                                        },
+                                    );
+                                    this.console_logs.push(ConsoleLogEntry {
+                                        level: ConsoleLogLevel::Success,
+                                        message: format!(
+                                            "✓ {}: {status_code} {} · {duration_ms}ms ({} B)",
+                                            node.name, snapshot.reason, snapshot.size_bytes
+                                        ),
+                                    });
+                                }
+                                if !snapshot.headers.is_empty() {
+                                    let rhdrs: Vec<String> = snapshot
+                                        .headers
+                                        .iter()
+                                        .map(|h| format!("{}: {}", h.name, h.value))
+                                        .collect();
+                                    this.console_logs.push(ConsoleLogEntry {
+                                        level: ConsoleLogLevel::Info,
+                                        message: format!("  Resp Headers: {}", rhdrs.join(" | ")),
+                                    });
+                                }
+                                let resp_body = if snapshot.pretty_body.is_empty() {
+                                    snapshot.body_text.as_str()
+                                } else {
+                                    snapshot.pretty_body.as_str()
+                                };
+                                if !resp_body.is_empty() {
+                                    this.console_logs.push(ConsoleLogEntry {
+                                        level: ConsoleLogLevel::Info,
+                                        message: format!("  Resp Body: {resp_body}"),
+                                    });
+                                }
                                 cx.notify();
                             }
                         });
+                        if is_http_error {
+                            break;
+                        }
                     }
                     Ok(Err(err)) => {
                         let msg = err.to_string();
@@ -2177,13 +2293,64 @@ impl PackageTabView {
             )
             .into_any_element()
     }
+    fn step_console_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let q = self.console_find_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            self.console_find_match_ix = 0;
+            cx.notify();
+            return;
+        }
+        let match_count = self
+            .console_logs
+            .iter()
+            .filter(|e| e.message.to_ascii_lowercase().contains(&q))
+            .count();
+        if match_count == 0 {
+            self.console_find_match_ix = 0;
+        } else {
+            let cur = self.console_find_match_ix.min(match_count - 1) as isize;
+            let next = (cur + delta).rem_euclid(match_count as isize) as usize;
+            self.console_find_match_ix = next;
+        }
+        cx.notify();
+    }
+
     fn render_console_panel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let view_toggle = cx.entity();
-        let view_clear = cx.entity();
+        let view = cx.entity();
+        let view_toggle = view.clone();
+        let view_clear = view.clone();
+        let view_find = view.clone();
+        let view_prev = view.clone();
+        let view_next = view.clone();
+        let view_find_close = view.clone();
         let collapsed = self.console_collapsed;
         let log_count = self.console_logs.len();
 
+        let query = self.console_find_query.trim().to_ascii_lowercase();
+        let matching_indices: Vec<usize> = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.console_logs
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, entry)| {
+                    if entry.message.to_ascii_lowercase().contains(&query) {
+                        Some(ix)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let active_match_log_ix = if matching_indices.is_empty() {
+            None
+        } else {
+            let clamped = self.console_find_match_ix.min(matching_indices.len() - 1);
+            Some(matching_indices[clamped])
+        };
+
         v_flex()
+            .relative()
             .w_full()
             .border_t_1()
             .border_color(cx.theme().border)
@@ -2225,25 +2392,125 @@ impl PackageTabView {
                             ),
                     )
                     .child(
-                        Button::new("dag-console-clear-btn")
-                            .ghost()
-                            .xsmall()
-                            .label("Clear")
-                            .disabled(self.console_logs.is_empty())
-                            .on_click(move |_, _, cx| {
-                                view_clear.update(cx, |this, cx| {
-                                    this.console_logs.clear();
-                                    cx.notify();
-                                });
-                            }),
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("dag-console-find-btn")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Search))
+                                    .tooltip("Find in console")
+                                    .on_click(move |_, window, cx| {
+                                        view_find.update(cx, |this, cx| {
+                                            this.console_find_open = !this.console_find_open;
+                                            if this.console_find_open {
+                                                this.console_collapsed = false;
+                                                this.console_find_input
+                                                    .update(cx, |input, cx| input.focus(window, cx));
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("dag-console-clear-btn")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Clear")
+                                    .disabled(self.console_logs.is_empty())
+                                    .on_click(move |_, _, cx| {
+                                        view_clear.update(cx, |this, cx| {
+                                            this.console_logs.clear();
+                                            this.console_find_match_ix = 0;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
                     ),
             )
+            .when(self.console_find_open && !collapsed, |panel| {
+                let match_label = if query.is_empty() {
+                    String::new()
+                } else if matching_indices.is_empty() {
+                    "0/0".to_string()
+                } else {
+                    let cur = self.console_find_match_ix.min(matching_indices.len() - 1) + 1;
+                    format!("{cur}/{}", matching_indices.len())
+                };
+                panel.child(
+                    h_flex()
+                        .id("dag-console-find-float")
+                        .absolute()
+                        .top(px(34.))
+                        .right_3()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .shadow_md()
+                        .child(
+                            div()
+                                .w(px(190.))
+                                .child(Input::new(&self.console_find_input).xsmall()),
+                        )
+                        .when(!match_label.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .px_1()
+                                    .child(match_label),
+                            )
+                        })
+                        .child(
+                            Button::new("dag-console-find-prev")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::ChevronUp))
+                                .disabled(matching_indices.is_empty())
+                                .on_click(move |_, _, cx| {
+                                    view_prev.update(cx, |this, cx| {
+                                        this.step_console_find(-1, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("dag-console-find-next")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::ChevronDown))
+                                .disabled(matching_indices.is_empty())
+                                .on_click(move |_, _, cx| {
+                                    view_next.update(cx, |this, cx| {
+                                        this.step_console_find(1, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("dag-console-find-close")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::Close))
+                                .on_click(move |_, _, cx| {
+                                    view_find_close.update(cx, |this, cx| {
+                                        this.console_find_open = false;
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                )
+            })
             .when(!collapsed, |panel| {
                 panel.child(
                     div()
                         .id("dag-console-scroll")
                         .w_full()
-                        .h(px(150.))
+                        .h(px(180.))
                         .overflow_y_scrollbar()
                         .p_2()
                         .flex()
@@ -2257,14 +2524,27 @@ impl PackageTabView {
                                     .child("No execution logs yet. Click Play to run the DAG."),
                             )
                         })
-                        .children(self.console_logs.iter().map(|entry| {
+                        .children(self.console_logs.iter().enumerate().map(|(ix, entry)| {
                             let color = match entry.level {
                                 ConsoleLogLevel::Info => cx.theme().muted_foreground,
                                 ConsoleLogLevel::Success => gpui_kit::rgb(0x16a34a).into(),
                                 ConsoleLogLevel::Error => cx.theme().danger,
                             };
+                            let is_active_match = active_match_log_ix == Some(ix);
+                            let is_match = !query.is_empty() && matching_indices.contains(&ix);
                             div()
                                 .w_full()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(cx.theme().radius)
+                                .when(is_active_match, |d| {
+                                    d.bg(cx.theme().accent)
+                                        .border_1()
+                                        .border_color(cx.theme().primary)
+                                })
+                                .when(!is_active_match && is_match, |d| {
+                                    d.bg(cx.theme().secondary)
+                                })
                                 .text_xs()
                                 .whitespace_normal()
                                 .text_color(color)

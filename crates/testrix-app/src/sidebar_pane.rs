@@ -38,6 +38,22 @@ impl SidebarViewMode {
             Self::Set => "Package",
         }
     }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Explorer => "explorer",
+            Self::History => "history",
+            Self::Set => "set",
+        }
+    }
+
+    pub(crate) fn from_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "history" => Self::History,
+            "set" | "package" => Self::Set,
+            _ => Self::Explorer,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +61,7 @@ pub(crate) enum SidebarPaneEvent {
     Explorer(ExplorerEvent),
     History(HistoryPanelEvent),
     Sets(SetsPanelEvent),
+    ModeChanged,
     SplitRequested(String),
     CloseRequested(String),
 }
@@ -206,6 +223,7 @@ impl Render for SidebarPane {
                                                 .on_click(move |_, _, cx| {
                                                     v.update(cx, |this, cx| {
                                                         this.mode = mode;
+                                                        cx.emit(SidebarPaneEvent::ModeChanged);
                                                         cx.notify();
                                                     });
                                                 }),

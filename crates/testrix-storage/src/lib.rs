@@ -25,7 +25,7 @@ pub use workspace::{
     load_project,
     load_request_response, load_workspace, load_workspace_environments,
     load_workspace_explorer_state, load_workspace_history, load_workspace_sets,
-    load_workspace_tabs, merge_environments_into_dir, move_request, save_config_appearance,
+    load_workspace_sidebar_panes, load_workspace_tabs, merge_environments_into_dir, move_request, save_config_appearance,
     save_config_appearance_at, save_config_key_bindings, save_config_key_bindings_at,
     save_config_preferences, save_config_preferences_at, save_config_share_settings,
     save_config_share_settings_at, save_config_shared_projects, save_config_shared_projects_at,
@@ -33,7 +33,7 @@ pub use workspace::{
     save_config_workspace_dir_at, save_environment, save_folder, save_global_environment,
     save_project, save_request,
     save_request_response, save_workspace_explorer_state, save_workspace_history,
-    save_workspace_sets, save_workspace_state, save_workspace_tabs, to_yaml_pretty,
+    save_workspace_sets, save_workspace_sidebar_panes, save_workspace_state, save_workspace_tabs, to_yaml_pretty,
     validate_yaml_file, write_yaml_atomic,
 };
 

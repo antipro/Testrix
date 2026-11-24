@@ -64,13 +64,14 @@ use testrix_storage::{
     ensure_seeded_workspace, ensure_workspace_git_repo, import_project_bundle, init_or_load_config,
     list_file_commits, load_request_response, load_sync_base, load_workspace,
     load_workspace_environments, load_workspace_explorer_state, load_workspace_history,
-    load_workspace_sets, load_workspace_tabs, move_request, read_file_at_commit,
-    restore_file_from_commit, save_config_appearance, save_config_key_bindings,
-    save_config_preferences, save_config_share_settings, save_config_shared_projects,
-    save_config_sync_settings, save_config_workspace_dir, save_environment, save_folder,
-    save_global_environment, save_project, save_request, save_request_response, save_sync_base,
-    save_workspace_explorer_state, save_workspace_history, save_workspace_sets,
-    save_workspace_state, save_workspace_tabs, three_way_merge_trees,
+    load_workspace_sets, load_workspace_sidebar_panes, load_workspace_tabs, move_request,
+    read_file_at_commit, restore_file_from_commit, save_config_appearance,
+    save_config_key_bindings, save_config_preferences, save_config_share_settings,
+    save_config_shared_projects, save_config_sync_settings, save_config_workspace_dir,
+    save_environment, save_folder, save_global_environment, save_project, save_request,
+    save_request_response, save_sync_base, save_workspace_explorer_state, save_workspace_history,
+    save_workspace_sets, save_workspace_sidebar_panes, save_workspace_state, save_workspace_tabs,
+    three_way_merge_trees,
 };
 use tracing::{error, info};
 
@@ -403,10 +404,23 @@ impl TestrixApp {
         };
 
         let runner = HttpRunner::new().expect("failed to initialize HTTP runner");
-        let initial_pane_id = generate_id("pane");
-        let initial_pane = cx.new(|cx| {
-            SidebarPane::new(initial_pane_id, SidebarViewMode::Explorer, false, window, cx)
-        });
+        let saved_pane_modes = load_workspace_sidebar_panes(&workspace.root_dir);
+        let sidebar_panes: Vec<Entity<SidebarPane>> = if saved_pane_modes.is_empty() {
+            let initial_pane_id = generate_id("pane");
+            vec![cx.new(|cx| {
+                SidebarPane::new(initial_pane_id, SidebarViewMode::Explorer, false, window, cx)
+            })]
+        } else {
+            let can_close = saved_pane_modes.len() > 1;
+            saved_pane_modes
+                .iter()
+                .map(|m| {
+                    let mode = SidebarViewMode::from_str(m);
+                    let id = generate_id("pane");
+                    cx.new(|cx| SidebarPane::new(id, mode, can_close, window, cx))
+                })
+                .collect()
+        };
         let history_entries = load_workspace_history(&workspace.root_dir);
         let request_sets = load_workspace_sets(&workspace.root_dir);
         let env_editor = cx.new(|cx| EnvEditorView::new(window, cx));
@@ -502,7 +516,7 @@ impl TestrixApp {
             workspace_dir,
             workspace,
             runner,
-            sidebar_panes: vec![initial_pane],
+            sidebar_panes,
             sidebar_pane_subscriptions: Vec::new(),
             history_entries,
             request_sets,
@@ -987,6 +1001,9 @@ impl TestrixApp {
             SidebarPaneEvent::Explorer(e) => self.handle_explorer_event(e, window, cx),
             SidebarPaneEvent::History(e) => self.handle_history_event(e, window, cx),
             SidebarPaneEvent::Sets(e) => self.handle_sets_event(e, window, cx),
+            SidebarPaneEvent::ModeChanged => {
+                self.persist_sidebar_panes(cx);
+            }
             SidebarPaneEvent::SplitRequested(pane_id) => {
                 let Some(pos) = self.sidebar_panes.iter().position(|p| p.read(cx).id == pane_id)
                 else {
@@ -1005,6 +1022,7 @@ impl TestrixApp {
                 self.wire_sidebar_pane_subscriptions(window, cx);
                 let saved_expanded = load_workspace_explorer_state(&self.workspace.root_dir);
                 self.sync_sidebars(Some(&saved_expanded), cx);
+                self.persist_sidebar_panes(cx);
                 cx.notify();
             }
             SidebarPaneEvent::CloseRequested(pane_id) => {
@@ -1013,9 +1031,19 @@ impl TestrixApp {
                 }
                 self.sidebar_panes.retain(|p| p.read(cx).id != pane_id);
                 self.wire_sidebar_pane_subscriptions(window, cx);
+                self.persist_sidebar_panes(cx);
                 cx.notify();
             }
         }
+    }
+
+    fn persist_sidebar_panes(&self, cx: &App) {
+        let modes: Vec<String> = self
+            .sidebar_panes
+            .iter()
+            .map(|p| p.read(cx).mode.as_str().to_string())
+            .collect();
+        let _ = save_workspace_sidebar_panes(&self.workspace.root_dir, &modes);
     }
 
     fn handle_history_event(
