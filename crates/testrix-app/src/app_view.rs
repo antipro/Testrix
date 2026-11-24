@@ -5958,7 +5958,7 @@ impl TestrixApp {
         window.open_sheet_at(Placement::Right, cx, move |sheet, _, _| {
             sheet
                 .title("Profiles & Environment Variables")
-                .size(px(580.))
+                .size(px(640.))
                 .child(div().size_full().p_4().child(env_editor.clone()))
                 .footer(
                     Button::new("env-sheet-done-btn")

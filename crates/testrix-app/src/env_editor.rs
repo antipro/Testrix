@@ -460,10 +460,11 @@ impl EnvEditorView {
 
             dialog
                 .title("Remove Variable")
-                .width(px(460.))
+                .width(px(560.))
                 .child(body)
                 .footer(
                     DialogFooter::new()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             DialogClose::new().child(
@@ -528,37 +529,10 @@ impl Render for EnvEditorView {
             .size_full()
             .min_h_0()
             .gap_3()
-            // Profile selector tabs + create bar
+            // Create bar + profile selector tabs
             .child(
                 v_flex()
                     .gap_2()
-                    .child({
-                        let profiles = self.profiles.clone();
-                        TabBar::new("env-profile-tabs")
-                            .w_full()
-                            .segmented()
-                            .small()
-                            .selected_index(selected_tab_ix)
-                            .on_click(cx.listener(move |this, ix: &usize, window, cx| {
-                                if *ix == 0 {
-                                    this.load_profile_for_editing(Some(GLOBAL_ENV_ID), window, cx);
-                                } else if let Some(profile) = this.profiles.get(*ix - 1) {
-                                    let id = profile.doc.id.clone();
-                                    this.load_profile_for_editing(Some(&id), window, cx);
-                                }
-                            }))
-                            .child(Tab::new().label("Global"))
-                            .children(profiles.iter().map(|p| {
-                                let is_active =
-                                    self.active_env_id.as_deref() == Some(p.doc.id.as_str());
-                                let label: SharedString = if is_active {
-                                    format!("{} (Active)", p.doc.name).into()
-                                } else {
-                                    p.doc.name.clone().into()
-                                };
-                                Tab::new().label(label)
-                            }))
-                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -597,7 +571,34 @@ impl Render for EnvEditorView {
                                         cx.emit(EnvEditorEvent::Create { name });
                                     })),
                             ),
-                    ),
+                    )
+                    .child({
+                        let profiles = self.profiles.clone();
+                        TabBar::new("env-profile-tabs")
+                            .w_full()
+                            .segmented()
+                            .small()
+                            .selected_index(selected_tab_ix)
+                            .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                                if *ix == 0 {
+                                    this.load_profile_for_editing(Some(GLOBAL_ENV_ID), window, cx);
+                                } else if let Some(profile) = this.profiles.get(*ix - 1) {
+                                    let id = profile.doc.id.clone();
+                                    this.load_profile_for_editing(Some(&id), window, cx);
+                                }
+                            }))
+                            .child(Tab::new().label("Global"))
+                            .children(profiles.iter().map(|p| {
+                                let is_active =
+                                    self.active_env_id.as_deref() == Some(p.doc.id.as_str());
+                                let label: SharedString = if is_active {
+                                    format!("{} (Active)", p.doc.name).into()
+                                } else {
+                                    p.doc.name.clone().into()
+                                };
+                                Tab::new().label(label)
+                            }))
+                    }),
             )
             // Selected profile metadata + actions
             .when_some(editing_id, |this, env_id| {
@@ -807,7 +808,9 @@ impl Render for EnvEditorView {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_wrap()
                     .justify_between()
+                    .gap_2()
                     .pt_2()
                     .border_t_1()
                     .border_color(cx.theme().border)
@@ -851,6 +854,7 @@ impl Render for EnvEditorView {
                                     .ghost()
                                     .small()
                                     .label("No Environment")
+                                    .tooltip("Deactivate active profile (run requests with no environment)")
                                     .disabled(self.active_env_id.is_none())
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(EnvEditorEvent::SelectActive { env_id: None });
