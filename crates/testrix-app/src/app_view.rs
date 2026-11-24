@@ -356,6 +356,7 @@ pub struct TestrixApp {
     active_shares: Vec<ActiveShareRecord>,
     share_sync_count: usize,
     sync_settings: SyncSettings,
+    auto_sync_enabled: bool,
     sync_in_progress: bool,
     quit_after_sync: bool,
     force_quit: bool,
@@ -372,6 +373,19 @@ impl Focusable for TestrixApp {
 
 impl TestrixApp {
     pub fn new(workspace_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_auto_sync(workspace_dir, true, window, cx)
+    }
+
+    pub fn new_for_test(workspace_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_auto_sync(workspace_dir, false, window, cx)
+    }
+
+    fn new_with_auto_sync(
+        workspace_dir: PathBuf,
+        auto_sync_enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let workspace = match ensure_seeded_workspace(&workspace_dir) {
             Ok(tree) => {
                 if let Err(err) = ensure_workspace_git_repo(&tree.root_dir) {
@@ -511,6 +525,7 @@ impl TestrixApp {
             active_shares: restored_shares,
             share_sync_count: 0,
             sync_settings: SyncSettings::from(&cfg),
+            auto_sync_enabled,
             sync_in_progress: false,
             quit_after_sync: false,
             force_quit: false,
@@ -578,8 +593,10 @@ impl TestrixApp {
         app.sync_sidebars(Some(&saved_expanded), cx);
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
-        app.maybe_auto_git_sync(window, cx);
-        app.start_ipc_reload_listener(window, cx);
+        if auto_sync_enabled {
+            app.maybe_auto_git_sync(window, cx);
+            app.start_ipc_reload_listener(window, cx);
+        }
         if !cfg!(debug_assertions) {
             app.check_for_updates(false, window, cx);
         }
@@ -5923,6 +5940,9 @@ impl TestrixApp {
     }
 
     fn maybe_auto_git_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.auto_sync_enabled {
+            return;
+        }
         let (server_url, _, token, repo_slug) = self.effective_sync_credentials();
         if !server_url.is_empty()
             && !token.is_empty()

@@ -32,7 +32,7 @@ fn open_testrix_test_window(
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| TestrixApp::new(workspace_dir, window, cx)),
+            |window, cx| cx.new(|cx| TestrixApp::new_for_test(workspace_dir, window, cx)),
         )
         .expect("open test window");
         (
