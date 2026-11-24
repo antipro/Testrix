@@ -8,7 +8,6 @@ use gpui_kit::{
         WindowExt as _,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
-        dialog::{DialogClose, DialogFooter},
         h_flex,
         input::{Input, InputEvent, InputState},
         scroll::ScrollableElement as _,
@@ -463,15 +462,17 @@ impl EnvEditorView {
                 .width(px(560.))
                 .child(body)
                 .footer(
-                    DialogFooter::new()
-                        .flex_wrap()
+                    h_flex()
+                        .w_full()
+                        .justify_end()
                         .gap_2()
                         .child(
-                            DialogClose::new().child(
-                                Button::new("env-var-del-cancel")
-                                    .outline()
-                                    .label("Cancel"),
-                            ),
+                            Button::new("env-var-del-cancel")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
                         )
                         .child(
                             Button::new("env-var-del-only")

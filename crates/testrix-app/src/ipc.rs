@@ -1,7 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::{path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::{
