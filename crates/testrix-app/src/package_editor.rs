@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use gpui_kit::{
-    AppContext as _, Bounds, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
+    Pixels, Point, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window,
     assets::IconName as LucideIcon,
     canvas,
     component::{
@@ -23,9 +24,9 @@ use gpui_kit::{
     px,
 };
 use testrix_core::{
-    DagNode, DagNodeOverrides, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag, ProjectNode,
-    RawBodyFormat, RequestBody, RequestSet, RequestSetFolder, RequestSetItem, WorkspaceTree,
-    generate_id, materialize_request_doc_with_extra_vars,
+    DagNode, DagNodeOverrides, EnvVariable, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag,
+    ProjectNode, RawBodyFormat, RequestBody, RequestSet, RequestSetFolder, RequestSetItem,
+    WorkspaceTree, generate_id, materialize_request_doc_with_extra_vars,
 };
 use testrix_http::{CancellationToken, HttpRunner};
 use testrix_storage::to_yaml_pretty;
@@ -34,7 +35,7 @@ use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
     explorer::DraggedRequest,
     kv_editor::{KeyValueTable, TableChangeEvent, common_http_header_options},
-    post_script::run_post_script_with_thread,
+    post_script::{PostScriptCompletionProvider, run_post_script_with_thread},
     theme_helpers::method_badge,
 };
 
@@ -54,6 +55,7 @@ enum OverrideSection {
     Headers,
     Body,
     Auth,
+    PostScript,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,7 @@ struct NodeOverrideDrawer {
     body_editor: Entity<EditorState>,
     body_form_table: Entity<KeyValueTable>,
     auth_editor: Entity<AuthEditor>,
+    post_script_editor: Entity<EditorState>,
     suppress_sync: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -163,6 +166,7 @@ pub(crate) struct PackageTabView {
     run_summary: Option<Result<String, String>>,
     console_logs: Vec<ConsoleLogEntry>,
     console_collapsed: bool,
+    last_thread_vars: BTreeMap<String, String>,
     node_drawer: Option<NodeOverrideDrawer>,
     _subscriptions: Vec<Subscription>,
 }
@@ -220,6 +224,7 @@ impl PackageTabView {
             run_summary: None,
             console_logs: Vec::new(),
             console_collapsed: true,
+            last_thread_vars: BTreeMap::new(),
             node_drawer: None,
             _subscriptions: vec![sub],
         }
@@ -652,6 +657,16 @@ impl PackageTabView {
                                                 vars: res.next_global_vars,
                                             });
                                         }
+                                        if !res.changed_thread_keys.is_empty() {
+                                            this.console_logs.push(ConsoleLogEntry {
+                                                level: ConsoleLogLevel::Info,
+                                                message: format!(
+                                                    "  thread updated by {}: {}",
+                                                    node.name,
+                                                    res.changed_thread_keys.join(", ")
+                                                ),
+                                            });
+                                        }
                                     });
                                 }
                                 Err(err) => {
@@ -729,6 +744,7 @@ impl PackageTabView {
                 }
                 this.is_running = false;
                 this.active_cancel = None;
+                this.last_thread_vars = thread_vars;
                 for id in &order {
                     if matches!(
                         this.node_statuses.get(id),
@@ -1343,6 +1359,66 @@ impl PackageTabView {
             .into_any_element()
     }
 
+    fn collect_upstream_thread_keys(&self, node_id: &str) -> Vec<String> {
+        let mut keys = BTreeSet::new();
+        for k in self.last_thread_vars.keys() {
+            keys.insert(k.clone());
+        }
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        if let Some(start) = self.set.dag.nodes.iter().find(|n| n.id == node_id) {
+            for dep in &start.needs {
+                queue.push_back(dep.clone());
+            }
+        }
+        while let Some(curr_id) = queue.pop_front() {
+            if !visited.insert(curr_id.clone()) {
+                continue;
+            }
+            if let Some(node) = self.set.dag.nodes.iter().find(|n| n.id == curr_id) {
+                let script = node
+                    .overrides
+                    .post_script
+                    .as_deref()
+                    .or_else(|| {
+                        Self::resolve_request_doc(&self.workspace, node)
+                            .map(|(_, _, doc)| doc.request.post_script.as_str())
+                    })
+                    .unwrap_or("");
+                extract_thread_keys_from_script(script, &mut keys);
+                for dep in &node.needs {
+                    if !visited.contains(dep) {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    fn build_drawer_validation_env(&self, node_id: &str) -> Option<EnvironmentDoc> {
+        let thread_keys = self.collect_upstream_thread_keys(node_id);
+        if thread_keys.is_empty() && self.active_env.is_none() {
+            return None;
+        }
+        let mut env = self
+            .active_env
+            .clone()
+            .unwrap_or_else(|| EnvironmentDoc::new("dag-thread", "DAG Thread"));
+        for key in thread_keys {
+            let full_key = format!("thread.{key}");
+            if !env.variables.iter().any(|v| v.key.trim() == full_key) {
+                let val = self
+                    .last_thread_vars
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                env.variables.push(EnvVariable::new(full_key, val));
+            }
+        }
+        Some(env)
+    }
+
     fn open_node_drawer(&mut self, node_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node) = self.set.dag.nodes.iter().find(|n| n.id == node_id).cloned() else {
             return;
@@ -1355,7 +1431,7 @@ impl PackageTabView {
             return;
         };
         let base_doc = req_doc.clone();
-        let active_env = self.active_env.clone();
+        let active_env = self.build_drawer_validation_env(&node.id);
 
         let initial_params = node
             .overrides
@@ -1382,6 +1458,11 @@ impl PackageTabView {
             .auth
             .as_ref()
             .unwrap_or(&base_doc.request.auth);
+        let initial_post_script = node
+            .overrides
+            .post_script
+            .as_deref()
+            .unwrap_or(&base_doc.request.post_script);
 
         let params_table = cx.new(|cx| {
             KeyValueTable::new(
@@ -1467,6 +1548,18 @@ impl PackageTabView {
                 cx,
             );
             ed.set_context(None, active_env, cx);
+            ed
+        });
+        let ps_completion = std::rc::Rc::new(PostScriptCompletionProvider::new(
+            self.active_env.as_ref(),
+            self.global_env.as_ref(),
+        ));
+        let post_script_editor = cx.new(|cx| {
+            let mut ed = EditorState::new(window, cx)
+                .language("javascript")
+                .folding(true)
+                .default_value(initial_post_script.to_string());
+            ed.lsp_mut().completion_provider = Some(ps_completion);
             ed
         });
 
@@ -1569,6 +1662,29 @@ impl PackageTabView {
             },
         );
 
+        let sub_post_script = cx.subscribe_in(
+            &post_script_editor,
+            window,
+            |this, ed, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let Some(drawer) = &this.node_drawer else {
+                        return;
+                    };
+                    if drawer.suppress_sync {
+                        return;
+                    }
+                    let nid = drawer.node_id.clone();
+                    let script = ed.read(cx).value().to_string();
+                    if let Some(n) = this.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+                        n.overrides.post_script = Some(script);
+                    }
+                    this.sync_yaml_from_dag(window, cx);
+                    cx.emit(PackageTabEvent::DirtyChanged);
+                    cx.notify();
+                }
+            },
+        );
+
         self.node_drawer = Some(NodeOverrideDrawer {
             node_id: node.id,
             base_doc,
@@ -1580,6 +1696,7 @@ impl PackageTabView {
             body_editor,
             body_form_table,
             auth_editor,
+            post_script_editor,
             suppress_sync: false,
             _subscriptions: vec![
                 sub_params,
@@ -1588,6 +1705,7 @@ impl PackageTabView {
                 sub_body_ed,
                 sub_body_form,
                 sub_auth,
+                sub_post_script,
             ],
         });
         cx.notify();
@@ -1689,6 +1807,12 @@ impl PackageTabView {
                         ed.set_auth(&base_doc.request.auth, window, cx);
                     });
                 }
+                OverrideSection::PostScript => {
+                    n.overrides.post_script = None;
+                    drawer.post_script_editor.update(cx, |ed, cx| {
+                        ed.set_value(base_doc.request.post_script.clone(), window, cx);
+                    });
+                }
             }
         }
         if let Some(drawer) = &mut self.node_drawer {
@@ -1724,6 +1848,7 @@ impl PackageTabView {
             OverrideSection::Headers => 2,
             OverrideSection::Body => 3,
             OverrideSection::Auth => 4,
+            OverrideSection::PostScript => 5,
         };
         let is_active_overridden = match drawer.active_tab {
             OverrideSection::Params => overrides.params.is_some(),
@@ -1731,7 +1856,9 @@ impl PackageTabView {
             OverrideSection::Headers => overrides.headers.is_some(),
             OverrideSection::Body => overrides.body.is_some(),
             OverrideSection::Auth => overrides.auth.is_some(),
+            OverrideSection::PostScript => overrides.post_script.is_some(),
         };
+        let thread_keys = self.collect_upstream_thread_keys(&drawer.node_id);
 
         let label_for = |title: &str, active: bool| -> String {
             if active {
@@ -1861,7 +1988,8 @@ impl PackageTabView {
                                         1 => OverrideSection::Path,
                                         2 => OverrideSection::Headers,
                                         3 => OverrideSection::Body,
-                                        _ => OverrideSection::Auth,
+                                        4 => OverrideSection::Auth,
+                                        _ => OverrideSection::PostScript,
                                     };
                                     cx.notify();
                                 }
@@ -1870,9 +1998,48 @@ impl PackageTabView {
                             .child(Tab::new().label(label_for("Path", overrides.path_params.is_some())))
                             .child(Tab::new().label(label_for("Headers", overrides.headers.is_some())))
                             .child(Tab::new().label(label_for("Body", overrides.body.is_some())))
-                            .child(Tab::new().label(label_for("Auth", overrides.auth.is_some()))),
+                            .child(Tab::new().label(label_for("Auth", overrides.auth.is_some())))
+                            .child(Tab::new().label(label_for("Post-Script", overrides.post_script.is_some()))),
                     ),
             )
+            .when(!thread_keys.is_empty(), |panel| {
+                panel.child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_1()
+                        .gap_1()
+                        .flex_wrap()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary)
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("thread:"),
+                        )
+                        .children(thread_keys.iter().enumerate().map(|(ix, key)| {
+                            let placeholder = format!("{{{{thread.{key}}}}}");
+                            let to_copy = placeholder.clone();
+                            Button::new(SharedString::from(format!("dag-thread-chip-{ix}")))
+                                .outline()
+                                .xsmall()
+                                .label(placeholder)
+                                .tooltip("Click to copy {{thread.*}} placeholder")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        to_copy.clone(),
+                                    ));
+                                    window.push_notification(
+                                        format!("Copied {to_copy}"),
+                                        cx,
+                                    );
+                                })
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("dag-drawer-content")
@@ -1954,6 +2121,16 @@ impl PackageTabView {
                                 .into_any_element()
                         }
                         OverrideSection::Auth => drawer.auth_editor.clone().into_any_element(),
+                        OverrideSection::PostScript => div()
+                            .w_full()
+                            .h_full()
+                            .min_h(px(260.))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .overflow_hidden()
+                            .child(Editor::new(&drawer.post_script_editor).h_full().w_full())
+                            .into_any_element(),
                     }),
             )
             .into_any_element()
@@ -2096,6 +2273,42 @@ impl PackageTabView {
                 )
             })
             .into_any_element()
+    }
+}
+
+fn extract_thread_keys_from_script(script: &str, out: &mut BTreeSet<String>) {
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if script[i..].starts_with("thread.") {
+            let start = i + "thread.".len();
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'-')
+            {
+                end += 1;
+            }
+            if end > start {
+                out.insert(script[start..end].to_string());
+            }
+            i = end;
+            continue;
+        }
+        if script[i..].starts_with("thread[") {
+            let rest = &script[i + "thread[".len()..];
+            if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let after_q = &rest[1..];
+                if let Some(close) = after_q.find(quote) {
+                    let key = after_q[..close].trim();
+                    if !key.is_empty() {
+                        out.insert(key.to_string());
+                    }
+                    i += "thread[".len() + 1 + close + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
     }
 }
 

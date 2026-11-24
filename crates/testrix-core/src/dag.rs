@@ -19,6 +19,8 @@ pub struct DagNodeOverrides {
     pub body: Option<RequestBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_script: Option<String>,
 }
 
 impl DagNodeOverrides {
@@ -28,6 +30,7 @@ impl DagNodeOverrides {
             && self.headers.is_none()
             && self.body.is_none()
             && self.auth.is_none()
+            && self.post_script.is_none()
     }
 
     /// Applies any configured overrides onto an in-memory copy of `doc`.
@@ -46,6 +49,9 @@ impl DagNodeOverrides {
         }
         if let Some(auth) = &self.auth {
             doc.request.auth = auth.clone();
+        }
+        if let Some(post_script) = &self.post_script {
+            doc.request.post_script = post_script.clone();
         }
     }
 }
