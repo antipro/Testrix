@@ -36,9 +36,11 @@ testrix item     <list|get|create|update|delete> --project <id-or-name> [--item 
 testrix profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
 testrix var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
 testrix share    <list|status|config-set|login|publish|revoke> [--project <id-or-name>] [--channel <server|r2>] [--share <id>] [--access-token <token>]
+testrix notify   reload
 ```
 
 - Run `testrix <resource> --help` (or `testrix --help`) to see all supported resources and actions.
+- Mutating CLI CRUD commands (`create`, `update`, `delete`, `set`, `merge`) automatically notify any running Testrix GUI instance via IPC (Unix Domain Socket on macOS/Linux, Named Pipe on Windows) to reload the workspace.
 - Sharing examples:
   ```bash
   testrix share status
@@ -54,11 +56,15 @@ Only edit YAML files directly if a specific operation is not covered by the CLI 
 1. **Locate the workspace** by reading `~/.testrix/config.yaml` (`workspaceDir`) or inspecting `testrix project list` output — never scan the disk.
 2. **Read the target file** (and nearby `testrix.project.yaml`, `_folder.yaml`, or `environments/*.env.yaml` if inheritance or variables matter).
 3. **Edit or create the YAML file** following the schema below. Preserve existing `id` values on existing files so open tabs, saved responses, and references do not break.
-4. **Validate with `testrix --check`** before finishing:
+4. **Validate with `testrix --check` and notify the running GUI to reload** before finishing:
 
 ```bash
 # Check the configured workspace
 testrix --check
+
+# Notify the running Testrix GUI app to reload YAML changes immediately (via UDS on Unix / Named Pipe on Windows)
+testrix notify reload
+```
 
 # Check one or more specific YAML files or a project directory
 testrix --check path/to/file.request.yaml path/to/dev.env.yaml

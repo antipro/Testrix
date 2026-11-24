@@ -52,12 +52,21 @@ pub fn is_api_resource(arg: &str) -> bool {
             | "variables"
             | "share"
             | "shares"
+            | "notify"
+            | "reload"
     )
 }
 
 pub fn execute_cli_api(workspace_dir: &Path, args: &[String]) -> Result<String, String> {
     let parsed = parse_api_args(args)?;
     let value = dispatch_api(workspace_dir, &parsed)?;
+    if matches!(
+        parsed.action.as_str(),
+        "create" | "update" | "delete" | "set" | "merge"
+    ) && !matches!(parsed.resource.as_str(), "share" | "shares" | "notify" | "reload")
+    {
+        let _ = crate::ipc::send_reload_notification(Some(workspace_dir));
+    }
     serde_json::to_string_pretty(&ApiResponse {
         ok: true,
         data: value,
@@ -118,10 +127,11 @@ fn parse_api_args(args: &[String]) -> Result<ParsedApiCmd, String> {
         .first()
         .ok_or_else(|| "Missing resource (project | item | folder | profile | var)".to_string())?
         .to_ascii_lowercase();
-    let action = positional
-        .get(1)
-        .ok_or_else(|| format!("Missing action for `{resource}`"))?
-        .to_ascii_lowercase();
+    let action = match positional.get(1) {
+        Some(a) => a.to_ascii_lowercase(),
+        None if resource == "reload" => "reload".to_string(),
+        None => return Err(format!("Missing action for `{resource}`")),
+    };
 
     Ok(ParsedApiCmd {
         resource,
@@ -347,7 +357,28 @@ fn dispatch_api(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Strin
         }
         "var" | "vars" | "variable" | "variables" => handle_var(workspace_dir, cmd),
         "share" | "shares" => handle_share(workspace_dir, cmd),
+        "notify" | "reload" => handle_notify(workspace_dir, cmd),
         other => Err(format!("Unknown resource `{other}`")),
+    }
+}
+
+fn handle_notify(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
+    match cmd.action.as_str() {
+        "reload" => match crate::ipc::send_reload_notification(Some(workspace_dir)) {
+            Ok(resp) => Ok(json!({
+                "notified": true,
+                "reloaded": resp.reloaded,
+                "transport": crate::ipc::ipc_transport_name(),
+                "message": resp.message,
+            })),
+            Err(reason) => Ok(json!({
+                "notified": false,
+                "reloaded": false,
+                "transport": crate::ipc::ipc_transport_name(),
+                "reason": reason,
+            })),
+        },
+        other => Err(format!("Unsupported notify action `{other}` (expected `reload`)")),
     }
 }
 

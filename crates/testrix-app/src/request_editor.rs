@@ -47,7 +47,7 @@ use crate::{
     auth_section::{AuthEditor, AuthEditorEvent},
     editable_combobox::{ComboboxOption, EditableCombobox, EditableComboboxEvent},
     kv_editor::{KeyValueTable, MultipartTable, TableChangeEvent, common_http_header_options},
-    post_script::run_post_script,
+    post_script::{PostScriptCompletionProvider, run_post_script},
     theme_helpers::{apply_unresolved_var_border, format_bytes, method_color, status_badge},
 };
 
@@ -255,6 +255,7 @@ pub(crate) struct RequestTabView {
     // Auth + Post-Script + YAML + Settings controls
     auth_editor: Entity<AuthEditor>,
     post_script_editor: Entity<EditorState>,
+    post_script_completion: std::rc::Rc<PostScriptCompletionProvider>,
     post_script_status: Option<Result<String, String>>,
     editor_font_size: f32,
     yaml_editor: Entity<EditorState>,
@@ -470,12 +471,17 @@ impl RequestTabView {
             editor
         });
 
+        let post_script_completion =
+            std::rc::Rc::new(PostScriptCompletionProvider::new(active_env.as_ref()));
+        let post_script_completion_for_editor = post_script_completion.clone();
         let post_script_editor = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut state = EditorState::new(window, cx)
                 .language("javascript")
                 .folding(true)
                 .searchable(true)
-                .default_value(doc.request.post_script.clone())
+                .default_value(doc.request.post_script.clone());
+            state.lsp_mut().completion_provider = Some(post_script_completion_for_editor);
+            state
         });
 
         let yaml_text = to_yaml_pretty(doc).unwrap_or_default();
@@ -555,6 +561,7 @@ impl RequestTabView {
             binary_ct_input,
             auth_editor,
             post_script_editor,
+            post_script_completion,
             post_script_status: None,
             editor_font_size: 13.0,
             yaml_editor,
@@ -881,6 +888,8 @@ impl RequestTabView {
     ) {
         self.project_snapshot = project.clone();
         self.active_env = active_env.clone();
+        self.post_script_completion
+            .set_env_keys(self.active_env.as_ref());
 
         let (ancestors, updated_file_path) = match project.find_request(&self.request_id) {
             Some((ancestors, req_node)) => {

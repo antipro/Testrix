@@ -1,10 +1,21 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::{Mutex, OnceLock},
 };
 
 use anyhow::{Context as _, Result};
+use gpui_kit::{
+    App, Task, Window,
+    component::input::{CompletionProvider, RopeExt as _},
+};
 use gpui_shell::{HostModule, HostValue, ShellRuntime};
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    Documentation, Range, TextEdit,
+};
+use ropey::Rope;
 use serde::Serialize;
 use testrix_core::{EnvVariable, EnvironmentDoc, HttpResponseSnapshot};
 
@@ -248,6 +259,362 @@ pub(crate) fn apply_vars_to_environment(
         }
     }
     changed
+}
+
+struct CompletionEntry {
+    label: &'static str,
+    insert_text: &'static str,
+    kind: CompletionItemKind,
+    detail: &'static str,
+    doc: &'static str,
+}
+
+const TOP_LEVEL_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "environment",
+        insert_text: "environment",
+        kind: CompletionItemKind::VARIABLE,
+        detail: "ScriptEnvironment",
+        doc: "Active environment profile (`id`, `name`, `var`). Mutations to `environment.var` are saved back to `*.env.yaml`.",
+    },
+    CompletionEntry {
+        label: "request",
+        insert_text: "request",
+        kind: CompletionItemKind::VARIABLE,
+        detail: "ScriptRequest",
+        doc: "Executed HTTP request metadata (`id`, `name`, `method`, `url`, `headers`).",
+    },
+    CompletionEntry {
+        label: "response",
+        insert_text: "response",
+        kind: CompletionItemKind::VARIABLE,
+        detail: "ScriptResponse",
+        doc: "HTTP response snapshot (`status`, `reason`, `headers`, `body`, `durationMs`, `sizeBytes`, `json()`).",
+    },
+    CompletionEntry {
+        label: "JSON",
+        insert_text: "JSON",
+        kind: CompletionItemKind::CLASS,
+        detail: "JSON",
+        doc: "Standard JavaScript JSON parser and serializer (`parse`, `stringify`).",
+    },
+    CompletionEntry {
+        label: "console",
+        insert_text: "console",
+        kind: CompletionItemKind::MODULE,
+        detail: "Console",
+        doc: "Standard JavaScript console (`log`, `warn`, `error`).",
+    },
+];
+
+const ENVIRONMENT_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "var",
+        insert_text: "var",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "Record<string, string>",
+        doc: "Mutable map of environment variables. Changes are persisted to the active `*.env.yaml` profile.",
+    },
+    CompletionEntry {
+        label: "name",
+        insert_text: "name",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Active environment profile display name.",
+    },
+    CompletionEntry {
+        label: "id",
+        insert_text: "id",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Active environment profile ID.",
+    },
+];
+
+const REQUEST_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "id",
+        insert_text: "id",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Request ID.",
+    },
+    CompletionEntry {
+        label: "name",
+        insert_text: "name",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Request display name.",
+    },
+    CompletionEntry {
+        label: "method",
+        insert_text: "method",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "HTTP method (e.g. GET, POST).",
+    },
+    CompletionEntry {
+        label: "url",
+        insert_text: "url",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Materialized request URL.",
+    },
+    CompletionEntry {
+        label: "headers",
+        insert_text: "headers",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "Record<string, string>",
+        doc: "Sent HTTP request headers.",
+    },
+];
+
+const RESPONSE_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "status",
+        insert_text: "status",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "number",
+        doc: "HTTP status code (e.g. 200).",
+    },
+    CompletionEntry {
+        label: "reason",
+        insert_text: "reason",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "HTTP status reason phrase (e.g. OK).",
+    },
+    CompletionEntry {
+        label: "headers",
+        insert_text: "headers",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "Record<string, string>",
+        doc: "HTTP response headers.",
+    },
+    CompletionEntry {
+        label: "body",
+        insert_text: "body",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "string",
+        doc: "Raw HTTP response body text.",
+    },
+    CompletionEntry {
+        label: "durationMs",
+        insert_text: "durationMs",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "number",
+        doc: "Request duration in milliseconds.",
+    },
+    CompletionEntry {
+        label: "sizeBytes",
+        insert_text: "sizeBytes",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "number",
+        doc: "Response body size in bytes.",
+    },
+    CompletionEntry {
+        label: "json",
+        insert_text: "json()",
+        kind: CompletionItemKind::METHOD,
+        detail: "() => any",
+        doc: "Parses `response.body` as JSON (`JSON.parse(response.body)`).",
+    },
+];
+
+const JSON_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "parse",
+        insert_text: "parse()",
+        kind: CompletionItemKind::METHOD,
+        detail: "(text: string) => any",
+        doc: "Parses a JSON string into a JavaScript value.",
+    },
+    CompletionEntry {
+        label: "stringify",
+        insert_text: "stringify()",
+        kind: CompletionItemKind::METHOD,
+        detail: "(value: any) => string",
+        doc: "Converts a JavaScript value to a JSON string.",
+    },
+];
+
+const CONSOLE_COMPLETIONS: &[CompletionEntry] = &[
+    CompletionEntry {
+        label: "log",
+        insert_text: "log()",
+        kind: CompletionItemKind::METHOD,
+        detail: "(...args: any[]) => void",
+        doc: "Logs a message.",
+    },
+    CompletionEntry {
+        label: "warn",
+        insert_text: "warn()",
+        kind: CompletionItemKind::METHOD,
+        detail: "(...args: any[]) => void",
+        doc: "Logs a warning message.",
+    },
+    CompletionEntry {
+        label: "error",
+        insert_text: "error()",
+        kind: CompletionItemKind::METHOD,
+        detail: "(...args: any[]) => void",
+        doc: "Logs an error message.",
+    },
+];
+
+/// Provides IDE-style autocomplete suggestions for `environment.`, `request.`, `response.`,
+/// `JSON.`, `console.`, and top-level globals in the Post-Script JavaScript editor.
+pub(crate) struct PostScriptCompletionProvider {
+    env_keys: Rc<RefCell<Vec<String>>>,
+}
+
+impl PostScriptCompletionProvider {
+    pub(crate) fn new(active_env: Option<&EnvironmentDoc>) -> Self {
+        let provider = Self {
+            env_keys: Rc::new(RefCell::new(Vec::new())),
+        };
+        provider.set_env_keys(active_env);
+        provider
+    }
+
+    pub(crate) fn set_env_keys(&self, active_env: Option<&EnvironmentDoc>) {
+        let mut keys: Vec<String> = active_env
+            .map(|env| env.variables.iter().map(|v| v.key.clone()).collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys.dedup();
+        *self.env_keys.borrow_mut() = keys;
+    }
+
+    fn build_items(
+        entries: &[CompletionEntry],
+        prefix: &str,
+        replace_range: Range,
+    ) -> Vec<CompletionItem> {
+        let lower_prefix = prefix.to_ascii_lowercase();
+        entries
+            .iter()
+            .filter(|e| {
+                lower_prefix.is_empty() || e.label.to_ascii_lowercase().starts_with(&lower_prefix)
+            })
+            .map(|e| CompletionItem {
+                label: e.label.to_string(),
+                filter_text: Some(prefix.to_string()),
+                kind: Some(e.kind),
+                detail: Some(e.detail.to_string()),
+                documentation: Some(Documentation::String(e.doc.to_string())),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: replace_range,
+                    new_text: e.insert_text.to_string(),
+                })),
+                ..Default::default()
+            })
+            .collect()
+    }
+}
+
+fn is_expr_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '.'
+}
+
+fn is_valid_js_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+fn extract_expr_before_cursor(rope: &Rope, offset: usize) -> (usize, String) {
+    let clamped = offset.min(rope.len());
+    let mut start = clamped;
+    while start > 0 {
+        let Some(ch) = rope.char_at(start - 1) else {
+            break;
+        };
+        if !is_expr_char(ch) {
+            break;
+        }
+        start -= ch.len_utf8();
+    }
+    let expr = rope.slice(start..clamped).to_string();
+    (start, expr)
+}
+
+impl CompletionProvider for PostScriptCompletionProvider {
+    fn completions(
+        &self,
+        rope: &Rope,
+        offset: usize,
+        _: CompletionContext,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Task<Result<CompletionResponse>> {
+        let (expr_start, expr) = extract_expr_before_cursor(rope, offset);
+        if expr.is_empty() {
+            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+        }
+
+        let items = if let Some(dot_rel) = expr.rfind('.') {
+            let receiver = &expr[..dot_rel];
+            let member_prefix = &expr[dot_rel + 1..];
+            let replace_start = expr_start + dot_rel + 1;
+            let replace_range = Range {
+                start: rope.offset_to_position(replace_start),
+                end: rope.offset_to_position(offset.min(rope.len())),
+            };
+
+            match receiver {
+                "environment" => {
+                    Self::build_items(ENVIRONMENT_COMPLETIONS, member_prefix, replace_range)
+                }
+                "environment.var" => {
+                    let lower_prefix = member_prefix.to_ascii_lowercase();
+                    self.env_keys
+                        .borrow()
+                        .iter()
+                        .filter(|k| {
+                            is_valid_js_ident(k)
+                                && (lower_prefix.is_empty()
+                                    || k.to_ascii_lowercase().starts_with(&lower_prefix))
+                        })
+                        .map(|k| CompletionItem {
+                            label: k.clone(),
+                            filter_text: Some(member_prefix.to_string()),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some("env variable".to_string()),
+                            documentation: Some(Documentation::String(format!(
+                                "Environment variable `{k}`"
+                            ))),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: replace_range,
+                                new_text: k.clone(),
+                            })),
+                            ..Default::default()
+                        })
+                        .collect()
+                }
+                "request" => Self::build_items(REQUEST_COMPLETIONS, member_prefix, replace_range),
+                "response" => Self::build_items(RESPONSE_COMPLETIONS, member_prefix, replace_range),
+                "JSON" => Self::build_items(JSON_COMPLETIONS, member_prefix, replace_range),
+                "console" => Self::build_items(CONSOLE_COMPLETIONS, member_prefix, replace_range),
+                _ => Vec::new(),
+            }
+        } else {
+            let replace_range = Range {
+                start: rope.offset_to_position(expr_start),
+                end: rope.offset_to_position(offset.min(rope.len())),
+            };
+            Self::build_items(TOP_LEVEL_COMPLETIONS, &expr, replace_range)
+        };
+
+        Task::ready(Ok(CompletionResponse::Array(items)))
+    }
+
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _: &mut App) -> bool {
+        new_text == "." || new_text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
 }
 
 #[cfg(test)]

@@ -151,7 +151,8 @@ CLI API Resources (validated JSON CRUD):
   item     <list|get|create|update|delete>
   profile  <list|get|create|update|delete|merge>
   var      <list|get|create|update|set|delete>
-  share    <list|status|config-set|login|publish|revoke>"
+  share    <list|status|config-set|login|publish|revoke>
+  notify   <reload>"
     );
 }
 

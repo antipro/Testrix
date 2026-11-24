@@ -37,7 +37,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Async runtime & HTTP client
-tokio = { version = "1.53", features = ["rt-multi-thread", "fs", "macros", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "fs", "io-util", "macros", "net", "sync", "time"] }
 tokio-util = { version = "0.7" }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",

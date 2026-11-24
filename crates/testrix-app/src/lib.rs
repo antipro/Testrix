@@ -10,6 +10,7 @@ mod env_editor;
 mod explorer;
 mod history_panel;
 mod i18n;
+pub mod ipc;
 mod kv_editor;
 mod post_script;
 mod request_editor;

@@ -574,6 +574,7 @@ impl TestrixApp {
         app.sync_env_editor(window, cx);
         app.restore_or_open_initial_tabs(window, cx);
         app.maybe_auto_git_sync(window, cx);
+        app.start_ipc_reload_listener(window, cx);
         if !cfg!(debug_assertions) {
             app.check_for_updates(false, window, cx);
         }
@@ -586,6 +587,71 @@ impl TestrixApp {
 
     pub fn set_force_quit(&mut self) {
         self.force_quit = true;
+    }
+
+    fn start_ipc_reload_listener(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut rx = crate::ipc::start_ipc_server();
+        let app_entity = cx.entity();
+        window
+            .spawn(cx, async move |window| {
+                while let Some((req, reply_tx)) = rx.recv().await {
+                    if req.action != "reload" {
+                        let _ = reply_tx.send(crate::ipc::IpcResponse {
+                            ok: false,
+                            reloaded: false,
+                            message: Some(format!("Unsupported IPC action: {}", req.action)),
+                        });
+                        continue;
+                    }
+
+                    let target_ws = req.workspace.clone();
+                    let outcome = window.update(|window, cx| {
+                        app_entity.update(cx, |this, cx| {
+                            let matches_workspace = match target_ws.as_deref() {
+                                Some(ws) if !ws.trim().is_empty() => {
+                                    crate::ipc::normalize_workspace_path(std::path::Path::new(ws))
+                                        == crate::ipc::normalize_workspace_path(
+                                            &this.workspace_dir,
+                                        )
+                                }
+                                _ => true,
+                            };
+                            if matches_workspace {
+                                this.reload_workspace(window, cx);
+                                window.push_notification(
+                                    "Reloaded workspace from external YAML change.",
+                                    cx,
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    });
+
+                    let resp = match outcome {
+                        Ok(true) => crate::ipc::IpcResponse {
+                            ok: true,
+                            reloaded: true,
+                            message: Some("Reloaded workspace".to_string()),
+                        },
+                        Ok(false) => crate::ipc::IpcResponse {
+                            ok: true,
+                            reloaded: false,
+                            message: Some(
+                                "Running GUI has a different workspace open".to_string(),
+                            ),
+                        },
+                        Err(_) => crate::ipc::IpcResponse {
+                            ok: false,
+                            reloaded: false,
+                            message: Some("Failed updating GUI window".to_string()),
+                        },
+                    };
+                    let _ = reply_tx.send(resp);
+                }
+            })
+            .detach();
     }
 
     pub fn workspace(&self) -> &WorkspaceTree {
@@ -6302,6 +6368,25 @@ impl TestrixApp {
         let req_name = req.doc.name.clone();
         let req_name_for_commit = req_name.clone();
         let file_path = req.file_path.clone();
+        let involved_packages = packages_referencing_request(&self.request_sets, &request_id);
+        let description = if involved_packages.is_empty() {
+            "This permanently removes the YAML request file from disk.".to_string()
+        } else {
+            let shown: Vec<&str> = involved_packages
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect();
+            let suffix = if involved_packages.len() > 5 {
+                ", ..."
+            } else {
+                ""
+            };
+            format!(
+                "This permanently removes the YAML request file from disk.\nInvolved packages: {}{suffix}",
+                shown.join(", ")
+            )
+        };
         let app_entity = cx.entity();
 
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -6310,9 +6395,10 @@ impl TestrixApp {
             let rid = request_id.clone();
             let path = file_path.clone();
             let del_name = req_name_for_commit.clone();
+            let desc = description.clone();
             alert
                 .title(format!("Delete \"{req_name}\"?"))
-                .description("This permanently removes the YAML request file from disk.")
+                .description(desc)
                 .confirm()
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
@@ -7124,6 +7210,27 @@ fn insert_request_into_project(
             .cmp(&b.doc.order)
             .then_with(|| a.doc.name.to_lowercase().cmp(&b.doc.name.to_lowercase()))
     });
+}
+
+fn packages_referencing_request(sets: &[RequestSet], request_id: &str) -> Vec<String> {
+    fn folder_has_request(folder: &RequestSetFolder, request_id: &str) -> bool {
+        folder.requests.iter().any(|r| r.request_id == request_id)
+            || folder
+                .folders
+                .iter()
+                .any(|sub| folder_has_request(sub, request_id))
+    }
+
+    sets.iter()
+        .filter(|set| {
+            set.requests.iter().any(|r| r.request_id == request_id)
+                || set
+                    .folders
+                    .iter()
+                    .any(|f| folder_has_request(f, request_id))
+        })
+        .map(|set| set.name.clone())
+        .collect()
 }
 
 fn remove_request_from_project(project: &mut testrix_core::ProjectNode, request_id: &str) {
