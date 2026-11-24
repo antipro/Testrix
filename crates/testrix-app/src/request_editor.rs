@@ -199,6 +199,9 @@ pub(crate) enum RequestTabEvent {
         env_id: String,
         vars: BTreeMap<String, String>,
     },
+    ApplyPostScriptGlobalEnv {
+        vars: BTreeMap<String, String>,
+    },
     ResponseCompleted {
         request_id: String,
         snapshot: Box<HttpResponseSnapshot>,
@@ -229,6 +232,7 @@ pub(crate) struct RequestTabView {
     saved_doc: HttpRequestDoc,
     project_snapshot: ProjectNode,
     active_env: Option<EnvironmentDoc>,
+    global_env: Option<EnvironmentDoc>,
     runner: HttpRunner,
 
     // Request controls
@@ -320,6 +324,7 @@ impl RequestTabView {
         parent_folders: &[&FolderNode],
         node: &RequestNode,
         active_env: Option<EnvironmentDoc>,
+        global_env: Option<EnvironmentDoc>,
         runner: HttpRunner,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -471,8 +476,10 @@ impl RequestTabView {
             editor
         });
 
-        let post_script_completion =
-            std::rc::Rc::new(PostScriptCompletionProvider::new(active_env.as_ref()));
+        let post_script_completion = std::rc::Rc::new(PostScriptCompletionProvider::new(
+            active_env.as_ref(),
+            global_env.as_ref(),
+        ));
         let post_script_completion_for_editor = post_script_completion.clone();
         let post_script_editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
@@ -541,6 +548,7 @@ impl RequestTabView {
             saved_doc: doc.clone(),
             project_snapshot: project.clone(),
             active_env,
+            global_env,
             runner,
             method: doc.request.method,
             method_select,
@@ -883,13 +891,15 @@ impl RequestTabView {
         &mut self,
         project: &ProjectNode,
         active_env: Option<EnvironmentDoc>,
+        global_env: Option<EnvironmentDoc>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.project_snapshot = project.clone();
         self.active_env = active_env.clone();
+        self.global_env = global_env;
         self.post_script_completion
-            .set_env_keys(self.active_env.as_ref());
+            .set_env_keys(self.active_env.as_ref(), self.global_env.as_ref());
 
         let (ancestors, updated_file_path) = match project.find_request(&self.request_id) {
             Some((ancestors, req_node)) => {
@@ -1128,16 +1138,23 @@ impl RequestTabView {
                                 &this.request_id,
                                 &req_name,
                                 this.active_env.as_ref(),
+                                this.global_env.as_ref(),
                                 &snapshot,
                             ) {
                                 Ok(res) => {
-                                    let count = res.changed_keys.len();
-                                    if count > 0
+                                    let count =
+                                        res.changed_keys.len() + res.changed_global_keys.len();
+                                    if !res.changed_keys.is_empty()
                                         && let Some(env) = &this.active_env
                                     {
                                         cx.emit(RequestTabEvent::ApplyPostScriptEnv {
                                             env_id: env.id.clone(),
                                             vars: res.next_vars,
+                                        });
+                                    }
+                                    if !res.changed_global_keys.is_empty() {
+                                        cx.emit(RequestTabEvent::ApplyPostScriptGlobalEnv {
+                                            vars: res.next_global_vars,
                                         });
                                     }
                                     this.post_script_status = Some(Ok(format!(
@@ -2019,6 +2036,129 @@ impl RequestTabView {
             })
     }
 
+    fn open_post_script_help_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+
+        let example = concat!(
+            "if (response.status >= 200 && response.status < 300) {\n",
+            "  const data = response.json();\n",
+            "  // Save to active profile (*.env.yaml)\n",
+            "  environment.var[\"token\"] = data.token;\n",
+            "  // Save to Global profile (environments/_global.env.yaml)\n",
+            "  environment.global[\"user_id\"] = String(data.user.id);\n",
+            "}"
+        );
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let section_title = |title: &'static str| {
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child(title)
+            };
+            let var_row = |name: &'static str, desc: &'static str| {
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_baseline()
+                    .child(
+                        div()
+                            .w(px(190.))
+                            .flex_none()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_xs()
+                            .text_color(cx.theme().primary)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(desc),
+                    )
+            };
+
+            dialog
+                .title("Post-Script Reference")
+                .width(px(640.))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_h(px(460.))
+                        .overflow_y_scrollbar()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Post-scripts run in QuickJS (gpui-shell) after each HTTP response. Type `environment.`, `request.`, or `response.` for autocomplete."),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(section_title("environment"))
+                                .child(var_row("environment.id", "Active profile ID (string)"))
+                                .child(var_row("environment.name", "Active profile name (string)"))
+                                .child(var_row(
+                                    "environment.var",
+                                    "Active profile variables map (saved to *.env.yaml)",
+                                ))
+                                .child(var_row(
+                                    "environment.global",
+                                    "Global variables map (saved to environments/_global.env.yaml)",
+                                )),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(section_title("request"))
+                                .child(var_row("request.id", "Request ID (string)"))
+                                .child(var_row("request.name", "Request display name (string)"))
+                                .child(var_row("request.method", "HTTP method (GET, POST, ...)"))
+                                .child(var_row("request.url", "Materialized request URL"))
+                                .child(var_row("request.headers", "Sent request headers map")),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(section_title("response"))
+                                .child(var_row("response.status", "HTTP status code (number)"))
+                                .child(var_row("response.reason", "HTTP status reason (string)"))
+                                .child(var_row("response.headers", "Response headers map"))
+                                .child(var_row("response.body", "Raw response body (string)"))
+                                .child(var_row("response.durationMs", "Duration in ms (number)"))
+                                .child(var_row("response.sizeBytes", "Body size in bytes (number)"))
+                                .child(var_row("response.json()", "Parses response.body as JSON")),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(section_title("Basic Usage"))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .p_2p5()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .bg(cx.theme().secondary.opacity(0.35))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_xs()
+                                        .child(example),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        DialogClose::new()
+                            .child(Button::new("post-script-help-close").label("Close").outline()),
+                    ),
+                )
+        });
+    }
+
     fn render_post_script_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let id_base = self.request_id.clone();
         v_flex()
@@ -2059,6 +2199,19 @@ impl RequestTabView {
                                     ),
                                 }
                             })
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "post-script-help-{id_base}"
+                                )))
+                                .outline()
+                                .xsmall()
+                                .icon(Icon::new(LucideIcon::CircleQuestionMark))
+                                .label("Help")
+                                .tooltip("Show pre-defined variables and usage")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_post_script_help_dialog(window, cx);
+                                })),
+                            )
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "post-script-find-{id_base}"

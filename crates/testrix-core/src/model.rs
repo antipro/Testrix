@@ -870,12 +870,16 @@ pub struct ProjectNode {
     pub environments: Vec<EnvironmentNode>,
 }
 
+/// Reserved profile ID for the workspace-wide Global environment (`environments/_global.env.yaml`).
+pub const GLOBAL_ENV_ID: &str = "__global__";
+
 /// Complete loaded workspace containing projects, shared environments, and active UI selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceTree {
     pub root_dir: PathBuf,
     pub projects: Vec<ProjectNode>,
     pub environments: Vec<EnvironmentNode>,
+    pub global_environment: Option<EnvironmentNode>,
     pub active_project_id: Option<String>,
     pub active_environment_id: Option<String>,
 }
@@ -932,6 +936,34 @@ impl WorkspaceTree {
                     .iter()
                     .find(|env| env.doc.id == env_id)
             })
+    }
+
+    /// Returns an effective [`EnvironmentDoc`] combining the Global environment (base) with the
+    /// currently active profile (override).
+    pub fn effective_environment(&self) -> Option<EnvironmentDoc> {
+        let global = self.global_environment.as_ref().map(|e| &e.doc);
+        let active = self.active_environment().map(|e| &e.doc);
+        match (global, active) {
+            (None, None) => None,
+            (Some(g), None) => Some(g.clone()),
+            (None, Some(a)) => Some(a.clone()),
+            (Some(g), Some(a)) => {
+                let mut merged = a.clone();
+                let mut existing_keys: std::collections::BTreeSet<String> = merged
+                    .variables
+                    .iter()
+                    .filter(|v| v.enabled && !v.key.trim().is_empty())
+                    .map(|v| v.key.trim().to_string())
+                    .collect();
+                for gv in &g.variables {
+                    let key = gv.key.trim();
+                    if gv.enabled && !key.is_empty() && existing_keys.insert(key.to_string()) {
+                        merged.variables.push(gv.clone());
+                    }
+                }
+                Some(merged)
+            }
+        }
     }
 
     /// Finds a project by ID.

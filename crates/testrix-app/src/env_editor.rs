@@ -20,7 +20,9 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px,
 };
-use testrix_core::{EnvVariable, EnvironmentDoc, EnvironmentNode, sort_env_variables};
+use testrix_core::{
+    EnvVariable, EnvironmentDoc, EnvironmentNode, GLOBAL_ENV_ID, sort_env_variables,
+};
 
 struct EnvVarRowState {
     id: u64,
@@ -76,6 +78,7 @@ impl SelectItem for MergeProfileOption {
 /// Persistent editor view rendered inside the Environment Profiles sheet.
 pub(crate) struct EnvEditorView {
     focus_handle: FocusHandle,
+    global_profile: Option<EnvironmentNode>,
     profiles: Vec<EnvironmentNode>,
     editing_env_id: Option<String>,
     active_env_id: Option<String>,
@@ -116,6 +119,7 @@ impl EnvEditorView {
 
         Self {
             focus_handle: cx.focus_handle(),
+            global_profile: None,
             profiles: Vec::new(),
             editing_env_id: None,
             active_env_id: None,
@@ -133,20 +137,23 @@ impl EnvEditorView {
 
     pub(crate) fn sync_profiles(
         &mut self,
+        global_profile: Option<EnvironmentNode>,
         profiles: Vec<EnvironmentNode>,
         active_env_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.global_profile = global_profile;
         self.profiles = profiles;
         self.active_env_id = active_env_id.clone();
 
         let target_id = self
             .editing_env_id
             .clone()
-            .filter(|id| self.profiles.iter().any(|p| &p.doc.id == id))
+            .filter(|id| id == GLOBAL_ENV_ID || self.profiles.iter().any(|p| &p.doc.id == id))
             .or(active_env_id)
-            .or_else(|| self.profiles.first().map(|p| p.doc.id.clone()));
+            .or_else(|| self.profiles.first().map(|p| p.doc.id.clone()))
+            .or_else(|| Some(GLOBAL_ENV_ID.to_string()));
 
         self.load_profile_for_editing(target_id.as_deref(), window, cx);
     }
@@ -171,7 +178,22 @@ impl EnvEditorView {
         self.dirty = false;
         self.refresh_merge_source_options(window, cx);
 
-        if let Some(profile) = env_id.and_then(|id| self.profiles.iter().find(|p| p.doc.id == id)) {
+        if env_id == Some(GLOBAL_ENV_ID) {
+            let mut vars = self
+                .global_profile
+                .as_ref()
+                .map(|p| p.doc.variables.clone())
+                .unwrap_or_default();
+            sort_env_variables(&mut vars);
+            self.profile_name_input
+                .update(cx, |state, cx| state.set_value("Global", window, cx));
+            for var in &vars {
+                let row = self.build_row(var, window, cx);
+                self.rows.push(row);
+            }
+        } else if let Some(profile) =
+            env_id.and_then(|id| self.profiles.iter().find(|p| p.doc.id == id))
+        {
             let name = profile.doc.name.clone();
             let mut vars = profile.doc.variables.clone();
             sort_env_variables(&mut vars);
@@ -336,17 +358,24 @@ impl EnvEditorView {
         let Some(env_id) = self.editing_env_id.clone() else {
             return;
         };
-        let Some(original) = self.profiles.iter().find(|p| p.doc.id == env_id) else {
-            return;
+        let mut updated = if env_id == GLOBAL_ENV_ID {
+            self.global_profile
+                .as_ref()
+                .map(|n| n.doc.clone())
+                .unwrap_or_else(|| EnvironmentDoc::new(GLOBAL_ENV_ID, "Global"))
+        } else {
+            let Some(original) = self.profiles.iter().find(|p| p.doc.id == env_id) else {
+                return;
+            };
+            let mut doc = original.doc.clone();
+            let next_name = self.profile_name_input.read(cx).value().trim().to_string();
+            if next_name.is_empty() {
+                window.push_notification("Profile name must not be empty.", cx);
+                return;
+            }
+            doc.name = next_name;
+            doc
         };
-
-        let mut updated = original.doc.clone();
-        let next_name = self.profile_name_input.read(cx).value().trim().to_string();
-        if next_name.is_empty() {
-            window.push_notification("Profile name must not be empty.", cx);
-            return;
-        }
-        updated.name = next_name;
         let mut renamed_keys = Vec::new();
         updated.variables = self
             .rows
@@ -479,15 +508,19 @@ impl EnvEditorView {
 
 impl Render for EnvEditorView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_tab_ix = self
-            .editing_env_id
-            .as_deref()
-            .and_then(|id| self.profiles.iter().position(|p| p.doc.id == id))
-            .unwrap_or(0);
+        let is_editing_global = self.editing_env_id.as_deref() == Some(GLOBAL_ENV_ID);
+        let selected_tab_ix = if is_editing_global {
+            0
+        } else {
+            self.editing_env_id
+                .as_deref()
+                .and_then(|id| self.profiles.iter().position(|p| p.doc.id == id))
+                .map(|ix| ix + 1)
+                .unwrap_or(0)
+        };
 
         let is_editing_active =
             self.editing_env_id.is_some() && self.editing_env_id == self.active_env_id;
-        let has_profiles = !self.profiles.is_empty();
         let editing_id = self.editing_env_id.clone();
 
         v_flex()
@@ -499,31 +532,32 @@ impl Render for EnvEditorView {
             .child(
                 v_flex()
                     .gap_2()
-                    .when(has_profiles, |this| {
+                    .child({
                         let profiles = self.profiles.clone();
-                        this.child(
-                            TabBar::new("env-profile-tabs")
-                                .w_full()
-                                .segmented()
-                                .small()
-                                .selected_index(selected_tab_ix)
-                                .on_click(cx.listener(move |this, ix: &usize, window, cx| {
-                                    if let Some(profile) = this.profiles.get(*ix) {
-                                        let id = profile.doc.id.clone();
-                                        this.load_profile_for_editing(Some(&id), window, cx);
-                                    }
-                                }))
-                                .children(profiles.iter().map(|p| {
-                                    let is_active =
-                                        self.active_env_id.as_deref() == Some(p.doc.id.as_str());
-                                    let label: SharedString = if is_active {
-                                        format!("{} (Active)", p.doc.name).into()
-                                    } else {
-                                        p.doc.name.clone().into()
-                                    };
-                                    Tab::new().label(label)
-                                })),
-                        )
+                        TabBar::new("env-profile-tabs")
+                            .w_full()
+                            .segmented()
+                            .small()
+                            .selected_index(selected_tab_ix)
+                            .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                                if *ix == 0 {
+                                    this.load_profile_for_editing(Some(GLOBAL_ENV_ID), window, cx);
+                                } else if let Some(profile) = this.profiles.get(*ix - 1) {
+                                    let id = profile.doc.id.clone();
+                                    this.load_profile_for_editing(Some(&id), window, cx);
+                                }
+                            }))
+                            .child(Tab::new().label("Global"))
+                            .children(profiles.iter().map(|p| {
+                                let is_active =
+                                    self.active_env_id.as_deref() == Some(p.doc.id.as_str());
+                                let label: SharedString = if is_active {
+                                    format!("{} (Active)", p.doc.name).into()
+                                } else {
+                                    p.doc.name.clone().into()
+                                };
+                                Tab::new().label(label)
+                            }))
                     })
                     .child(
                         h_flex()
@@ -579,36 +613,39 @@ impl Render for EnvEditorView {
                                 .child(
                                     Input::new(&self.profile_name_input)
                                         .id("env-profile-name-input")
+                                        .disabled(is_editing_global)
                                         .small(),
                                 ),
                         )
-                        .child(
-                            Button::new("env-set-active")
-                                .small()
-                                .when(is_editing_active, |b| b.primary().label("Active"))
-                                .when(!is_editing_active, |b| b.outline().label("Set Active"))
-                                .disabled(is_editing_active)
-                                .on_click(cx.listener({
-                                    let env_id = env_id.clone();
-                                    move |_, _, _, cx| {
-                                        cx.emit(EnvEditorEvent::SelectActive {
-                                            env_id: Some(env_id.clone()),
+                        .when(!is_editing_global, |row| {
+                            row.child(
+                                Button::new("env-set-active")
+                                    .small()
+                                    .when(is_editing_active, |b| b.primary().label("Active"))
+                                    .when(!is_editing_active, |b| b.outline().label("Set Active"))
+                                    .disabled(is_editing_active)
+                                    .on_click(cx.listener({
+                                        let env_id = env_id.clone();
+                                        move |_, _, _, cx| {
+                                            cx.emit(EnvEditorEvent::SelectActive {
+                                                env_id: Some(env_id.clone()),
+                                            });
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("env-delete-profile")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Delete)
+                                    .tooltip("Delete Profile")
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(EnvEditorEvent::Delete {
+                                            env_id: env_id.clone(),
                                         });
-                                    }
-                                })),
-                        )
-                        .child(
-                            Button::new("env-delete-profile")
-                                .ghost()
-                                .small()
-                                .icon(IconName::Delete)
-                                .tooltip("Delete Profile")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(EnvEditorEvent::Delete {
-                                        env_id: env_id.clone(),
-                                    });
-                                })),
-                        ),
+                                    })),
+                            )
+                        }),
                 )
             })
             // Variables header

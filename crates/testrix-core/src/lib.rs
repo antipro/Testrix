@@ -28,7 +28,7 @@ pub use materialize::{
 };
 pub use model::{
     API_VERSION, ApiKeyLocation, AuthConfig, DocumentKind, EffectiveAuth, EnvVariable,
-    EnvironmentDoc, EnvironmentNode, ExplorerNode, FolderDoc, FolderNode, HttpMethod,
+    EnvironmentDoc, EnvironmentNode, ExplorerNode, FolderDoc, FolderNode, GLOBAL_ENV_ID, HttpMethod,
     HttpRequestDoc, HttpRequestSpec, KeyValueRow, MultipartField, MultipartFieldType, ProjectDoc,
     ProjectNode, RawBodyFormat, RequestBody, RequestHistoryEntry, RequestNode, RequestSet,
     RequestSetFolder, RequestSetItem, RequestSettings, WorkspaceTree, compare_env_var_keys,
@@ -251,6 +251,7 @@ mod tests {
             root_dir: PathBuf::from("."),
             projects: vec![project],
             environments: Vec::new(),
+            global_environment: None,
             active_project_id: None,
             active_environment_id: None,
         };

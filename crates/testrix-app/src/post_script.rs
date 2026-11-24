@@ -56,6 +56,7 @@ struct ScriptEnvironment<'a> {
     id: &'a str,
     name: &'a str,
     var: BTreeMap<String, String>,
+    global: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -89,15 +90,18 @@ struct ScriptContext<'a> {
 pub(crate) struct PostScriptResult {
     pub changed_keys: Vec<String>,
     pub next_vars: BTreeMap<String, String>,
+    pub changed_global_keys: Vec<String>,
+    pub next_global_vars: BTreeMap<String, String>,
 }
 
 /// Executes a request's `postScript` using `gpui-shell` (QuickJS), exposing
-/// `environment`, `request`, and `response` globals.
+/// `environment` (`var` and `global`), `request`, and `response` globals.
 pub(crate) fn run_post_script(
     script: &str,
     request_id: &str,
     request_name: &str,
     active_env: Option<&EnvironmentDoc>,
+    global_env: Option<&EnvironmentDoc>,
     snapshot: &HttpResponseSnapshot,
 ) -> Result<PostScriptResult> {
     if script.trim().is_empty() {
@@ -110,6 +114,7 @@ pub(crate) fn run_post_script(
         .map_err(|_| anyhow::anyhow!("post-script runner lock poisoned"))?;
 
     let initial_vars = testrix_core::env_variable_map(active_env);
+    let initial_global_vars = testrix_core::env_variable_map(global_env);
     let mut req_headers = BTreeMap::new();
     for h in &snapshot.sent_request.headers {
         req_headers.insert(h.name.clone(), h.value.clone());
@@ -124,6 +129,7 @@ pub(crate) fn run_post_script(
             id: active_env.map_or("", |e| e.id.as_str()),
             name: active_env.map_or("", |e| e.name.as_str()),
             var: initial_vars.clone(),
+            global: initial_global_vars.clone(),
         },
         request: ScriptRequest {
             id: request_id,
@@ -167,7 +173,8 @@ try {{
 {script}
 }} finally {{
   const __vars = (globalThis.environment && globalThis.environment.var) ? globalThis.environment.var : {{}};
-  __commit_env(JSON.stringify(__vars));
+  const __global = (globalThis.environment && globalThis.environment.global) ? globalThis.environment.global : {{}};
+  __commit_env(JSON.stringify({{ var: __vars, global: __global }}));
 }}
 
 export default class PostScriptRunner extends View {{
@@ -204,22 +211,35 @@ export default class PostScriptRunner extends View {{
         state.committed_vars_json.take()
     };
 
-    let next_vars: BTreeMap<String, String> = match committed_json {
+    fn parse_committed_map(
+        obj: Option<&serde_json::Value>,
+        fallback: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let Some(serde_json::Value::Object(raw)) = obj else {
+            return fallback.clone();
+        };
+        raw.iter()
+            .filter_map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => return None,
+                    other => other.to_string(),
+                };
+                Some((k.clone(), s))
+            })
+            .collect()
+    }
+
+    let (next_vars, next_global_vars) = match committed_json {
         Some(json) => {
-            let raw: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&json).context("parse committed environment.var")?;
-            raw.into_iter()
-                .filter_map(|(k, v)| {
-                    let s = match v {
-                        serde_json::Value::String(s) => s,
-                        serde_json::Value::Null => return None,
-                        other => other.to_string(),
-                    };
-                    Some((k, s))
-                })
-                .collect()
+            let root: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&json).context("parse committed environment")?;
+            (
+                parse_committed_map(root.get("var"), &initial_vars),
+                parse_committed_map(root.get("global"), &initial_global_vars),
+            )
         }
-        None => initial_vars.clone(),
+        None => (initial_vars.clone(), initial_global_vars.clone()),
     };
 
     let changed_keys = next_vars
@@ -228,9 +248,17 @@ export default class PostScriptRunner extends View {{
         .map(|(k, _)| k.clone())
         .collect();
 
+    let changed_global_keys = next_global_vars
+        .iter()
+        .filter(|(k, v)| initial_global_vars.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
+
     Ok(PostScriptResult {
         changed_keys,
         next_vars,
+        changed_global_keys,
+        next_global_vars,
     })
 }
 
@@ -314,6 +342,13 @@ const ENVIRONMENT_COMPLETIONS: &[CompletionEntry] = &[
         kind: CompletionItemKind::PROPERTY,
         detail: "Record<string, string>",
         doc: "Mutable map of environment variables. Changes are persisted to the active `*.env.yaml` profile.",
+    },
+    CompletionEntry {
+        label: "global",
+        insert_text: "global",
+        kind: CompletionItemKind::PROPERTY,
+        detail: "Record<string, string>",
+        doc: "Mutable map of Global environment variables. Changes are persisted to `environments/_global.env.yaml`.",
     },
     CompletionEntry {
         label: "name",
@@ -466,24 +501,40 @@ const CONSOLE_COMPLETIONS: &[CompletionEntry] = &[
 /// `JSON.`, `console.`, and top-level globals in the Post-Script JavaScript editor.
 pub(crate) struct PostScriptCompletionProvider {
     env_keys: Rc<RefCell<Vec<String>>>,
+    global_keys: Rc<RefCell<Vec<String>>>,
 }
 
 impl PostScriptCompletionProvider {
-    pub(crate) fn new(active_env: Option<&EnvironmentDoc>) -> Self {
+    pub(crate) fn new(
+        active_env: Option<&EnvironmentDoc>,
+        global_env: Option<&EnvironmentDoc>,
+    ) -> Self {
         let provider = Self {
             env_keys: Rc::new(RefCell::new(Vec::new())),
+            global_keys: Rc::new(RefCell::new(Vec::new())),
         };
-        provider.set_env_keys(active_env);
+        provider.set_env_keys(active_env, global_env);
         provider
     }
 
-    pub(crate) fn set_env_keys(&self, active_env: Option<&EnvironmentDoc>) {
+    pub(crate) fn set_env_keys(
+        &self,
+        active_env: Option<&EnvironmentDoc>,
+        global_env: Option<&EnvironmentDoc>,
+    ) {
         let mut keys: Vec<String> = active_env
             .map(|env| env.variables.iter().map(|v| v.key.clone()).collect())
             .unwrap_or_default();
         keys.sort();
         keys.dedup();
         *self.env_keys.borrow_mut() = keys;
+
+        let mut gkeys: Vec<String> = global_env
+            .map(|env| env.variables.iter().map(|v| v.key.clone()).collect())
+            .unwrap_or_default();
+        gkeys.sort();
+        gkeys.dedup();
+        *self.global_keys.borrow_mut() = gkeys;
     }
 
     fn build_items(
@@ -595,6 +646,32 @@ impl CompletionProvider for PostScriptCompletionProvider {
                         })
                         .collect()
                 }
+                "environment.global" => {
+                    let lower_prefix = member_prefix.to_ascii_lowercase();
+                    self.global_keys
+                        .borrow()
+                        .iter()
+                        .filter(|k| {
+                            is_valid_js_ident(k)
+                                && (lower_prefix.is_empty()
+                                    || k.to_ascii_lowercase().starts_with(&lower_prefix))
+                        })
+                        .map(|k| CompletionItem {
+                            label: k.clone(),
+                            filter_text: Some(member_prefix.to_string()),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some("global variable".to_string()),
+                            documentation: Some(Documentation::String(format!(
+                                "Global environment variable `{k}`"
+                            ))),
+                            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                                range: replace_range,
+                                new_text: k.clone(),
+                            })),
+                            ..Default::default()
+                        })
+                        .collect()
+                }
                 "request" => Self::build_items(REQUEST_COMPLETIONS, member_prefix, replace_range),
                 "response" => Self::build_items(RESPONSE_COMPLETIONS, member_prefix, replace_range),
                 "JSON" => Self::build_items(JSON_COMPLETIONS, member_prefix, replace_range),
@@ -657,7 +734,7 @@ mod tests {
             environment.var["user-id"] = String(data.user.id);
         "#;
 
-        let result = run_post_script(script, "req-login", "Login", Some(&env), &snapshot)
+        let result = run_post_script(script, "req-login", "Login", Some(&env), None, &snapshot)
             .expect("post-script should succeed");
 
         assert_eq!(
@@ -735,11 +812,55 @@ mod tests {
             }
         "#;
 
-        let result = run_post_script(script, "req-auth", "Auth", Some(&env), &snapshot)
+        let result = run_post_script(script, "req-auth", "Auth", Some(&env), None, &snapshot)
             .expect("post-script should succeed on large nested JSON");
         assert_eq!(
             result.next_vars.get("api_token").map(String::as_str),
             Some("jwt-access-token-xyz")
         );
+    }
+
+    #[test]
+    fn post_script_reads_and_updates_environment_global() {
+        let mut global_env = EnvironmentDoc::new(testrix_core::GLOBAL_ENV_ID, "Global");
+        global_env
+            .variables
+            .push(EnvVariable::new("shared_host", "https://global.test"));
+
+        let body = r#"{"token":"global-jwt-999"}"#;
+        let snapshot = HttpResponseSnapshot {
+            status_code: 200,
+            reason: "OK".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            duration_ms: 10,
+            size_bytes: body.len(),
+            headers: Vec::new(),
+            body_text: body.to_string(),
+            pretty_body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
+            content_type: Some("application/json".to_string()),
+            sent_request: SentRequestSnapshot {
+                method: HttpMethod::Get,
+                url: "https://global.test/auth".to_string(),
+                headers: Vec::new(),
+                body_preview: String::new(),
+            },
+        };
+
+        let script = r#"
+            const data = response.json();
+            if (environment.global.shared_host === "https://global.test") {
+              environment.global.global_token = data.token;
+            }
+        "#;
+
+        let result =
+            run_post_script(script, "req-g", "GlobalAuth", None, Some(&global_env), &snapshot)
+                .expect("post-script should update environment.global");
+        assert_eq!(
+            result.next_global_vars.get("global_token").map(String::as_str),
+            Some("global-jwt-999")
+        );
+        assert_eq!(result.changed_global_keys, vec!["global_token".to_string()]);
     }
 }

@@ -22,6 +22,7 @@ const FOLDER_MANIFEST_FILE: &str = "_folder.yaml";
 const ENVIRONMENTS_DIR: &str = "environments";
 const REQUEST_EXTENSION: &str = ".request.yaml";
 const ENV_EXTENSION: &str = ".env.yaml";
+const GLOBAL_ENV_FILE: &str = "_global.env.yaml";
 const WORKSPACE_STATE_FILE: &str = ".testrix-state.yaml";
 const WORKSPACE_HISTORY_FILE: &str = ".testrix-history.yaml";
 const WORKSPACE_SETS_FILE: &str = ".testrix-sets.yaml";
@@ -132,6 +133,7 @@ pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageErr
             root_dir: workspace_root.to_path_buf(),
             projects: Vec::new(),
             environments: Vec::new(),
+            global_environment: None,
             active_project_id: None,
             active_environment_id: None,
         });
@@ -213,10 +215,13 @@ pub fn load_workspace(workspace_root: &Path) -> Result<WorkspaceTree, StorageErr
         .active_environment_id
         .filter(|env_id| environments.iter().any(|e| &e.doc.id == env_id));
 
+    let global_environment = load_global_environment(workspace_root)?;
+
     Ok(WorkspaceTree {
         root_dir: workspace_root.to_path_buf(),
         projects,
         environments,
+        global_environment,
         active_project_id,
         active_environment_id,
     })
@@ -465,7 +470,7 @@ fn load_environments(env_dir: &Path) -> Result<Vec<EnvironmentNode>, StorageErro
         if path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|name| name.ends_with(ENV_EXTENSION))
+            .is_some_and(|name| name.ends_with(ENV_EXTENSION) && name != GLOBAL_ENV_FILE)
         {
             let mut doc: EnvironmentDoc = read_yaml_file(&path)?;
             doc.validate()?;
@@ -737,6 +742,43 @@ pub fn load_workspace_environments(
     let mut envs = load_environments(&env_dir)?;
     envs.sort_by_key(|a| a.doc.name.to_lowercase());
     Ok(envs)
+}
+
+/// Loads the workspace-wide Global environment (`environments/_global.env.yaml`), if present.
+pub fn load_global_environment(
+    workspace_root: &Path,
+) -> Result<Option<EnvironmentNode>, StorageError> {
+    let path = workspace_root.join(ENVIRONMENTS_DIR).join(GLOBAL_ENV_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let mut doc: EnvironmentDoc = read_yaml_file(&path)?;
+    doc.id = testrix_core::GLOBAL_ENV_ID.to_string();
+    doc.name = "Global".to_string();
+    doc.validate()?;
+    testrix_core::sort_env_variables(&mut doc.variables);
+    Ok(Some(EnvironmentNode {
+        doc,
+        file_path: path,
+    }))
+}
+
+/// Saves the workspace-wide Global environment (`environments/_global.env.yaml`).
+pub fn save_global_environment(
+    workspace_root: &Path,
+    doc: &EnvironmentDoc,
+) -> Result<EnvironmentNode, StorageError> {
+    let path = workspace_root.join(ENVIRONMENTS_DIR).join(GLOBAL_ENV_FILE);
+    let mut next = doc.clone();
+    next.id = testrix_core::GLOBAL_ENV_ID.to_string();
+    next.name = "Global".to_string();
+    testrix_core::sort_env_variables(&mut next.variables);
+    next.validate()?;
+    write_yaml_atomic(&path, &next)?;
+    Ok(EnvironmentNode {
+        doc: next,
+        file_path: path,
+    })
 }
 
 /// Persists an [`ImportedProjectBundle`] (such as an OpenAPI 3.0 or Postman import) into `workspace_root`.

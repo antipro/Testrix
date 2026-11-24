@@ -42,7 +42,7 @@ use gpui_kit::{
     px, size,
 };
 use testrix_core::{
-    AuthConfig, AuthNodeRef, ExplorerNode, FolderNode, HttpMethod, HttpRequestDoc,
+    AuthConfig, AuthNodeRef, ExplorerNode, FolderNode, GLOBAL_ENV_ID, HttpMethod, HttpRequestDoc,
     HttpRequestSpec, ImportedProjectBundle, KeyValueRow, ProjectNode, RequestBody,
     RequestHistoryEntry, RequestSet, RequestSetFolder, RequestSetItem, WorkspaceTree,
     export_openapi_3_0, generate_id, parse_apifox, parse_openapi_3_0, parse_postman_collection,
@@ -68,7 +68,7 @@ use testrix_storage::{
     restore_file_from_commit, save_config_appearance, save_config_key_bindings,
     save_config_preferences, save_config_share_settings, save_config_shared_projects,
     save_config_sync_settings, save_config_workspace_dir, save_environment, save_folder,
-    save_project, save_request, save_request_response, save_sync_base,
+    save_global_environment, save_project, save_request, save_request_response, save_sync_base,
     save_workspace_explorer_state, save_workspace_history, save_workspace_sets,
     save_workspace_state, save_workspace_tabs, three_way_merge_trees,
 };
@@ -1054,7 +1054,12 @@ impl TestrixApp {
                         doc: doc.clone(),
                         file_path: PathBuf::new(),
                     };
-                    let active_env = self.workspace.active_environment().map(|e| e.doc.clone());
+                    let active_env = self.workspace.effective_environment();
+                    let global_env = self
+                        .workspace
+                        .global_environment
+                        .as_ref()
+                        .map(|e| e.doc.clone());
                     let runner = self.runner.clone();
                     let editor_font_size = f32::from(self.editor_font_size);
                     let tab_view = cx.new(|cx| {
@@ -1063,6 +1068,7 @@ impl TestrixApp {
                             &[],
                             &req_node,
                             active_env,
+                            global_env,
                             runner,
                             window,
                             cx,
@@ -1424,6 +1430,45 @@ impl TestrixApp {
                 updated,
                 renamed_keys,
             } => {
+                if env_id == GLOBAL_ENV_ID {
+                    match save_global_environment(&self.workspace.root_dir, &updated) {
+                        Ok(node) => {
+                            self.workspace.global_environment = Some(node);
+                            if !renamed_keys.is_empty() {
+                                for proj in &mut self.workspace.projects {
+                                    propagate_variable_rewrites_in_project(
+                                        proj,
+                                        &renamed_keys,
+                                        true,
+                                    );
+                                }
+                            }
+                            self.commit_git_change("Update global environment");
+                            self.sync_env_editor(window, cx);
+                            if !renamed_keys.is_empty() {
+                                self.rewrite_variables_in_open_tabs(
+                                    &renamed_keys,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            self.sync_all_tabs(window, cx);
+                            self.env_editor.update(cx, |editor, cx| {
+                                window.focus(&editor.focus_handle(cx), cx);
+                            });
+                            self.maybe_auto_git_sync(window, cx);
+                            window.push_notification("Global environment saved.", cx);
+                        }
+                        Err(err) => {
+                            window.push_notification(
+                                format!("Failed saving global environment: {err}"),
+                                cx,
+                            );
+                        }
+                    }
+                    return;
+                }
                 let is_active =
                     self.workspace.active_environment_id.as_deref() == Some(&env_id);
                 if let Some(env_node) = self
@@ -1558,10 +1603,11 @@ impl TestrixApp {
     }
 
     fn sync_env_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let global_profile = self.workspace.global_environment.clone();
         let profiles = self.workspace.environments.clone();
         let active_id = self.workspace.active_environment_id.clone();
         self.env_editor.update(cx, |editor, cx| {
-            editor.sync_profiles(profiles, active_id, window, cx);
+            editor.sync_profiles(global_profile, profiles, active_id, window, cx);
         });
     }
 
@@ -1603,7 +1649,12 @@ impl TestrixApp {
             return;
         }
 
-        let active_env = self.workspace.active_environment().map(|e| e.doc.clone());
+        let active_env = self.workspace.effective_environment();
+        let global_env = self
+            .workspace
+            .global_environment
+            .as_ref()
+            .map(|e| e.doc.clone());
 
         let new_tab = match node {
             ExplorerNode::Request {
@@ -1625,7 +1676,7 @@ impl TestrixApp {
                 let editor_font_size = f32::from(self.editor_font_size);
                 let view = cx.new(|cx| {
                     let mut tab = RequestTabView::new(
-                        project, &ancestors, req_node, active_env, runner, window, cx,
+                        project, &ancestors, req_node, active_env, global_env, runner, window, cx,
                     );
                     tab.set_editor_font_size(editor_font_size, cx);
                     if let Some(snap) = cached_resp {
@@ -1817,6 +1868,34 @@ impl TestrixApp {
                         self.commit_git_change(&format!("Update environment: {env_name}"));
                         self.sync_env_editor(window, cx);
                         self.sync_all_tabs(window, cx);
+                    }
+                }
+            }
+            RequestTabEvent::ApplyPostScriptGlobalEnv { vars } => {
+                let mut doc = self
+                    .workspace
+                    .global_environment
+                    .as_ref()
+                    .map(|e| e.doc.clone())
+                    .unwrap_or_else(|| {
+                        testrix_core::EnvironmentDoc::new(GLOBAL_ENV_ID, "Global")
+                    });
+                let changed = crate::post_script::apply_vars_to_environment(&mut doc, &vars);
+                if !changed.is_empty() {
+                    match save_global_environment(&self.workspace.root_dir, &doc) {
+                        Ok(node) => {
+                            self.workspace.global_environment = Some(node);
+                            self.commit_git_change("Update global environment");
+                            self.sync_env_editor(window, cx);
+                            self.sync_all_tabs(window, cx);
+                            self.maybe_auto_git_sync(window, cx);
+                        }
+                        Err(err) => {
+                            window.push_notification(
+                                format!("Failed saving post-script global environment: {err}"),
+                                cx,
+                            );
+                        }
                     }
                 }
             }
@@ -2682,14 +2761,20 @@ impl TestrixApp {
     }
 
     fn sync_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let active_env = self.workspace.active_environment().map(|e| e.doc.clone());
+        let active_env = self.workspace.effective_environment();
+        let global_env = self
+            .workspace
+            .global_environment
+            .as_ref()
+            .map(|e| e.doc.clone());
         for tab in &self.tabs {
             match tab {
                 WorkbenchTab::Request(view) => {
                     let project_id = view.read(cx).project_id().to_string();
                     if let Some(project) = self.workspace.find_project(&project_id) {
                         let env = active_env.clone();
-                        view.update(cx, |v, cx| v.sync_context(project, env, window, cx));
+                        let genv = global_env.clone();
+                        view.update(cx, |v, cx| v.sync_context(project, env, genv, window, cx));
                     }
                 }
                 WorkbenchTab::Container(view) => {
