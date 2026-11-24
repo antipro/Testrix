@@ -2387,7 +2387,12 @@ impl PackageTabView {
                         .w_full()
                         .h(px(190.))
                         .overflow_hidden()
-                        .child(Editor::new(&self.console_editor).h_full().w_full()),
+                        .child(
+                            Editor::new(&self.console_editor)
+                                .readonly(true)
+                                .h_full()
+                                .w_full(),
+                        ),
                 )
             })
             .into_any_element()
