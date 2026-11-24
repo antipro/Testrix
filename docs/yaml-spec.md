@@ -331,3 +331,65 @@ Given a target node $N_0$ (`HttpRequest` or `Folder`) with ancestor chain $[N_0,
 3. `id` and `name` must be non-empty after trimming whitespace.
 4. `settings.timeoutMs` must be `>= 1`.
 5. `Project.auth` resolves `inherit` as `none` if encountered in legacy files, though `none` is canonical at the project root.
+
+---
+
+## 7. Package & Execution DAG Specification (`.testrix-sets.yaml`)
+
+Workspace Packages (stored in `<workspace-root>/.testrix-sets.yaml`) support an optional `dag` field describing a Directed Acyclic Graph (DAG) of HTTP requests for orchestrated execution.
+
+```yaml
+sets:
+  - id: set-checkout-flow
+    name: Checkout Flow
+    dag:
+      nodes:
+        - id: node-login
+          projectId: proj-starter
+          requestId: req-login
+          name: Login
+          x: 60
+          y: 120
+        - id: node-create-order
+          projectId: proj-starter
+          requestId: req-create-order
+          name: Create Order
+          x: 340
+          y: 120
+      edges:
+        - from: node-login
+          to: node-create-order
+```
+
+### 7.1 `PackageDag` Schema
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `nodes` | `DagNode[]` | No | List of request nodes in the DAG. |
+| `edges` | `DagEdge[]` | No | List of directed dependency edges (`from` -> `to`). |
+
+#### `DagNode`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | `string` | Yes | Unique node identifier within this DAG. |
+| `projectId` | `string` | No | Owning project ID (recommended; if omitted, resolved by `requestId`). |
+| `requestId` | `string` | Yes | Target `HttpRequest.id` to execute. |
+| `name` | `string` | No | Display label in the DAG canvas. |
+| `x` | `number` | No | Canvas X coordinate in pixels (default `0`). |
+| `y` | `number` | No | Canvas Y coordinate in pixels (default `0`). |
+
+#### `DagEdge`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `from` | `string` | Yes | Upstream `DagNode.id` that must complete first. |
+| `to` | `string` | Yes | Downstream `DagNode.id` that runs after `from`. |
+
+### 7.2 DAG Validation Rules
+
+1. Node `id` values must be non-empty and unique within the DAG.
+2. Node `requestId` must be non-empty.
+3. Every edge's `from` and `to` must reference an existing `DagNode.id`.
+4. **No loops**: Self-loops (`from == to`), duplicate edges, and cycles of any length are rejected.
+5. Downstream nodes may reference ephemeral `thread` variables written by upstream post-scripts via `{{thread.<key>}}` in request templates or `thread.<key>` in post-scripts.

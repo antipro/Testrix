@@ -1045,6 +1045,7 @@ fn handle_package(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
                 name,
                 folders: Vec::new(),
                 requests: Vec::new(),
+                dag: Default::default(),
             };
             sets.push(pkg.clone());
             save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;

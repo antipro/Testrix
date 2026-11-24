@@ -12,6 +12,7 @@ mod history_panel;
 mod i18n;
 pub mod ipc;
 mod kv_editor;
+mod package_editor;
 mod post_script;
 mod request_editor;
 mod sets_panel;

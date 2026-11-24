@@ -608,7 +608,7 @@ pub struct RequestSetFolder {
     pub requests: Vec<RequestSetItem>,
 }
 
-/// A named group of HTTP request references with nested folders.
+/// A named group of HTTP request references with nested folders and an optional execution DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestSet {
@@ -618,6 +618,8 @@ pub struct RequestSet {
     pub folders: Vec<RequestSetFolder>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<RequestSetItem>,
+    #[serde(default, skip_serializing_if = "crate::dag::PackageDag::is_empty")]
+    pub dag: crate::dag::PackageDag,
 }
 
 /// Top-level YAML document for a folder (`_folder.yaml`).

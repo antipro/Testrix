@@ -37,6 +37,9 @@ pub(crate) enum SetsPanelEvent {
     DeleteSet {
         set_id: String,
     },
+    OpenSetProperties {
+        set_id: String,
+    },
     CreateFolder {
         set_id: String,
         parent_folder_id: Option<String>,
@@ -169,6 +172,7 @@ impl SetsPanel {
         let set_id_drop = set.id.clone();
         let set_id_menu = set.id.clone();
         let set_id_toggle = set.id.clone();
+        let set_id_props = set.id.clone();
 
         let has_children = !set.folders.is_empty() || !set.requests.is_empty();
         let matches_self = query.is_empty() || set.name.to_lowercase().contains(query);
@@ -183,6 +187,7 @@ impl SetsPanel {
         let view_t = view.clone();
         let view_m = view.clone();
         let view_d = view.clone();
+        let view_p = view.clone();
 
         let set_row = ListItem::new(SharedString::from(format!("set-row-{row_ix}-{}", set.id)))
             .px_1p5()
@@ -226,6 +231,20 @@ impl SetsPanel {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .child(set.name.clone()),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("set-props-btn-{row_ix}-{}", set.id)))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(LucideIcon::Workflow))
+                            .tooltip("Package Properties & DAG")
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let sid = set_id_props.clone();
+                                view_p.update(cx, |_, cx| {
+                                    cx.emit(SetsPanelEvent::OpenSetProperties { set_id: sid });
+                                });
+                            }),
                     ),
             )
             .on_click(move |_, _, cx| {
@@ -248,13 +267,25 @@ impl SetsPanel {
                 });
             })
             .context_menu(move |menu, _, _| {
+                let s0 = set_id_menu.clone();
                 let s1 = set_id_menu.clone();
                 let s2 = set_id_menu.clone();
                 let s3 = set_id_menu.clone();
+                let v0 = view_m.clone();
                 let v1 = view_m.clone();
                 let v2 = view_m.clone();
                 let v3 = view_m.clone();
-                menu.item(PopupMenuItem::new("New Folder").on_click(move |_, _, cx| {
+                menu.item(
+                    PopupMenuItem::new("Properties")
+                        .icon(LucideIcon::Workflow)
+                        .on_click(move |_, _, cx| {
+                            v0.update(cx, |_, cx| {
+                                cx.emit(SetsPanelEvent::OpenSetProperties { set_id: s0.clone() });
+                            });
+                        }),
+                )
+                .separator()
+                .item(PopupMenuItem::new("New Folder").on_click(move |_, _, cx| {
                     v1.update(cx, |_, cx| {
                         cx.emit(SetsPanelEvent::CreateFolder {
                             set_id: s1.clone(),

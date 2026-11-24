@@ -4,6 +4,7 @@
 mod apifox;
 mod auth;
 mod codegen;
+mod dag;
 mod error;
 mod materialize;
 mod model;
@@ -20,11 +21,12 @@ pub use auth::{
     resolve_project_auth, resolve_request_auth, resolve_request_doc_auth,
 };
 pub use codegen::{CodegenTarget, generate_request_code, parse_request_script};
+pub use dag::{DagEdge, DagNode, DagValidationError, PackageDag};
 pub use error::CoreError;
 pub use materialize::{
     PreparedBody, PreparedHeader, PreparedMultipartPart, PreparedRequest,
     extract_path_param_names, extract_url_query_params, materialize_request,
-    materialize_request_doc,
+    materialize_request_doc, materialize_request_doc_with_extra_vars,
 };
 pub use model::{
     API_VERSION, ApiKeyLocation, AuthConfig, DocumentKind, EffectiveAuth, EnvVariable,

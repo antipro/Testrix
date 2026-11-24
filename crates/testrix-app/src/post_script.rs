@@ -84,6 +84,7 @@ struct ScriptContext<'a> {
     environment: ScriptEnvironment<'a>,
     request: ScriptRequest<'a>,
     response: ScriptResponse<'a>,
+    thread: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,10 +93,12 @@ pub(crate) struct PostScriptResult {
     pub next_vars: BTreeMap<String, String>,
     pub changed_global_keys: Vec<String>,
     pub next_global_vars: BTreeMap<String, String>,
+    pub changed_thread_keys: Vec<String>,
+    pub next_thread_vars: BTreeMap<String, String>,
 }
 
 /// Executes a request's `postScript` using `gpui-shell` (QuickJS), exposing
-/// `environment` (`var` and `global`), `request`, and `response` globals.
+/// `environment` (`var` and `global`), `request`, `response`, and `thread` globals.
 pub(crate) fn run_post_script(
     script: &str,
     request_id: &str,
@@ -104,8 +107,32 @@ pub(crate) fn run_post_script(
     global_env: Option<&EnvironmentDoc>,
     snapshot: &HttpResponseSnapshot,
 ) -> Result<PostScriptResult> {
+    run_post_script_with_thread(
+        script,
+        request_id,
+        request_name,
+        active_env,
+        global_env,
+        None,
+        snapshot,
+    )
+}
+
+/// Executes a request's `postScript` with an optional DAG-scoped `thread` variable map.
+pub(crate) fn run_post_script_with_thread(
+    script: &str,
+    request_id: &str,
+    request_name: &str,
+    active_env: Option<&EnvironmentDoc>,
+    global_env: Option<&EnvironmentDoc>,
+    thread_vars: Option<&BTreeMap<String, String>>,
+    snapshot: &HttpResponseSnapshot,
+) -> Result<PostScriptResult> {
     if script.trim().is_empty() {
-        return Ok(PostScriptResult::default());
+        return Ok(PostScriptResult {
+            next_thread_vars: thread_vars.cloned().unwrap_or_default(),
+            ..Default::default()
+        });
     }
 
     let _run_guard = RUN_LOCK
@@ -115,6 +142,7 @@ pub(crate) fn run_post_script(
 
     let initial_vars = testrix_core::env_variable_map(active_env);
     let initial_global_vars = testrix_core::env_variable_map(global_env);
+    let initial_thread_vars = thread_vars.cloned().unwrap_or_default();
     let mut req_headers = BTreeMap::new();
     for h in &snapshot.sent_request.headers {
         req_headers.insert(h.name.clone(), h.value.clone());
@@ -146,6 +174,7 @@ pub(crate) fn run_post_script(
             duration_ms: snapshot.duration_ms,
             size_bytes: snapshot.size_bytes,
         },
+        thread: initial_thread_vars.clone(),
     };
     let context_json = serde_json::to_string(&ctx_payload)?;
 
@@ -167,6 +196,7 @@ const __ctx = JSON.parse(__get_context());
 globalThis.environment = __ctx.environment;
 globalThis.request = __ctx.request;
 globalThis.response = __ctx.response;
+globalThis.thread = __ctx.thread || {{}};
 globalThis.response.json = () => JSON.parse(globalThis.response.body);
 
 try {{
@@ -174,7 +204,8 @@ try {{
 }} finally {{
   const __vars = (globalThis.environment && globalThis.environment.var) ? globalThis.environment.var : {{}};
   const __global = (globalThis.environment && globalThis.environment.global) ? globalThis.environment.global : {{}};
-  __commit_env(JSON.stringify({{ var: __vars, global: __global }}));
+  const __thread = (globalThis.thread && typeof globalThis.thread === "object") ? globalThis.thread : {{}};
+  __commit_env(JSON.stringify({{ var: __vars, global: __global, thread: __thread }}));
 }}
 
 export default class PostScriptRunner extends View {{
@@ -230,16 +261,21 @@ export default class PostScriptRunner extends View {{
             .collect()
     }
 
-    let (next_vars, next_global_vars) = match committed_json {
+    let (next_vars, next_global_vars, next_thread_vars) = match committed_json {
         Some(json) => {
             let root: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&json).context("parse committed environment")?;
             (
                 parse_committed_map(root.get("var"), &initial_vars),
                 parse_committed_map(root.get("global"), &initial_global_vars),
+                parse_committed_map(root.get("thread"), &initial_thread_vars),
             )
         }
-        None => (initial_vars.clone(), initial_global_vars.clone()),
+        None => (
+            initial_vars.clone(),
+            initial_global_vars.clone(),
+            initial_thread_vars.clone(),
+        ),
     };
 
     let changed_keys = next_vars
@@ -254,11 +290,19 @@ export default class PostScriptRunner extends View {{
         .map(|(k, _)| k.clone())
         .collect();
 
+    let changed_thread_keys = next_thread_vars
+        .iter()
+        .filter(|(k, v)| initial_thread_vars.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
+
     Ok(PostScriptResult {
         changed_keys,
         next_vars,
         changed_global_keys,
         next_global_vars,
+        changed_thread_keys,
+        next_thread_vars,
     })
 }
 
@@ -318,6 +362,13 @@ const TOP_LEVEL_COMPLETIONS: &[CompletionEntry] = &[
         kind: CompletionItemKind::VARIABLE,
         detail: "ScriptResponse",
         doc: "HTTP response snapshot (`status`, `reason`, `headers`, `body`, `durationMs`, `sizeBytes`, `json()`).",
+    },
+    CompletionEntry {
+        label: "thread",
+        insert_text: "thread",
+        kind: CompletionItemKind::VARIABLE,
+        detail: "Record<string, string>",
+        doc: "Ephemeral DAG-scoped variables. Only takes effect during a Package DAG run and can be referenced by downstream requests via `{{thread.key}}` or `thread.key`.",
     },
     CompletionEntry {
         label: "JSON",
@@ -862,6 +913,65 @@ mod tests {
             Some("global-jwt-999")
         );
         assert_eq!(result.changed_global_keys, vec!["global_token".to_string()]);
+    }
+
+    #[test]
+    fn post_script_propagates_thread_vars_across_dag_steps() {
+        let body = r#"{"token":"dag-thread-token"}"#;
+        let snapshot = HttpResponseSnapshot {
+            status_code: 200,
+            reason: "OK".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            duration_ms: 5,
+            size_bytes: body.len(),
+            headers: Vec::new(),
+            body_text: body.to_string(),
+            pretty_body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
+            content_type: Some("application/json".to_string()),
+            sent_request: SentRequestSnapshot {
+                method: HttpMethod::Post,
+                url: "https://api.test/login".to_string(),
+                headers: Vec::new(),
+                body_preview: String::new(),
+            },
+        };
+
+        let mut thread_vars = BTreeMap::new();
+        let step1 = run_post_script_with_thread(
+            r#"thread.sessionToken = response.json().token;"#,
+            "req-1",
+            "Login",
+            None,
+            None,
+            Some(&thread_vars),
+            &snapshot,
+        )
+        .expect("step1 should succeed");
+        thread_vars = step1.next_thread_vars;
+        assert_eq!(
+            thread_vars.get("sessionToken").map(String::as_str),
+            Some("dag-thread-token")
+        );
+        assert_eq!(
+            step1.changed_thread_keys,
+            vec!["sessionToken".to_string()]
+        );
+
+        let step2 = run_post_script_with_thread(
+            r#"thread.derived = thread.sessionToken + "-v2";"#,
+            "req-2",
+            "Profile",
+            None,
+            None,
+            Some(&thread_vars),
+            &snapshot,
+        )
+        .expect("step2 should read thread from step1");
+        assert_eq!(
+            step2.next_thread_vars.get("derived").map(String::as_str),
+            Some("dag-thread-token-v2")
+        );
     }
 
     #[gpui_kit::gpui::test]

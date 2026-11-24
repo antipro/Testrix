@@ -36,7 +36,7 @@ You can also edit `postScript` directly in the **Post-Script** tab of any reques
 
 ## 2. Global Variables
 
-When a post-script runs, Testrix injects three global objects: `environment`, `request`, and `response`.
+When a post-script runs, Testrix injects four global objects: `environment`, `request`, `response`, and `thread`.
 
 ### `environment`
 
@@ -79,6 +79,23 @@ Read-only snapshot of the HTTP response returned by the server.
 | `response.durationMs` | `number` | Request duration in milliseconds. |
 | `response.sizeBytes` | `number` | Response body size in bytes. |
 | `response.json()` | `() => any` | Convenience helper equivalent to `JSON.parse(response.body)`. |
+
+### `thread`
+
+Mutable key-value map (`Record<string, string>`) scoped exclusively to a single Package DAG execution.
+
+- Changes written to `thread.<key>` (or `thread["<key>"]`) are **not** persisted to disk and **only** take effect during the active DAG run.
+- Downstream nodes in the DAG can read `thread.<key>` inside their own post-scripts, or interpolate `{{thread.<key>}}` in URLs, headers, query parameters, auth fields, and request bodies.
+- Outside of a DAG run (when executing a standalone request), `thread` is initialized empty and discarded after the request finishes.
+
+```javascript
+// Upstream node post-script:
+const data = response.json();
+thread.orderToken = data.token;
+
+// Downstream request URL or Header:
+// Authorization: Bearer {{thread.orderToken}}
+```
 
 ---
 

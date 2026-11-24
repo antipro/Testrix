@@ -84,6 +84,7 @@ use crate::{
     env_editor::{EnvEditorEvent, EnvEditorView},
     explorer::ExplorerEvent,
     history_panel::HistoryPanelEvent,
+    package_editor::{PackageTabEvent, PackageTabView},
     request_editor::{RequestTabEvent, RequestTabView},
     sets_panel::SetsPanelEvent,
     sidebar_pane::{SidebarPane, SidebarPaneEvent, SidebarViewMode},
@@ -225,6 +226,7 @@ impl SelectItem for LanguageOption {
 enum WorkbenchTab {
     Request(Entity<RequestTabView>),
     Container(Entity<ContainerTabView>),
+    Package(Entity<PackageTabView>),
 }
 
 impl WorkbenchTab {
@@ -232,6 +234,7 @@ impl WorkbenchTab {
         match self {
             Self::Request(view) => format!("req:{}", view.read(cx).request_id()),
             Self::Container(view) => view.read(cx).tab_key(),
+            Self::Package(view) => view.read(cx).tab_key(),
         }
     }
 
@@ -239,6 +242,7 @@ impl WorkbenchTab {
         match self {
             Self::Request(view) => view.read(cx).title(cx),
             Self::Container(view) => view.read(cx).title(cx),
+            Self::Package(view) => view.read(cx).title(),
         }
     }
 
@@ -246,6 +250,7 @@ impl WorkbenchTab {
         match self {
             Self::Request(view) => view.read(cx).is_dirty(),
             Self::Container(view) => view.read(cx).is_dirty(),
+            Self::Package(view) => view.read(cx).is_dirty(),
         }
     }
 }
@@ -1108,6 +1113,7 @@ impl TestrixApp {
                         name,
                         folders: Vec::new(),
                         requests: Vec::new(),
+                        dag: Default::default(),
                     });
                 });
             }
@@ -1134,7 +1140,25 @@ impl TestrixApp {
             SetsPanelEvent::DeleteSet { set_id } => {
                 self.request_sets.retain(|s| s.id != set_id);
                 let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
+                let pkg_key = format!("pkg:{set_id}");
+                if let Some(ix) = self.tabs.iter().position(|t| t.key(cx) == pkg_key) {
+                    self.tabs.remove(ix);
+                    if self.active_tab_ix == Some(ix) {
+                        self.active_tab_ix = if self.tabs.is_empty() {
+                            None
+                        } else {
+                            Some(ix.min(self.tabs.len() - 1))
+                        };
+                    } else if let Some(active) = self.active_tab_ix
+                        && active > ix
+                    {
+                        self.active_tab_ix = Some(active - 1);
+                    }
+                }
                 self.sync_sidebars(None, cx);
+            }
+            SetsPanelEvent::OpenSetProperties { set_id } => {
+                self.open_package_properties(&set_id, window, cx);
             }
             SetsPanelEvent::CreateFolder {
                 set_id,
@@ -1270,6 +1294,107 @@ impl TestrixApp {
                 }
                 let _ = save_workspace_sets(&self.workspace.root_dir, &self.request_sets);
                 self.sync_sidebars(None, cx);
+            }
+        }
+    }
+
+    fn open_package_properties(
+        &mut self,
+        set_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_key = format!("pkg:{set_id}");
+        if let Some(ix) = self.tabs.iter().position(|t| t.key(cx) == target_key) {
+            self.active_tab_ix = Some(ix);
+            self.persist_open_tabs(cx);
+            cx.notify();
+            return;
+        }
+        let Some(set) = self.request_sets.iter().find(|s| s.id == set_id).cloned() else {
+            return;
+        };
+        let active_env = self.workspace.effective_environment();
+        let global_env = self
+            .workspace
+            .global_environment
+            .as_ref()
+            .map(|e| e.doc.clone());
+        let workspace = self.workspace.clone();
+        let runner = self.runner.clone();
+        let view = cx.new(|cx| {
+            PackageTabView::new(set, workspace, active_env, global_env, runner, window, cx)
+        });
+        let sub = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &PackageTabEvent, window, cx| {
+                this.handle_package_tab_event(event.clone(), window, cx);
+            },
+        );
+        self._subscriptions.push(sub);
+        self.tabs.push(WorkbenchTab::Package(view));
+        self.active_tab_ix = Some(self.tabs.len() - 1);
+        self.refresh_dirty_indicators(cx);
+        self.persist_open_tabs(cx);
+        cx.notify();
+    }
+
+    fn handle_package_tab_event(
+        &mut self,
+        event: PackageTabEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PackageTabEvent::SaveSet { set_id, set } => {
+                if let Some(existing) = self.request_sets.iter_mut().find(|s| s.id == set_id) {
+                    *existing = set.clone();
+                }
+                if let Err(err) = save_workspace_sets(&self.workspace.root_dir, &self.request_sets) {
+                    window.push_notification(format!("Failed to save package: {err}"), cx);
+                } else {
+                    for tab in &self.tabs {
+                        if let WorkbenchTab::Package(view) = tab
+                            && view.read(cx).set_id() == set_id
+                        {
+                            view.update(cx, |v, cx| v.mark_saved(&set, cx));
+                        }
+                    }
+                    self.sync_sidebars(None, cx);
+                    self.refresh_dirty_indicators(cx);
+                }
+            }
+            PackageTabEvent::OpenRequest {
+                project_id,
+                request_id,
+            } => {
+                self.open_node(
+                    ExplorerNode::Request {
+                        project_id,
+                        request_id,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            PackageTabEvent::ApplyPostScriptEnv { env_id, vars } => {
+                self.handle_request_tab_event(
+                    RequestTabEvent::ApplyPostScriptEnv { env_id, vars },
+                    window,
+                    cx,
+                );
+            }
+            PackageTabEvent::ApplyPostScriptGlobalEnv { vars } => {
+                self.handle_request_tab_event(
+                    RequestTabEvent::ApplyPostScriptGlobalEnv { vars },
+                    window,
+                    cx,
+                );
+            }
+            PackageTabEvent::DirtyChanged => {
+                self.refresh_dirty_indicators(cx);
+                cx.notify();
             }
         }
     }
@@ -2790,6 +2915,7 @@ impl TestrixApp {
                         v.rewrite_variables(pairs, wrap_braces, window, cx);
                     });
                 }
+                WorkbenchTab::Package(_) => {}
             }
         }
     }
@@ -2824,6 +2950,16 @@ impl TestrixApp {
                         let env = active_env.clone();
                         view.update(cx, |v, cx| v.sync_context(project, env, window, cx));
                     }
+                }
+                WorkbenchTab::Package(view) => {
+                    let set_id = view.read(cx).set_id().to_string();
+                    let latest_set = self.request_sets.iter().find(|s| s.id == set_id).cloned();
+                    let ws = self.workspace.clone();
+                    let env = active_env.clone();
+                    let genv = global_env.clone();
+                    view.update(cx, |v, cx| {
+                        v.sync_context(ws, env, genv, latest_set.as_ref(), cx);
+                    });
                 }
             }
         }
@@ -2892,6 +3028,7 @@ impl TestrixApp {
                 match tab {
                     WorkbenchTab::Request(view) => view.update(cx, |v, cx| v.save(cx)),
                     WorkbenchTab::Container(view) => view.update(cx, |v, cx| v.save(cx)),
+                    WorkbenchTab::Package(view) => view.update(cx, |v, cx| v.save(cx)),
                 }
             }
         }
@@ -6657,6 +6794,7 @@ impl TestrixApp {
             match tab {
                 WorkbenchTab::Request(view) => view.update(cx, |v, cx| v.save(cx)),
                 WorkbenchTab::Container(view) => view.update(cx, |v, cx| v.save(cx)),
+                WorkbenchTab::Package(view) => view.update(cx, |v, cx| v.save(cx)),
             }
         }
     }
@@ -6713,7 +6851,7 @@ impl Render for TestrixApp {
                         .and_then(|p| resolve_request_auth(p, &req_id).ok())
                         .map(|r| format!("Auth: {}", r.summary()))
                 }
-                WorkbenchTab::Container(_) => None,
+                WorkbenchTab::Container(_) | WorkbenchTab::Package(_) => None,
             })
             .unwrap_or_else(|| "YAML Spec: testrix.io/v1".to_string());
 
@@ -7064,12 +7202,17 @@ impl TestrixApp {
                         if *ix < this.tabs.len() {
                             this.active_tab_ix = Some(*ix);
                             let project_id = match &this.tabs[*ix] {
-                                WorkbenchTab::Request(view) => view.read(cx).project_id().to_string(),
-                                WorkbenchTab::Container(view) => {
-                                    view.read(cx).project_id().to_string()
+                                WorkbenchTab::Request(view) => {
+                                    Some(view.read(cx).project_id().to_string())
                                 }
+                                WorkbenchTab::Container(view) => {
+                                    Some(view.read(cx).project_id().to_string())
+                                }
+                                WorkbenchTab::Package(_) => None,
                             };
-                            this.set_active_project(&project_id, window, cx);
+                            if let Some(project_id) = project_id {
+                                this.set_active_project(&project_id, window, cx);
+                            }
                             let key = this.tabs[*ix].key(cx);
                             this.reveal_and_select_in_explorers(&key, cx);
                             this.persist_open_tabs(cx);
@@ -7097,6 +7240,10 @@ impl TestrixApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .into_any_element()
                             }
+                            WorkbenchTab::Package(_) => Icon::new(LucideIcon::Workflow)
+                                .xsmall()
+                                .text_color(cx.theme().primary)
+                                .into_any_element(),
                         };
 
                         Tab::new()
@@ -7146,6 +7293,7 @@ impl TestrixApp {
             let body = match tab {
                 WorkbenchTab::Request(view) => view.clone().into_any_element(),
                 WorkbenchTab::Container(view) => view.clone().into_any_element(),
+                WorkbenchTab::Package(view) => view.clone().into_any_element(),
             };
             return div()
                 .id("center-workbench-content")

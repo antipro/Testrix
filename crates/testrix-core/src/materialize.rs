@@ -127,7 +127,21 @@ pub fn materialize_request_doc(
     doc: &HttpRequestDoc,
     env: Option<&EnvironmentDoc>,
 ) -> Result<PreparedRequest, CoreError> {
-    let vars = env_variable_map(env);
+    materialize_request_doc_with_extra_vars(project, ancestors, doc, env, &BTreeMap::new())
+}
+
+/// Materializes an [`HttpRequestDoc`] with additional runtime variables (such as DAG `thread.*` vars).
+pub fn materialize_request_doc_with_extra_vars(
+    project: &ProjectNode,
+    ancestors: &[&FolderNode],
+    doc: &HttpRequestDoc,
+    env: Option<&EnvironmentDoc>,
+    extra_vars: &BTreeMap<String, String>,
+) -> Result<PreparedRequest, CoreError> {
+    let mut vars = env_variable_map(env);
+    for (k, v) in extra_vars {
+        vars.insert(k.clone(), v.clone());
+    }
     let mut unresolved = Vec::new();
     let expand = |raw: &str, unresolved: &mut Vec<String>| -> String {
         let res = interpolate_with_map(raw, &vars);

@@ -314,6 +314,7 @@ mod tests {
                 }],
             }],
             requests: Vec::new(),
+            dag: Default::default(),
         }];
         save_workspace_sets(dir.path(), &sets).unwrap();
         let loaded_sets = load_workspace_sets(dir.path());
