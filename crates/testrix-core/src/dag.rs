@@ -3,6 +3,53 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::model::{AuthConfig, HttpRequestDoc, KeyValueRow, RequestBody};
+
+/// Per-node request overrides stored on a DAG node without mutating the underlying `HttpRequestDoc`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DagNodeOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Vec<KeyValueRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_params: Option<Vec<KeyValueRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Vec<KeyValueRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<RequestBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfig>,
+}
+
+impl DagNodeOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.params.is_none()
+            && self.path_params.is_none()
+            && self.headers.is_none()
+            && self.body.is_none()
+            && self.auth.is_none()
+    }
+
+    /// Applies any configured overrides onto an in-memory copy of `doc`.
+    pub fn apply_to(&self, doc: &mut HttpRequestDoc) {
+        if let Some(params) = &self.params {
+            doc.request.params = params.clone();
+        }
+        if let Some(path_params) = &self.path_params {
+            doc.request.path_params = path_params.clone();
+        }
+        if let Some(headers) = &self.headers {
+            doc.request.headers = headers.clone();
+        }
+        if let Some(body) = &self.body {
+            doc.request.body = body.clone();
+        }
+        if let Some(auth) = &self.auth {
+            doc.request.auth = auth.clone();
+        }
+    }
+}
+
 /// A node in a package's execution DAG referencing an HTTP request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +62,8 @@ pub struct DagNode {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
+    #[serde(default, skip_serializing_if = "DagNodeOverrides::is_empty")]
+    pub overrides: DagNodeOverrides,
     #[serde(default)]
     pub x: f32,
     #[serde(default)]
@@ -28,6 +77,7 @@ impl PartialEq for DagNode {
             && self.request_id == other.request_id
             && self.name == other.name
             && self.needs == other.needs
+            && self.overrides == other.overrides
             && self.x.to_bits() == other.x.to_bits()
             && self.y.to_bits() == other.y.to_bits()
     }
@@ -259,6 +309,7 @@ mod tests {
             request_id: req.to_string(),
             name: id.to_string(),
             needs: needs.iter().map(|s| (*s).to_string()).collect(),
+            overrides: DagNodeOverrides::default(),
             x: 0.0,
             y: 0.0,
         }

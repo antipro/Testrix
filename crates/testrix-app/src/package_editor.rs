@@ -23,15 +23,17 @@ use gpui_kit::{
     px,
 };
 use testrix_core::{
-    DagNode, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag, ProjectNode, RequestSet,
-    RequestSetFolder, RequestSetItem, WorkspaceTree, generate_id,
-    materialize_request_doc_with_extra_vars,
+    DagNode, DagNodeOverrides, EnvironmentDoc, HttpMethod, HttpRequestDoc, PackageDag, ProjectNode,
+    RawBodyFormat, RequestBody, RequestSet, RequestSetFolder, RequestSetItem, WorkspaceTree,
+    generate_id, materialize_request_doc_with_extra_vars,
 };
 use testrix_http::{CancellationToken, HttpRunner};
 use testrix_storage::to_yaml_pretty;
 
 use crate::{
+    auth_section::{AuthEditor, AuthEditorEvent},
     explorer::DraggedRequest,
+    kv_editor::{KeyValueTable, TableChangeEvent, common_http_header_options},
     post_script::run_post_script_with_thread,
     theme_helpers::method_badge,
 };
@@ -43,6 +45,38 @@ const NODE_HEIGHT: f32 = 58.0;
 enum PackageSection {
     Dag,
     Yaml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideSection {
+    Params,
+    Path,
+    Headers,
+    Body,
+    Auth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideBodyMode {
+    None,
+    Json,
+    Raw,
+    FormUrlEncoded,
+}
+
+struct NodeOverrideDrawer {
+    node_id: String,
+    base_doc: HttpRequestDoc,
+    active_tab: OverrideSection,
+    params_table: Entity<KeyValueTable>,
+    path_table: Entity<KeyValueTable>,
+    headers_table: Entity<KeyValueTable>,
+    body_mode: OverrideBodyMode,
+    body_editor: Entity<EditorState>,
+    body_form_table: Entity<KeyValueTable>,
+    auth_editor: Entity<AuthEditor>,
+    suppress_sync: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +163,7 @@ pub(crate) struct PackageTabView {
     run_summary: Option<Result<String, String>>,
     console_logs: Vec<ConsoleLogEntry>,
     console_collapsed: bool,
+    node_drawer: Option<NodeOverrideDrawer>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -185,6 +220,7 @@ impl PackageTabView {
             run_summary: None,
             console_logs: Vec::new(),
             console_collapsed: true,
+            node_drawer: None,
             _subscriptions: vec![sub],
         }
     }
@@ -352,6 +388,7 @@ impl PackageTabView {
             request_id: request_id.clone(),
             name: drag.name.clone(),
             needs: Vec::new(),
+            overrides: DagNodeOverrides::default(),
             x,
             y,
         });
@@ -422,6 +459,13 @@ impl PackageTabView {
         }
         if self.selected_node_id.as_deref() == Some(node_id) {
             self.selected_node_id = None;
+        }
+        if self
+            .node_drawer
+            .as_ref()
+            .is_some_and(|d| d.node_id == node_id)
+        {
+            self.node_drawer = None;
         }
         self.node_statuses.remove(node_id);
         self.sync_yaml_from_dag(window, cx);
@@ -524,6 +568,9 @@ impl PackageTabView {
                         return Err(format!("Request `{}` not found", node.request_id));
                     };
 
+                    let mut effective_doc = req_doc.clone();
+                    node.overrides.apply_to(&mut effective_doc);
+
                     let mut extra_vars = BTreeMap::new();
                     for (k, v) in &thread_vars {
                         extra_vars.insert(format!("thread.{k}"), v.clone());
@@ -532,7 +579,7 @@ impl PackageTabView {
                     let prepared = materialize_request_doc_with_extra_vars(
                         proj,
                         &ancestors,
-                        req_doc,
+                        &effective_doc,
                         this.active_env.as_ref(),
                         &extra_vars,
                     )
@@ -541,7 +588,7 @@ impl PackageTabView {
                     Ok((
                         this.runner.clone(),
                         prepared,
-                        req_doc.clone(),
+                        effective_doc,
                         this.active_env.clone(),
                         this.global_env.clone(),
                     ))
@@ -1038,6 +1085,9 @@ impl PackageTabView {
                             }),
                     ),
             )
+            .when_some(self.node_drawer.as_ref(), |pane, drawer| {
+                pane.child(self.render_node_drawer(drawer, cx))
+            })
             .into_any_element()
     }
 
@@ -1065,8 +1115,8 @@ impl PackageTabView {
         let nid_out = node_id.clone();
         let nid_in = node_id.clone();
         let nid_del = node_id.clone();
-        let pid_open = node.project_id.clone();
-        let rid_open = node.request_id.clone();
+        let nid_open = node_id.clone();
+        let has_overrides = !node.overrides.is_empty();
 
         let v_drag = view.clone();
         let v_up = view.clone();
@@ -1093,14 +1143,11 @@ impl PackageTabView {
             .flex_col()
             .justify_between()
             .cursor_grab()
-            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
-                if event.click_count >= 2 && !pid_open.is_empty() {
-                    v_open.update(cx, |_, cx| {
-                        cx.emit(PackageTabEvent::OpenRequest {
-                            project_id: pid_open.clone(),
-                            request_id: rid_open.clone(),
-                        });
+                if event.click_count >= 2 {
+                    v_open.update(cx, |this, cx| {
+                        this.open_node_drawer(&nid_open, window, cx);
                     });
                     return;
                 }
@@ -1227,6 +1274,20 @@ impl PackageTabView {
                                 .into_any_element()
                         }
                         DagNodeRunStatus::Skipped => div().child("Skipped").into_any_element(),
+                    })
+                    .when(has_overrides, |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("dag-node-ov-{}", node.id)))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Has float-layer overrides").build(window, cx)
+                                })
+                                .child(
+                                    Icon::new(LucideIcon::Layers)
+                                        .size(px(12.))
+                                        .text_color(cx.theme().primary),
+                                ),
+                        )
                     }),
             )
             // Input Port (left)
@@ -1277,6 +1338,622 @@ impl PackageTabView {
                             });
                             cx.notify();
                         });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn open_node_drawer(&mut self, node_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.set.dag.nodes.iter().find(|n| n.id == node_id).cloned() else {
+            return;
+        };
+        let Some((_, _, req_doc)) = Self::resolve_request_doc(&self.workspace, &node) else {
+            window.push_notification(
+                format!("Base request `{}` was not found in workspace.", node.request_id),
+                cx,
+            );
+            return;
+        };
+        let base_doc = req_doc.clone();
+        let active_env = self.active_env.clone();
+
+        let initial_params = node
+            .overrides
+            .params
+            .as_deref()
+            .unwrap_or(&base_doc.request.params);
+        let initial_path = node
+            .overrides
+            .path_params
+            .as_deref()
+            .unwrap_or(&base_doc.request.path_params);
+        let initial_headers = node
+            .overrides
+            .headers
+            .as_deref()
+            .unwrap_or(&base_doc.request.headers);
+        let initial_body = node
+            .overrides
+            .body
+            .as_ref()
+            .unwrap_or(&base_doc.request.body);
+        let initial_auth = node
+            .overrides
+            .auth
+            .as_ref()
+            .unwrap_or(&base_doc.request.auth);
+
+        let params_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("dag-ov-params-{}", node.id),
+                "Param Name",
+                "Value",
+                "Add Param",
+                initial_params,
+                window,
+                cx,
+            )
+            .with_variable_validation(active_env.clone())
+        });
+        let path_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("dag-ov-path-{}", node.id),
+                "Path Variable",
+                "Value",
+                "Add Path Var",
+                initial_path,
+                window,
+                cx,
+            )
+            .with_variable_validation(active_env.clone())
+        });
+        let headers_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("dag-ov-hdrs-{}", node.id),
+                "Header Name",
+                "Value",
+                "Add Header",
+                initial_headers,
+                window,
+                cx,
+            )
+            .with_name_suggestions(common_http_header_options(), window, cx)
+            .with_variable_validation(active_env.clone())
+        });
+
+        let (body_mode, body_lang, body_text, form_fields) = match initial_body {
+            RequestBody::None => (OverrideBodyMode::None, "text", String::new(), Vec::new()),
+            RequestBody::Json { content } => {
+                (OverrideBodyMode::Json, "json", content.clone(), Vec::new())
+            }
+            RequestBody::Raw { content, .. } => {
+                (OverrideBodyMode::Raw, "text", content.clone(), Vec::new())
+            }
+            RequestBody::FormUrlEncoded { fields } => (
+                OverrideBodyMode::FormUrlEncoded,
+                "text",
+                String::new(),
+                fields.clone(),
+            ),
+            RequestBody::Multipart { .. } | RequestBody::Binary { .. } => {
+                (OverrideBodyMode::Raw, "text", String::new(), Vec::new())
+            }
+        };
+
+        let body_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(body_lang)
+                .folding(true)
+                .default_value(body_text)
+        });
+        let body_form_table = cx.new(|cx| {
+            KeyValueTable::new(
+                format!("dag-ov-form-{}", node.id),
+                "Field Name",
+                "Value",
+                "Add Form Field",
+                &form_fields,
+                window,
+                cx,
+            )
+            .with_variable_validation(active_env.clone())
+        });
+        let auth_editor = cx.new(|cx| {
+            let mut ed = AuthEditor::new(
+                format!("dag-ov-auth-{}", node.id),
+                true,
+                initial_auth,
+                window,
+                cx,
+            );
+            ed.set_context(None, active_env, cx);
+            ed
+        });
+
+        let sub_params = cx.subscribe_in(
+            &params_table,
+            window,
+            |this, tbl, _: &TableChangeEvent, window, cx| {
+                let Some(drawer) = &this.node_drawer else {
+                    return;
+                };
+                if drawer.suppress_sync {
+                    return;
+                }
+                let nid = drawer.node_id.clone();
+                let rows = tbl.read(cx).snapshot(cx);
+                if let Some(n) = this.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+                    n.overrides.params = Some(rows);
+                }
+                this.sync_yaml_from_dag(window, cx);
+                cx.emit(PackageTabEvent::DirtyChanged);
+                cx.notify();
+            },
+        );
+        let sub_path = cx.subscribe_in(
+            &path_table,
+            window,
+            |this, tbl, _: &TableChangeEvent, window, cx| {
+                let Some(drawer) = &this.node_drawer else {
+                    return;
+                };
+                if drawer.suppress_sync {
+                    return;
+                }
+                let nid = drawer.node_id.clone();
+                let rows = tbl.read(cx).snapshot(cx);
+                if let Some(n) = this.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+                    n.overrides.path_params = Some(rows);
+                }
+                this.sync_yaml_from_dag(window, cx);
+                cx.emit(PackageTabEvent::DirtyChanged);
+                cx.notify();
+            },
+        );
+        let sub_headers = cx.subscribe_in(
+            &headers_table,
+            window,
+            |this, tbl, _: &TableChangeEvent, window, cx| {
+                let Some(drawer) = &this.node_drawer else {
+                    return;
+                };
+                if drawer.suppress_sync {
+                    return;
+                }
+                let nid = drawer.node_id.clone();
+                let rows = tbl.read(cx).snapshot(cx);
+                if let Some(n) = this.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+                    n.overrides.headers = Some(rows);
+                }
+                this.sync_yaml_from_dag(window, cx);
+                cx.emit(PackageTabEvent::DirtyChanged);
+                cx.notify();
+            },
+        );
+        let sub_body_ed = cx.subscribe_in(
+            &body_editor,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.sync_drawer_body_to_node(window, cx);
+                }
+            },
+        );
+        let sub_body_form = cx.subscribe_in(
+            &body_form_table,
+            window,
+            |this, _, _: &TableChangeEvent, window, cx| {
+                this.sync_drawer_body_to_node(window, cx);
+            },
+        );
+        let sub_auth = cx.subscribe_in(
+            &auth_editor,
+            window,
+            |this, ed, event: &AuthEditorEvent, window, cx| {
+                if matches!(event, AuthEditorEvent::Changed) {
+                    let Some(drawer) = &this.node_drawer else {
+                        return;
+                    };
+                    if drawer.suppress_sync {
+                        return;
+                    }
+                    let nid = drawer.node_id.clone();
+                    let auth = ed.read(cx).snapshot(cx);
+                    if let Some(n) = this.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+                        n.overrides.auth = Some(auth);
+                    }
+                    this.sync_yaml_from_dag(window, cx);
+                    cx.emit(PackageTabEvent::DirtyChanged);
+                    cx.notify();
+                }
+            },
+        );
+
+        self.node_drawer = Some(NodeOverrideDrawer {
+            node_id: node.id,
+            base_doc,
+            active_tab: OverrideSection::Params,
+            params_table,
+            path_table,
+            headers_table,
+            body_mode,
+            body_editor,
+            body_form_table,
+            auth_editor,
+            suppress_sync: false,
+            _subscriptions: vec![
+                sub_params,
+                sub_path,
+                sub_headers,
+                sub_body_ed,
+                sub_body_form,
+                sub_auth,
+            ],
+        });
+        cx.notify();
+    }
+
+    fn sync_drawer_body_to_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drawer) = &self.node_drawer else {
+            return;
+        };
+        if drawer.suppress_sync {
+            return;
+        }
+        let nid = drawer.node_id.clone();
+        let body = match drawer.body_mode {
+            OverrideBodyMode::None => RequestBody::None,
+            OverrideBodyMode::Json => RequestBody::Json {
+                content: drawer.body_editor.read(cx).value().to_string(),
+            },
+            OverrideBodyMode::Raw => RequestBody::Raw {
+                raw_format: RawBodyFormat::Text,
+                content: drawer.body_editor.read(cx).value().to_string(),
+            },
+            OverrideBodyMode::FormUrlEncoded => RequestBody::FormUrlEncoded {
+                fields: drawer.body_form_table.read(cx).snapshot(cx),
+            },
+        };
+        if let Some(n) = self.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+            n.overrides.body = Some(body);
+        }
+        self.sync_yaml_from_dag(window, cx);
+        cx.emit(PackageTabEvent::DirtyChanged);
+        cx.notify();
+    }
+
+    fn reset_drawer_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drawer) = &mut self.node_drawer else {
+            return;
+        };
+        drawer.suppress_sync = true;
+        let nid = drawer.node_id.clone();
+        let section = drawer.active_tab;
+        let base_doc = drawer.base_doc.clone();
+
+        if let Some(n) = self.set.dag.nodes.iter_mut().find(|n| n.id == nid) {
+            match section {
+                OverrideSection::Params => {
+                    n.overrides.params = None;
+                    drawer.params_table.update(cx, |tbl, cx| {
+                        tbl.set_rows(&base_doc.request.params, window, cx);
+                    });
+                }
+                OverrideSection::Path => {
+                    n.overrides.path_params = None;
+                    drawer.path_table.update(cx, |tbl, cx| {
+                        tbl.set_rows(&base_doc.request.path_params, window, cx);
+                    });
+                }
+                OverrideSection::Headers => {
+                    n.overrides.headers = None;
+                    drawer.headers_table.update(cx, |tbl, cx| {
+                        tbl.set_rows(&base_doc.request.headers, window, cx);
+                    });
+                }
+                OverrideSection::Body => {
+                    n.overrides.body = None;
+                    match &base_doc.request.body {
+                        RequestBody::None => {
+                            drawer.body_mode = OverrideBodyMode::None;
+                            drawer.body_editor.update(cx, |ed, cx| ed.set_value("", window, cx));
+                        }
+                        RequestBody::Json { content } => {
+                            drawer.body_mode = OverrideBodyMode::Json;
+                            drawer.body_editor.update(cx, |ed, cx| {
+                                ed.set_highlighter("json", cx);
+                                ed.set_value(content.clone(), window, cx);
+                            });
+                        }
+                        RequestBody::Raw { content, .. } => {
+                            drawer.body_mode = OverrideBodyMode::Raw;
+                            drawer.body_editor.update(cx, |ed, cx| {
+                                ed.set_highlighter("text", cx);
+                                ed.set_value(content.clone(), window, cx);
+                            });
+                        }
+                        RequestBody::FormUrlEncoded { fields } => {
+                            drawer.body_mode = OverrideBodyMode::FormUrlEncoded;
+                            drawer.body_form_table.update(cx, |tbl, cx| {
+                                tbl.set_rows(fields, window, cx);
+                            });
+                        }
+                        _ => {
+                            drawer.body_mode = OverrideBodyMode::None;
+                        }
+                    }
+                }
+                OverrideSection::Auth => {
+                    n.overrides.auth = None;
+                    drawer.auth_editor.update(cx, |ed, cx| {
+                        ed.set_auth(&base_doc.request.auth, window, cx);
+                    });
+                }
+            }
+        }
+        if let Some(drawer) = &mut self.node_drawer {
+            drawer.suppress_sync = false;
+        }
+        self.sync_yaml_from_dag(window, cx);
+        cx.emit(PackageTabEvent::DirtyChanged);
+        cx.notify();
+    }
+
+    fn render_node_drawer(
+        &self,
+        drawer: &NodeOverrideDrawer,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let view = cx.entity();
+        let view_close = view.clone();
+        let view_reset = view.clone();
+        let view_open_base = view.clone();
+        let view_body_mode = view.clone();
+
+        let node_opt = self.set.dag.nodes.iter().find(|n| n.id == drawer.node_id);
+        let overrides = node_opt
+            .map(|n| &n.overrides)
+            .cloned()
+            .unwrap_or_default();
+        let pid = node_opt.map(|n| n.project_id.clone()).unwrap_or_default();
+        let rid = drawer.base_doc.id.clone();
+
+        let section_ix = match drawer.active_tab {
+            OverrideSection::Params => 0,
+            OverrideSection::Path => 1,
+            OverrideSection::Headers => 2,
+            OverrideSection::Body => 3,
+            OverrideSection::Auth => 4,
+        };
+        let is_active_overridden = match drawer.active_tab {
+            OverrideSection::Params => overrides.params.is_some(),
+            OverrideSection::Path => overrides.path_params.is_some(),
+            OverrideSection::Headers => overrides.headers.is_some(),
+            OverrideSection::Body => overrides.body.is_some(),
+            OverrideSection::Auth => overrides.auth.is_some(),
+        };
+
+        let label_for = |title: &str, active: bool| -> String {
+            if active {
+                format!("{title} •")
+            } else {
+                title.to_string()
+            }
+        };
+
+        v_flex()
+            .id("dag-node-override-drawer")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(460.))
+            .bg(cx.theme().popover)
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .items_center()
+                            .gap_1p5()
+                            .child(method_badge(drawer.base_doc.request.method, true))
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_semibold()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(drawer.base_doc.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Float layer (does not modify base request)"),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .when(!pid.is_empty(), |row| {
+                                row.child(
+                                    Button::new("dag-drawer-open-base")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Open Base")
+                                        .on_click(move |_, _, cx| {
+                                            view_open_base.update(cx, |_, cx| {
+                                                cx.emit(PackageTabEvent::OpenRequest {
+                                                    project_id: pid.clone(),
+                                                    request_id: rid.clone(),
+                                                });
+                                            });
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("dag-drawer-reset")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Reset")
+                                    .disabled(!is_active_overridden)
+                                    .on_click(move |_, window, cx| {
+                                        view_reset.update(cx, |this, cx| {
+                                            this.reset_drawer_section(window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("dag-drawer-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Close))
+                                    .on_click(move |_, _, cx| {
+                                        view_close.update(cx, |this, cx| {
+                                            this.node_drawer = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1p5()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        TabBar::new("dag-drawer-section-tabs")
+                            .segmented()
+                            .small()
+                            .selected_index(section_ix)
+                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                if let Some(d) = &mut this.node_drawer {
+                                    d.active_tab = match ix {
+                                        0 => OverrideSection::Params,
+                                        1 => OverrideSection::Path,
+                                        2 => OverrideSection::Headers,
+                                        3 => OverrideSection::Body,
+                                        _ => OverrideSection::Auth,
+                                    };
+                                    cx.notify();
+                                }
+                            }))
+                            .child(Tab::new().label(label_for("Params", overrides.params.is_some())))
+                            .child(Tab::new().label(label_for("Path", overrides.path_params.is_some())))
+                            .child(Tab::new().label(label_for("Headers", overrides.headers.is_some())))
+                            .child(Tab::new().label(label_for("Body", overrides.body.is_some())))
+                            .child(Tab::new().label(label_for("Auth", overrides.auth.is_some()))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("dag-drawer-content")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scrollbar()
+                    .p_3()
+                    .child(match drawer.active_tab {
+                        OverrideSection::Params => {
+                            drawer.params_table.clone().into_any_element()
+                        }
+                        OverrideSection::Path => drawer.path_table.clone().into_any_element(),
+                        OverrideSection::Headers => {
+                            drawer.headers_table.clone().into_any_element()
+                        }
+                        OverrideSection::Body => {
+                            let mode_ix = match drawer.body_mode {
+                                OverrideBodyMode::None => 0,
+                                OverrideBodyMode::Json => 1,
+                                OverrideBodyMode::Raw => 2,
+                                OverrideBodyMode::FormUrlEncoded => 3,
+                            };
+                            v_flex()
+                                .w_full()
+                                .h_full()
+                                .gap_2()
+                                .child(
+                                    TabBar::new("dag-drawer-body-mode")
+                                        .segmented()
+                                        .small()
+                                        .selected_index(mode_ix)
+                                        .on_click(move |ix: &usize, window, cx| {
+                                            let next_mode = match ix {
+                                                0 => OverrideBodyMode::None,
+                                                1 => OverrideBodyMode::Json,
+                                                2 => OverrideBodyMode::Raw,
+                                                _ => OverrideBodyMode::FormUrlEncoded,
+                                            };
+                                            view_body_mode.update(cx, |this, cx| {
+                                                if let Some(d) = &mut this.node_drawer {
+                                                    d.body_mode = next_mode;
+                                                    let lang = match next_mode {
+                                                        OverrideBodyMode::Json => "json",
+                                                        _ => "text",
+                                                    };
+                                                    d.body_editor.update(cx, |ed, cx| {
+                                                        ed.set_highlighter(lang, cx);
+                                                    });
+                                                }
+                                                this.sync_drawer_body_to_node(window, cx);
+                                            });
+                                        })
+                                        .child(Tab::new().label("None"))
+                                        .child(Tab::new().label("JSON"))
+                                        .child(Tab::new().label("Raw"))
+                                        .child(Tab::new().label("Form")),
+                                )
+                                .child(match drawer.body_mode {
+                                    OverrideBodyMode::None => div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("No request body.")
+                                        .into_any_element(),
+                                    OverrideBodyMode::Json | OverrideBodyMode::Raw => div()
+                                        .flex_1()
+                                        .min_h(px(220.))
+                                        .w_full()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .rounded(cx.theme().radius)
+                                        .overflow_hidden()
+                                        .child(Editor::new(&drawer.body_editor).h_full().w_full())
+                                        .into_any_element(),
+                                    OverrideBodyMode::FormUrlEncoded => {
+                                        drawer.body_form_table.clone().into_any_element()
+                                    }
+                                })
+                                .into_any_element()
+                        }
+                        OverrideSection::Auth => drawer.auth_editor.clone().into_any_element(),
                     }),
             )
             .into_any_element()
