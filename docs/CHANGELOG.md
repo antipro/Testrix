@@ -4,6 +4,24 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-11-24
+
+### Added
+- Add a **Global** environment profile tab in the Profiles & Environment Variables panel (`_global.env.yaml`), exposed as `environment.global` in Post-Scripts.
+- Add Post-Script autocomplete suggestions for `environment.`, `request.`, `response.`, and their fields/methods, plus a **Help** dialog documenting all predefined variables and usage.
+- Add Tokio IPC (`testrix notify reload` and automatic CLI reload notifications) over Unix Domain Sockets on macOS/Linux and Named Pipes on Windows, documented in `SKILL.md`.
+- Add `testrix package` CLI CRUD (`list`, `get`, `create`, `update`, `delete`, `add-folder`, `update-folder`, `delete-folder`, `add-item`, `remove-item`) and update `SKILL.md`.
+- Show involved packages (up to 5, with `...` for more) in the request deletion confirmation dialog, and add a confirmation dialog when deleting environment profiles.
+- Save Git sync repository slugs per workspace and add a repository delete button in `node-web`.
+
+### Fixed
+- Fix Post-Script completion menu Up/Down arrow navigation by deduplicating base `Input` keybindings at startup.
+- Trigger auto Git sync when creating or deleting environment profiles.
+- Fix Windows WiX shortcut icons by referencing the embedded executable icon so taskbar icons persist across upgrades.
+- Fix Remove Variable dialog button wrapping/overflow, Environment sheet footer clipping, and move the new profile bar above the profile tabs.
+- Crop transparent padding from the system tray icon and render at `64×64` for sharper, larger tray display.
+- Gate `PathBuf` import in `ipc.rs` under `#[cfg(unix)]` to eliminate unused-import warnings on Windows.
+
 ## [v0.9.0] - 2026-11-23
 
 ### Changed
