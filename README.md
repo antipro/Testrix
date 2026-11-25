@@ -21,9 +21,13 @@ A native desktop API client and YAML-backed request workbench built with **Rust*
    - **Local Network**: Built-in LAN HTTP viewer bound to a selected local network adapter IP with live updates on save and `/r/<request>` links.
    - **Testrix Server (`optional/node-web`)**: Self-hosted Express sharing server with account login, optional SMTP email verification, per-project access tokens, and `/s/<slug>/<request>` links.
    - **Cloudflare Pages + R2 (`optional/cloudflare`)**: Zero-dependency Cloudflare Pages + R2 private API docs viewer with `?project=<slug>&request=<request>` links. See [optional/cloudflare/README.md](optional/cloudflare/README.md).
-11. **CLI CRUD API for AI Agents**: Run `testrix [--workspace <DIR>] <project|folder|item|profile|var> <action> ...` to perform validated JSON CRUD operations with legal checks instead of editing YAML files directly.
-12. **Preferences & 13-Language UI (i18n)**: Configure workspace directory (`~/.testrix/config.yaml`), session persistence, sharing credentials/access tokens, theme, and UI language (`English`, `Français`, `Deutsch`, `Español`, `Italiano`, `Português`, `Русский`, `العربية`, `Türkçe`, `日本語`, `한국어`, `简体中文`, `繁體中文`).
-13. **YAML-First Storage (`testrix.io/v1`)**: Every HTTP request is stored on disk as `*.request.yaml` alongside `testrix.project.yaml`, `_folder.yaml`, and `environments/*.env.yaml`. See [docs/yaml-spec.md](docs/yaml-spec.md).
+11. **Packages & Execution DAG Workflows**: Group requests from any project into reusable **Packages** (`.testrix-sets.yaml`) and orchestrate multi-step API flows on an interactive **DAG** canvas (drag-and-drop requests, connect output-to-input ports with automatic loop prevention, hold left-click to pan large graphs, or edit the `YAML` view directly):
+   - **Float-Layer Node Overrides**: Double-click any DAG node to open a slide-over drawer for per-node overrides (`Params`, `Path`, `Headers`, `Body`, `Auth`, `Post-Script`) without modifying the underlying `*.request.yaml` file.
+   - **DAG-Scoped `thread` Variables**: Write `thread.<key> = value` in an upstream node's Post-Script and reference `{{thread.<key>}}` in downstream nodes (with clickable upstream `thread.*` chips in the node drawer).
+   - **Live Execution Console & CLI Runner**: Run the DAG in topological order from the GUI (with a collapsible read-only console, Find bar, and automatic failure on HTTP 4xx/5xx or script errors) or via `testrix package run --package <ref> [--fail-fast]`.
+12. **CLI CRUD & Execution API for AI Agents**: Run `testrix [--workspace <DIR>] <project|folder|item|profile|var|package|share|notify> <action> ...` to perform validated JSON CRUD, run single items (`item run`) or package DAGs (`package run`, `package dag ...`), and automatically notify a running GUI instance to reload via IPC.
+13. **Preferences & 13-Language UI (i18n)**: Configure workspace directory (`~/.testrix/config.yaml`), session persistence, sharing credentials/access tokens, theme, and UI language (`English`, `Français`, `Deutsch`, `Español`, `Italiano`, `Português`, `Русский`, `العربية`, `Türkçe`, `日本語`, `한국어`, `简体中文`, `繁體中文`).
+14. **YAML-First Storage (`testrix.io/v1`)**: Every HTTP request is stored on disk as `*.request.yaml` alongside `testrix.project.yaml`, `_folder.yaml`, `environments/*.env.yaml`, and `.testrix-sets.yaml`. See [docs/yaml-spec.md](docs/yaml-spec.md).
 
 ## Usage
 
@@ -53,6 +57,7 @@ cargo run -p testrix-app -- profile merge --project "Starter Platform API" --pro
 - **Configure Environments**: Select an active profile in the top-right dropdown and click **Env Vars** (`Cmd+E` / `Ctrl+E`) to edit `{{variable}}` values and secret variables.
 - **Send Requests & Inspect Responses**: Choose an HTTP method, enter a URL (or use `{{base_url}}`), configure Params/Headers/Body/Auth, and press **Send** (`Cmd+Enter` / `Ctrl+Enter`).
 - **Automate with Post-Scripts**: Open a request's **Post-Script** tab to extract tokens or values from `response.json()` into `environment.var["key"]` for subsequent requests.
+- **Orchestrate Multi-Step DAGs**: Open the **Package** sidebar, click the properties icon on a package to open its **DAG** canvas, drag in requests, connect dependencies (`needs`), double-click nodes to configure float-layer overrides or `thread.*` scripts, and press **Play** (or run `testrix package run --package <name>`).
 - **Export CLI Snippets**: Open a request's **Code** tab, pick `cURL`, `cURL (Win)`, `wget`, or `PowerShell`, and copy the generated command.
 - **Share a Project**:
   - Open a Project tab -> **Share** -> select **Local Network**, **Testrix Server**, or **Cloudflare R2 Storage**, then publish/upload.
