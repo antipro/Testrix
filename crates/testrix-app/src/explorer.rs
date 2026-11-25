@@ -474,6 +474,8 @@ fn render_tree_row(
             };
             let tid_for_toggle = tree_id.clone();
             let view_toggle = view.clone();
+            let pid_props = project_id.clone();
+            let view_props = view.clone();
 
             let row = h_flex()
                 .w_full()
@@ -525,6 +527,22 @@ fn render_tree_row(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(request_count.to_string()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("proj-props-btn-{tree_id}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(LucideIcon::SlidersHorizontal))
+                        .tooltip(crate::i18n::t("project_settings_menu"))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            let pid = pid_props.clone();
+                            view_props.update(cx, |_, cx| {
+                                cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Project {
+                                    project_id: pid,
+                                }));
+                            });
+                        }),
                 );
 
             (
@@ -558,6 +576,9 @@ fn render_tree_row(
             };
             let tid_for_toggle = tree_id.clone();
             let view_toggle = view.clone();
+            let pid_props = project_id.clone();
+            let fid_props = folder_id.clone();
+            let view_props = view.clone();
 
             let row = h_flex()
                 .w_full()
@@ -596,7 +617,25 @@ fn render_tree_row(
                             .rounded(cx.theme().radius_full())
                             .bg(cx.theme().warning),
                     )
-                });
+                })
+                .child(
+                    Button::new(SharedString::from(format!("fld-props-btn-{tree_id}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(LucideIcon::SlidersHorizontal))
+                        .tooltip(crate::i18n::t("folder_settings_menu"))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            let pid = pid_props.clone();
+                            let fid = fid_props.clone();
+                            view_props.update(cx, |_, cx| {
+                                cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Folder {
+                                    project_id: pid,
+                                    folder_id: fid,
+                                }));
+                            });
+                        }),
+                );
 
             (
                 SharedString::from(name),
@@ -674,10 +713,15 @@ fn render_tree_row(
         .child(content)
         .when_some(click_action, |item, (tid, node, expand_on_click)| {
             item.on_click(move |_, _, cx| {
-                let _ = (&tid, expand_on_click);
-                view_click.update(cx, |_, cx| {
-                    cx.emit(ExplorerEvent::OpenNode(node.clone()));
-                });
+                if expand_on_click {
+                    view_click.update(cx, |panel, cx| {
+                        panel.toggle_expand(&tid, cx);
+                    });
+                } else {
+                    view_click.update(cx, |_, cx| {
+                        cx.emit(ExplorerEvent::OpenNode(node.clone()));
+                    });
+                }
             })
         });
 
