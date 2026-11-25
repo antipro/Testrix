@@ -170,11 +170,7 @@ fn main() -> ExitCode {
     }
 
     if !cli.api_args.is_empty() {
-        let Some(_single_instance) = acquire_single_instance_or_activate_existing() else {
-        return ExitCode::SUCCESS;
-    };
-
-    let workspace_dir = resolve_startup_workspace_dir(cli.workspace);
+        let workspace_dir = resolve_startup_workspace_dir(cli.workspace);
         return match execute_cli_api(&workspace_dir, &cli.api_args) {
             Ok(json_out) => {
                 println!("{json_out}");

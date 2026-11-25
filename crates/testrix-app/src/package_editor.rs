@@ -115,6 +115,14 @@ struct NodeDragState {
 }
 
 #[derive(Debug, Clone)]
+struct CanvasPanState {
+    start_mouse_x: f32,
+    start_mouse_y: f32,
+    start_pan_x: f32,
+    start_pan_y: f32,
+}
+
+#[derive(Debug, Clone)]
 struct ConnectingState {
     from_node_id: String,
     cursor_x: f32,
@@ -157,6 +165,9 @@ pub(crate) struct PackageTabView {
     yaml_error: Option<String>,
     suppress_yaml_sync: bool,
     canvas_bounds: Bounds<Pixels>,
+    pan_x: f32,
+    pan_y: f32,
+    panning: Option<CanvasPanState>,
     dragging_node: Option<NodeDragState>,
     connecting_from: Option<ConnectingState>,
     selected_node_id: Option<String>,
@@ -226,6 +237,9 @@ impl PackageTabView {
             yaml_error: None,
             suppress_yaml_sync: false,
             canvas_bounds: Bounds::default(),
+            pan_x: 0.0,
+            pan_y: 0.0,
+            panning: None,
             dragging_node: None,
             connecting_from: None,
             selected_node_id: None,
@@ -393,8 +407,8 @@ impl PackageTabView {
         };
         let project_id = drag.project_id.clone().unwrap_or_default();
         let origin = self.canvas_bounds.origin;
-        let x = (f32::from(drop_pos.x - origin.x) - NODE_WIDTH * 0.5).max(16.0);
-        let y = (f32::from(drop_pos.y - origin.y) - NODE_HEIGHT * 0.5).max(16.0);
+        let x = (f32::from(drop_pos.x - origin.x) - self.pan_x - NODE_WIDTH * 0.5).max(16.0);
+        let y = (f32::from(drop_pos.y - origin.y) - self.pan_y - NODE_HEIGHT * 0.5).max(16.0);
 
         let mut node_id = generate_id("node");
         while self.set.dag.nodes.iter().any(|n| n.id == node_id) {
@@ -935,16 +949,19 @@ impl PackageTabView {
         let nodes_map: HashMap<&str, &DagNode> =
             nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
+        let pan_x = self.pan_x;
+        let pan_y = self.pan_y;
+
         // Collect edge midpoint coordinates for delete pills.
         let mut edge_midpoints: Vec<(String, String, f32, f32, bool)> = Vec::new();
         for (from_id, to_id) in &edges {
             if let (Some(from_n), Some(to_n)) =
                 (nodes_map.get(from_id.as_str()), nodes_map.get(to_id.as_str()))
             {
-                let x1 = from_n.x + NODE_WIDTH;
-                let y1 = from_n.y + NODE_HEIGHT * 0.5;
-                let x2 = to_n.x;
-                let y2 = to_n.y + NODE_HEIGHT * 0.5;
+                let x1 = from_n.x + NODE_WIDTH + pan_x;
+                let y1 = from_n.y + NODE_HEIGHT * 0.5 + pan_y;
+                let x2 = to_n.x + pan_x;
+                let y2 = to_n.y + NODE_HEIGHT * 0.5 + pan_y;
                 let is_sel = selected_edge
                     .as_ref()
                     .is_some_and(|(f, t)| f == from_id && t == to_id);
@@ -960,6 +977,7 @@ impl PackageTabView {
 
         let canvas_nodes = nodes.clone();
         let canvas_edges = edges.clone();
+        let is_panning = self.panning.is_some();
 
         div()
             .relative()
@@ -968,6 +986,7 @@ impl PackageTabView {
             .h_full()
             .overflow_hidden()
             .bg(cx.theme().background)
+            .when(is_panning, |d| d.cursor_grabbing())
             .drag_over::<DraggedRequest>(|style, _, _, cx| {
                 style.border_2().border_color(cx.theme().primary)
             })
@@ -978,19 +997,40 @@ impl PackageTabView {
                     this.add_node_from_drop(&drag, pos, window, cx);
                 });
             })
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
                 view_bg_down.update(cx, |this, cx| {
                     this.selected_node_id = None;
                     this.selected_edge = None;
+                    this.panning = Some(CanvasPanState {
+                        start_mouse_x: f32::from(event.position.x),
+                        start_mouse_y: f32::from(event.position.y),
+                        start_pan_x: this.pan_x,
+                        start_pan_y: this.pan_y,
+                    });
                     cx.notify();
                 });
             })
             .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
                 view_move.update(cx, |this, cx| {
                     let origin = this.canvas_bounds.origin;
-                    if let Some(drag) = &this.dragging_node {
-                        let nx = (f32::from(event.position.x - origin.x) - drag.offset_x).max(8.0);
-                        let ny = (f32::from(event.position.y - origin.y) - drag.offset_y).max(8.0);
+                    if let Some(pan) = &this.panning {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            this.panning = None;
+                            cx.notify();
+                            return;
+                        }
+                        this.pan_x = pan.start_pan_x + (f32::from(event.position.x) - pan.start_mouse_x);
+                        this.pan_y = pan.start_pan_y + (f32::from(event.position.y) - pan.start_mouse_y);
+                        cx.notify();
+                    } else if let Some(drag) = &this.dragging_node {
+                        let nx = (f32::from(event.position.x - origin.x)
+                            - this.pan_x
+                            - drag.offset_x)
+                            .max(8.0);
+                        let ny = (f32::from(event.position.y - origin.y)
+                            - this.pan_y
+                            - drag.offset_y)
+                            .max(8.0);
                         if let Some(node) =
                             this.set.dag.nodes.iter_mut().find(|n| n.id == drag.node_id)
                         {
@@ -1007,6 +1047,9 @@ impl PackageTabView {
             })
             .on_mouse_up(MouseButton::Left, move |_, window, cx| {
                 view_up.update(cx, |this, cx| {
+                    if this.panning.take().is_some() {
+                        cx.notify();
+                    }
                     if this.dragging_node.take().is_some() {
                         this.sync_yaml_from_dag(window, cx);
                         cx.emit(PackageTabEvent::DirtyChanged);
@@ -1039,12 +1082,12 @@ impl PackageTabView {
                                 continue;
                             };
                             let p1 = gpui_kit::point(
-                                px(ox + from_n.x + NODE_WIDTH),
-                                px(oy + from_n.y + NODE_HEIGHT * 0.5),
+                                px(ox + pan_x + from_n.x + NODE_WIDTH),
+                                px(oy + pan_y + from_n.y + NODE_HEIGHT * 0.5),
                             );
                             let p2 = gpui_kit::point(
-                                px(ox + to_n.x),
-                                px(oy + to_n.y + NODE_HEIGHT * 0.5),
+                                px(ox + pan_x + to_n.x),
+                                px(oy + pan_y + to_n.y + NODE_HEIGHT * 0.5),
                             );
                             let color = if selected_edge
                                 .as_ref()
@@ -1066,8 +1109,8 @@ impl PackageTabView {
                             && let Some(from_n) = map.get(conn.from_node_id.as_str())
                         {
                             let p1 = gpui_kit::point(
-                                px(ox + from_n.x + NODE_WIDTH),
-                                px(oy + from_n.y + NODE_HEIGHT * 0.5),
+                                px(ox + pan_x + from_n.x + NODE_WIDTH),
+                                px(oy + pan_y + from_n.y + NODE_HEIGHT * 0.5),
                             );
                             let p2 = gpui_kit::point(
                                 px(ox + conn.cursor_x),
@@ -1187,6 +1230,9 @@ impl PackageTabView {
                     .border_1()
                     .border_color(cx.theme().border)
                     .shadow_sm()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .when_some(self.run_summary.as_ref(), |row, summary| {
                         let (label, variant) = match summary {
                             Ok(msg) => (msg.clone(), TagVariant::Success),
@@ -1264,8 +1310,8 @@ impl PackageTabView {
         div()
             .id(SharedString::from(format!("dag-node-{}", node.id)))
             .absolute()
-            .left(px(node.x))
-            .top(px(node.y))
+            .left(px(node.x + self.pan_x))
+            .top(px(node.y + self.pan_y))
             .w(px(NODE_WIDTH))
             .h(px(NODE_HEIGHT))
             .rounded(cx.theme().radius)
@@ -1292,8 +1338,8 @@ impl PackageTabView {
                     this.selected_edge = None;
                     let origin = this.canvas_bounds.origin;
                     if let Some(n) = this.set.dag.nodes.iter().find(|n| n.id == nid_drag) {
-                        let lx = f32::from(event.position.x - origin.x);
-                        let ly = f32::from(event.position.y - origin.y);
+                        let lx = f32::from(event.position.x - origin.x) - this.pan_x;
+                        let ly = f32::from(event.position.y - origin.y) - this.pan_y;
                         this.dragging_node = Some(NodeDragState {
                             node_id: nid_drag.clone(),
                             offset_x: lx - n.x,
