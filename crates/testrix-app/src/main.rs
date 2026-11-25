@@ -11,17 +11,36 @@ use std::{
 use gpui_kit::assets::AllAssets;
 use testrix_app::{
     acquire_single_instance_or_activate_existing,
-    cli_api::{execute_cli_api, format_api_error, is_api_resource},
+    cli_api::{execute_cli_api_detailed, format_api_error, is_api_resource},
     init_app, init_system_tray, open_main_window,
 };
 use testrix_storage::{
-    default_workspace_dir, init_or_load_config, load_project, load_workspace, validate_yaml_file,
+    default_workspace_dir, init_or_load_config, load_project, load_workspace,
+    load_workspace_sets, validate_yaml_file,
 };
 use tracing_subscriber::EnvFilter;
+
+#[cfg(windows)]
+fn enable_utf8_console() {
+    const CP_UTF8: u32 = 65001;
+    unsafe extern "system" {
+        fn SetConsoleOutputCP(w_code_page_id: u32) -> i32;
+        fn SetConsoleCP(w_code_page_id: u32) -> i32;
+    }
+    unsafe {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_utf8_console() {}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CliArgs {
     workspace: Option<PathBuf>,
+    out: Option<PathBuf>,
+    quiet: bool,
     check: bool,
     check_paths: Vec<PathBuf>,
     api_args: Vec<String>,
@@ -41,6 +60,14 @@ where
             }
         } else if let Some(path) = arg.strip_prefix("--workspace=") {
             parsed.workspace = Some(PathBuf::from(path));
+        } else if arg == "--out" {
+            if let Some(path) = iter.next() {
+                parsed.out = Some(PathBuf::from(path));
+            }
+        } else if let Some(path) = arg.strip_prefix("--out=") {
+            parsed.out = Some(PathBuf::from(path));
+        } else if arg == "--quiet" || arg == "-q" {
+            parsed.quiet = true;
         } else if arg == "--check" {
             parsed.check = true;
         } else if let Some(path) = arg.strip_prefix("--check=") {
@@ -89,15 +116,42 @@ fn check_target(path: &Path) -> Result<String, String> {
                 })
                 .map_err(|err| err.to_string())
         } else {
-            load_workspace(path)
-                .map(|tree| {
-                    format!(
-                        "OK workspace ({} projects) {}",
-                        tree.projects.len(),
-                        path.display()
-                    )
-                })
-                .map_err(|err| err.to_string())
+            let tree = load_workspace(path).map_err(|err| err.to_string())?;
+            let sets = load_workspace_sets(path);
+            let mut dag_nodes = 0usize;
+            for set in &sets {
+                dag_nodes += set.dag.nodes.len();
+                set.dag
+                    .validate()
+                    .map_err(|err| format!("Package `{}` ({}): {err}", set.name, set.id))?;
+                for node in &set.dag.nodes {
+                    let found = if !node.project_id.is_empty() {
+                        tree.find_project(&node.project_id)
+                            .and_then(|p| p.find_request(&node.request_id))
+                            .is_some()
+                    } else {
+                        tree.projects
+                            .iter()
+                            .any(|p| p.find_request(&node.request_id).is_some())
+                    };
+                    if !found {
+                        return Err(format!(
+                            "Package `{}` ({}): node `{}` references unknown requestId `{}`",
+                            set.name, set.id, node.id, node.request_id
+                        ));
+                    }
+                }
+            }
+            let total_requests: usize = tree.projects.iter().map(|p| p.request_count()).sum();
+            Ok(format!(
+                "OK workspace ({} projects, {} requests, {} environments, {} packages, {} dag nodes) {}",
+                tree.projects.len(),
+                total_requests,
+                tree.environments.len(),
+                sets.len(),
+                dag_nodes,
+                path.display()
+            ))
         }
     } else {
         validate_yaml_file(path)
@@ -142,22 +196,25 @@ Usage:
 
 Options:
   --workspace <DIR>       Open or operate on the specified workspace directory
-  --check [PATH ...]      Validate Testrix YAML file(s), project, or workspace in console mode
-  -h, --help              Print this help message and exit
+  --out <FILE>            Write CLI API output to a UTF-8 file instead of stdout
+  --quiet, -q             Print only the created/updated/deleted id when available
+  --check [PATH ...]      Validate Testrix YAML file(s), project, or workspace (including packages & DAGs)
+  -h, --help              Print this help message (or `<RESOURCE> --help` for subcommand help)
 
-CLI API Resources (validated JSON CRUD):
+CLI API Resources (validated JSON CRUD & Execution):
   project  <list|get|create|update|delete>
   folder   <list|create|update|delete>
-  item     <list|get|create|update|delete>
+  item     <list|get|create|update|delete|run>
   profile  <list|get|create|update|delete|merge>
   var      <list|get|create|update|set|delete>
-  package  <list|get|create|update|delete|add-folder|update-folder|delete-folder|add-item|remove-item>
+  package  <list|get|create|update|delete|add-folder|update-folder|delete-folder|add-item|remove-item|run|dag>
   share    <list|status|config-set|login|publish|revoke>
   notify   <reload>"
     );
 }
 
 fn main() -> ExitCode {
+    enable_utf8_console();
     let cli = parse_cli_args(std::env::args().skip(1));
 
     if cli.help {
@@ -171,10 +228,37 @@ fn main() -> ExitCode {
 
     if !cli.api_args.is_empty() {
         let workspace_dir = resolve_startup_workspace_dir(cli.workspace);
-        return match execute_cli_api(&workspace_dir, &cli.api_args) {
-            Ok(json_out) => {
-                println!("{json_out}");
-                ExitCode::SUCCESS
+        return match execute_cli_api_detailed(&workspace_dir, &cli.api_args) {
+            Ok(out) => {
+                let quiet = cli.quiet || out.quiet;
+                let rendered = if out.is_help {
+                    out.text
+                } else if quiet {
+                    out.quiet_text.unwrap_or(out.text)
+                } else {
+                    out.text
+                };
+
+                if let Some(out_path) = cli.out.or(out.out_path) {
+                    if let Err(err) = std::fs::write(&out_path, rendered.as_bytes()) {
+                        eprintln!(
+                            "{}",
+                            format_api_error(&format!(
+                                "Failed writing output file `{}`: {err}",
+                                out_path.display()
+                            ))
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                } else {
+                    println!("{rendered}");
+                }
+
+                if out.exit_nonzero {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
             Err(err) => {
                 eprintln!("{}", format_api_error(&err));

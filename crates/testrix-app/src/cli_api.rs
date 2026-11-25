@@ -1,16 +1,22 @@
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    io::Read as _,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use testrix_core::{
-    AuthConfig, EnvVariable, EnvironmentNode, FolderNode, HttpMethod, HttpRequestSpec,
-    ProjectNode, RequestNode, RequestSet, RequestSetFolder, RequestSetItem, generate_id,
+    AuthConfig, DagNode, DagNodeOverrides, EnvVariable, EnvironmentNode, FolderNode, HttpMethod,
+    HttpRequestSpec, HttpResponseSnapshot, PackageDag, ProjectNode, RequestNode, RequestSet,
+    RequestSetFolder, RequestSetItem, generate_id, materialize_request_doc_with_extra_vars,
     parse_request_script,
 };
 use testrix_http::{
-    ShareChannel, collect_project_yaml_files, dispatch_share_future, login_testrix_server,
-    revoke_cloudflare_r2_share, revoke_testrix_server_share, upload_to_cloudflare_r2,
-    upload_to_testrix_server,
+    CancellationToken, HttpRunner, ShareChannel, collect_project_yaml_files, dispatch_share_future,
+    login_testrix_server, revoke_cloudflare_r2_share, revoke_testrix_server_share,
+    upload_to_cloudflare_r2, upload_to_testrix_server,
 };
 use testrix_storage::{
     PersistedShareRecord, ShareSettings, create_environment, create_folder, create_project,
@@ -63,10 +69,45 @@ pub fn is_api_resource(arg: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct CliApiOutput {
+    pub text: String,
+    pub quiet_text: Option<String>,
+    pub out_path: Option<PathBuf>,
+    pub quiet: bool,
+    pub is_help: bool,
+    pub exit_nonzero: bool,
+}
+
 pub fn execute_cli_api(workspace_dir: &Path, args: &[String]) -> Result<String, String> {
+    let out = execute_cli_api_detailed(workspace_dir, args)?;
+    Ok(out.text)
+}
+
+pub fn execute_cli_api_detailed(workspace_dir: &Path, args: &[String]) -> Result<CliApiOutput, String> {
     let parsed = parse_api_args(args)?;
+    let out_path = opt_flag(&parsed, "out").map(PathBuf::from);
+    let quiet = parsed.bool_flags.contains("quiet");
+
+    if parsed.bool_flags.contains("help") {
+        return Ok(CliApiOutput {
+            text: render_resource_help(&parsed.resource, &parsed.action),
+            quiet_text: None,
+            out_path,
+            quiet: false,
+            is_help: true,
+            exit_nonzero: false,
+        });
+    }
+
     let value = dispatch_api(workspace_dir, &parsed)?;
-    if matches!(
+    let is_mutating_dag = parsed.resource == "package"
+        && parsed.action == "dag"
+        && matches!(
+            parsed.sub_action.as_deref(),
+            Some("set" | "add-node" | "add-edge" | "remove-node")
+        );
+    if (matches!(
         parsed.action.as_str(),
         "create"
             | "update"
@@ -78,15 +119,40 @@ pub fn execute_cli_api(workspace_dir: &Path, args: &[String]) -> Result<String, 
             | "delete-folder"
             | "add-item"
             | "remove-item"
-    ) && !matches!(parsed.resource.as_str(), "share" | "shares" | "notify" | "reload")
+    ) || is_mutating_dag)
+        && !matches!(parsed.resource.as_str(), "share" | "shares" | "notify" | "reload")
     {
         let _ = crate::ipc::send_reload_notification(Some(workspace_dir));
     }
-    serde_json::to_string_pretty(&ApiResponse {
-        ok: true,
+
+    let exit_nonzero = matches!(parsed.action.as_str(), "run")
+        && value.get("ok").and_then(Value::as_bool) == Some(false);
+
+    let quiet_text = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("deleted")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+    let text = serde_json::to_string_pretty(&ApiResponse {
+        ok: !exit_nonzero,
         data: value,
     })
-    .map_err(|e| format!("Failed serializing response: {e}"))
+    .map_err(|e| format!("Failed serializing response: {e}"))?;
+
+    Ok(CliApiOutput {
+        text,
+        quiet_text,
+        out_path,
+        quiet,
+        is_help: false,
+        exit_nonzero,
+    })
 }
 
 pub fn format_api_error(err: &str) -> String {
@@ -101,32 +167,53 @@ pub fn format_api_error(err: &str) -> String {
 struct ParsedApiCmd {
     resource: String,
     action: String,
-    flags: std::collections::BTreeMap<String, String>,
-    bool_flags: std::collections::BTreeSet<String>,
+    sub_action: Option<String>,
+    flags: BTreeMap<String, String>,
+    multi_flags: BTreeMap<String, Vec<String>>,
+    bool_flags: BTreeSet<String>,
+}
+
+fn is_known_bool_flag(name: &str) -> bool {
+    matches!(
+        name,
+        "json" | "overwrite" | "help" | "quiet" | "fail-fast" | "no-fail-fast" | "upsert"
+    )
 }
 
 fn parse_api_args(args: &[String]) -> Result<ParsedApiCmd, String> {
     let mut positional = Vec::new();
-    let mut flags = std::collections::BTreeMap::new();
-    let mut bool_flags = std::collections::BTreeSet::new();
+    let mut flags = BTreeMap::new();
+    let mut multi_flags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut bool_flags = BTreeSet::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--json" {
-            bool_flags.insert("json".to_string());
+        if arg == "-h" || arg == "--help" {
+            bool_flags.insert("help".to_string());
             i += 1;
-        } else if arg == "--overwrite" {
-            bool_flags.insert("overwrite".to_string());
+        } else if arg == "-q" || arg == "--quiet" {
+            bool_flags.insert("quiet".to_string());
             i += 1;
         } else if let Some(rest) = arg.strip_prefix("--") {
             if let Some((k, v)) = rest.split_once('=') {
                 flags.insert(k.to_string(), v.to_string());
+                multi_flags
+                    .entry(k.to_string())
+                    .or_default()
+                    .push(v.to_string());
+                i += 1;
+            } else if is_known_bool_flag(rest) {
+                bool_flags.insert(rest.to_string());
                 i += 1;
             } else if let Some(next) = args.get(i + 1)
                 && !next.starts_with("--")
             {
                 flags.insert(rest.to_string(), next.clone());
+                multi_flags
+                    .entry(rest.to_string())
+                    .or_default()
+                    .push(next.clone());
                 i += 2;
             } else {
                 bool_flags.insert(rest.to_string());
@@ -140,18 +227,22 @@ fn parse_api_args(args: &[String]) -> Result<ParsedApiCmd, String> {
 
     let resource = positional
         .first()
-        .ok_or_else(|| "Missing resource (project | item | folder | profile | var)".to_string())?
+        .ok_or_else(|| "Missing resource (project | item | folder | profile | var | package | share | notify)".to_string())?
         .to_ascii_lowercase();
     let action = match positional.get(1) {
         Some(a) => a.to_ascii_lowercase(),
+        None if bool_flags.contains("help") => String::new(),
         None if resource == "reload" => "reload".to_string(),
-        None => return Err(format!("Missing action for `{resource}`")),
+        None => return Err(format!("Missing action for `{resource}` (run `testrix {resource} --help`)")),
     };
+    let sub_action = positional.get(2).map(|s| s.to_ascii_lowercase());
 
     Ok(ParsedApiCmd {
         resource,
         action,
+        sub_action,
         flags,
+        multi_flags,
         bool_flags,
     })
 }
@@ -166,6 +257,13 @@ fn req_flag<'a>(cmd: &'a ParsedApiCmd, key: &str) -> Result<&'a str, String> {
 
 fn opt_flag<'a>(cmd: &'a ParsedApiCmd, key: &str) -> Option<&'a str> {
     cmd.flags.get(key).map(String::as_str)
+}
+
+fn multi_flag<'a>(cmd: &'a ParsedApiCmd, key: &str) -> Vec<&'a str> {
+    cmd.multi_flags
+        .get(key)
+        .map(|v| v.iter().map(String::as_str).collect())
+        .unwrap_or_default()
 }
 
 fn parse_bool_str(val: &str, flag: &str) -> Result<bool, String> {
@@ -235,76 +333,189 @@ fn validate_variable_key(key: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn path_slug(path: &Path, suffix: &str) -> String {
+    let raw = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    raw.strip_suffix(suffix).unwrap_or(raw).to_string()
+}
+
+fn rel_path_match(base: &Path, full: &Path, target: &str, suffix: &str) -> bool {
+    let norm_target = target.replace('\\', "/").trim_matches('/').to_string();
+    if norm_target.is_empty() {
+        return false;
+    }
+    if let Ok(rel) = full.strip_prefix(base) {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == norm_target {
+            return true;
+        }
+        if !suffix.is_empty() && rel_str.strip_suffix(suffix) == Some(norm_target.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn format_candidates(items: Vec<String>) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let total = items.len();
+    let shown: Vec<String> = items.into_iter().take(10).collect();
+    if total > 10 {
+        format!(" Available: {}, ... ({total} total)", shown.join(", "))
+    } else {
+        format!(" Available: {}", shown.join(", "))
+    }
+}
+
+fn project_matches(p: &ProjectNode, target: &str) -> bool {
+    p.doc.id == target
+        || p.doc.name == target
+        || path_slug(&p.root_dir, "") == target
+}
+
 fn find_project<'a>(
     projects: &'a [ProjectNode],
     id_or_name: &str,
 ) -> Result<&'a ProjectNode, String> {
     projects
         .iter()
-        .find(|p| p.doc.id == id_or_name || p.doc.name == id_or_name)
-        .ok_or_else(|| format!("Project `{id_or_name}` not found"))
+        .find(|p| project_matches(p, id_or_name))
+        .ok_or_else(|| {
+            let cands = projects
+                .iter()
+                .map(|p| format!("{} ({}, slug: {})", p.doc.id, p.doc.name, path_slug(&p.root_dir, "")))
+                .collect();
+            format!("Project `{id_or_name}` not found.{}", format_candidates(cands))
+        })
 }
 
 fn find_project_mut<'a>(
     projects: &'a mut [ProjectNode],
     id_or_name: &str,
 ) -> Result<&'a mut ProjectNode, String> {
-    projects
-        .iter_mut()
-        .find(|p| p.doc.id == id_or_name || p.doc.name == id_or_name)
-        .ok_or_else(|| format!("Project `{id_or_name}` not found"))
+    if let Some(ix) = projects.iter().position(|p| project_matches(p, id_or_name)) {
+        return Ok(&mut projects[ix]);
+    }
+    let cands = projects
+        .iter()
+        .map(|p| format!("{} ({}, slug: {})", p.doc.id, p.doc.name, path_slug(&p.root_dir, "")))
+        .collect();
+    Err(format!("Project `{id_or_name}` not found.{}", format_candidates(cands)))
+}
+
+fn folder_matches(proj_root: &Path, f: &FolderNode, target: &str) -> bool {
+    f.doc.id == target
+        || f.doc.name == target
+        || path_slug(&f.dir_path, "") == target
+        || rel_path_match(proj_root, &f.dir_path, target, "")
+}
+
+fn collect_folder_candidates(proj_root: &Path, folders: &[FolderNode], out: &mut Vec<String>) {
+    for f in folders {
+        let rel = f
+            .dir_path
+            .strip_prefix(proj_root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path_slug(&f.dir_path, ""));
+        out.push(format!("{} ({}, path: {})", f.doc.id, f.doc.name, rel));
+        collect_folder_candidates(proj_root, &f.folders, out);
+    }
 }
 
 fn find_folder_in_project<'a>(
     proj: &'a ProjectNode,
     id_or_name: &str,
 ) -> Result<&'a FolderNode, String> {
-    fn walk<'a>(folders: &'a [FolderNode], target: &str) -> Option<&'a FolderNode> {
+    fn walk<'a>(proj_root: &Path, folders: &'a [FolderNode], target: &str) -> Option<&'a FolderNode> {
         for f in folders {
-            if f.doc.id == target || f.doc.name == target {
+            if folder_matches(proj_root, f, target) {
                 return Some(f);
             }
-            if let Some(sub) = walk(&f.folders, target) {
+            if let Some(sub) = walk(proj_root, &f.folders, target) {
                 return Some(sub);
             }
         }
         None
     }
-    walk(&proj.folders, id_or_name).ok_or_else(|| format!("Folder `{id_or_name}` not found"))
+    walk(&proj.root_dir, &proj.folders, id_or_name).ok_or_else(|| {
+        let mut cands = Vec::new();
+        collect_folder_candidates(&proj.root_dir, &proj.folders, &mut cands);
+        format!("Folder `{id_or_name}` not found.{}", format_candidates(cands))
+    })
 }
 
 fn find_folder_mut_in_project<'a>(
     proj: &'a mut ProjectNode,
     id_or_name: &str,
 ) -> Result<&'a mut FolderNode, String> {
-    fn walk<'a>(folders: &'a mut [FolderNode], target: &str) -> Option<&'a mut FolderNode> {
+    fn walk<'a>(proj_root: &Path, folders: &'a mut [FolderNode], target: &str) -> Option<&'a mut FolderNode> {
         for f in folders {
-            if f.doc.id == target || f.doc.name == target {
+            if folder_matches(proj_root, f, target) {
                 return Some(f);
             }
-            if let Some(sub) = walk(&mut f.folders, target) {
+            if let Some(sub) = walk(proj_root, &mut f.folders, target) {
                 return Some(sub);
             }
         }
         None
     }
-    walk(&mut proj.folders, id_or_name).ok_or_else(|| format!("Folder `{id_or_name}` not found"))
+    let proj_root = proj.root_dir.clone();
+    let mut cands = Vec::new();
+    collect_folder_candidates(&proj_root, &proj.folders, &mut cands);
+    walk(&proj_root, &mut proj.folders, id_or_name)
+        .ok_or_else(|| format!("Folder `{id_or_name}` not found.{}", format_candidates(cands)))
+}
+
+fn request_matches(proj_root: &Path, r: &RequestNode, target: &str) -> bool {
+    r.doc.id == target
+        || r.doc.name == target
+        || path_slug(&r.file_path, ".request.yaml") == target
+        || rel_path_match(proj_root, &r.file_path, target, ".request.yaml")
+}
+
+fn collect_request_candidates(proj: &ProjectNode, out: &mut Vec<String>) {
+    fn walk(folders: &[FolderNode], out: &mut Vec<String>) {
+        for f in folders {
+            for r in &f.requests {
+                out.push(format!(
+                    "{} ({}, slug: {})",
+                    r.doc.id,
+                    r.doc.name,
+                    path_slug(&r.file_path, ".request.yaml")
+                ));
+            }
+            walk(&f.folders, out);
+        }
+    }
+    for r in &proj.requests {
+        out.push(format!(
+            "{} ({}, slug: {})",
+            r.doc.id,
+            r.doc.name,
+            path_slug(&r.file_path, ".request.yaml")
+        ));
+    }
+    walk(&proj.folders, out);
 }
 
 fn find_request_in_project<'a>(
     proj: &'a ProjectNode,
     id_or_name: &str,
 ) -> Result<&'a RequestNode, String> {
-    fn walk<'a>(folders: &'a [FolderNode], target: &str) -> Option<&'a RequestNode> {
+    fn walk<'a>(proj_root: &Path, folders: &'a [FolderNode], target: &str) -> Option<&'a RequestNode> {
         for f in folders {
             if let Some(r) = f
                 .requests
                 .iter()
-                .find(|r| r.doc.id == target || r.doc.name == target)
+                .find(|r| request_matches(proj_root, r, target))
             {
                 return Some(r);
             }
-            if let Some(r) = walk(&f.folders, target) {
+            if let Some(r) = walk(proj_root, &f.folders, target) {
                 return Some(r);
             }
         }
@@ -312,54 +523,79 @@ fn find_request_in_project<'a>(
     }
     proj.requests
         .iter()
-        .find(|r| r.doc.id == id_or_name || r.doc.name == id_or_name)
-        .or_else(|| walk(&proj.folders, id_or_name))
-        .ok_or_else(|| format!("Request item `{id_or_name}` not found"))
+        .find(|r| request_matches(&proj.root_dir, r, id_or_name))
+        .or_else(|| walk(&proj.root_dir, &proj.folders, id_or_name))
+        .ok_or_else(|| {
+            let mut cands = Vec::new();
+            collect_request_candidates(proj, &mut cands);
+            format!(
+                "Request item `{id_or_name}` not found.{}",
+                format_candidates(cands)
+            )
+        })
 }
 
 fn find_request_mut_in_project<'a>(
     proj: &'a mut ProjectNode,
     id_or_name: &str,
 ) -> Result<&'a mut RequestNode, String> {
-    fn walk<'a>(folders: &'a mut [FolderNode], target: &str) -> Option<&'a mut RequestNode> {
+    fn walk<'a>(proj_root: &Path, folders: &'a mut [FolderNode], target: &str) -> Option<&'a mut RequestNode> {
         for f in folders {
             if let Some(r) = f
                 .requests
                 .iter_mut()
-                .find(|r| r.doc.id == target || r.doc.name == target)
+                .find(|r| request_matches(proj_root, r, target))
             {
                 return Some(r);
             }
-            if let Some(r) = walk(&mut f.folders, target) {
+            if let Some(r) = walk(proj_root, &mut f.folders, target) {
                 return Some(r);
             }
         }
         None
     }
+    let proj_root = proj.root_dir.clone();
+    let mut cands = Vec::new();
+    collect_request_candidates(proj, &mut cands);
     if let Some(r) = proj
         .requests
         .iter_mut()
-        .find(|r| r.doc.id == id_or_name || r.doc.name == id_or_name)
+        .find(|r| request_matches(&proj_root, r, id_or_name))
     {
         return Ok(r);
     }
-    walk(&mut proj.folders, id_or_name)
-        .ok_or_else(|| format!("Request item `{id_or_name}` not found"))
+    walk(&proj_root, &mut proj.folders, id_or_name)
+        .ok_or_else(|| format!("Request item `{id_or_name}` not found.{}", format_candidates(cands)))
+}
+
+fn env_matches(e: &EnvironmentNode, target: &str) -> bool {
+    e.doc.id == target || e.doc.name == target || path_slug(&e.file_path, ".env.yaml") == target
 }
 
 fn find_env<'a>(envs: &'a [EnvironmentNode], id_or_name: &str) -> Result<&'a EnvironmentNode, String> {
     envs.iter()
-        .find(|e| e.doc.id == id_or_name || e.doc.name == id_or_name)
-        .ok_or_else(|| format!("Profile `{id_or_name}` not found"))
+        .find(|e| env_matches(e, id_or_name))
+        .ok_or_else(|| {
+            let cands = envs
+                .iter()
+                .map(|e| format!("{} ({}, slug: {})", e.doc.id, e.doc.name, path_slug(&e.file_path, ".env.yaml")))
+                .collect();
+            format!("Profile `{id_or_name}` not found.{}", format_candidates(cands))
+        })
 }
 
 fn find_env_mut<'a>(
     envs: &'a mut [EnvironmentNode],
     id_or_name: &str,
 ) -> Result<&'a mut EnvironmentNode, String> {
-    envs.iter_mut()
-        .find(|e| e.doc.id == id_or_name || e.doc.name == id_or_name)
-        .ok_or_else(|| format!("Profile `{id_or_name}` not found"))
+    if let Some(ix) = envs.iter().position(|e| env_matches(e, id_or_name)) {
+        return Ok(&mut envs[ix]);
+    }
+    let cands = envs
+        .iter()
+        .map(|e| format!("{} ({}, slug: {})", e.doc.id, e.doc.name, path_slug(&e.file_path, ".env.yaml")))
+        .collect();
+    Err(format!("Profile `{id_or_name}` not found.{}", format_candidates(cands)))
 }
 
 fn dispatch_api(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
@@ -384,14 +620,17 @@ fn handle_notify(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Stri
             Ok(resp) => Ok(json!({
                 "notified": true,
                 "reloaded": resp.reloaded,
+                "guiRunning": true,
                 "transport": crate::ipc::ipc_transport_name(),
                 "message": resp.message,
             })),
             Err(reason) => Ok(json!({
                 "notified": false,
                 "reloaded": false,
+                "guiRunning": false,
                 "transport": crate::ipc::ipc_transport_name(),
                 "reason": reason,
+                "message": "No running Testrix GUI instance found (changes are already saved on disk)",
             })),
         },
         other => Err(format!("Unsupported notify action `{other}` (expected `reload`)")),
@@ -593,34 +832,69 @@ fn handle_item(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String
         }
         "create" => {
             let name = validate_non_empty_name(req_flag(cmd, "name")?, "Request")?;
+            let upsert = cmd.bool_flags.contains("upsert");
+            let custom_id = opt_flag(cmd, "id").map(str::trim).filter(|s| !s.is_empty());
+
+            let mut spec = if let Some(spec) = load_spec_from_cmd(cmd)? {
+                spec
+            } else if let Some(script) = opt_flag(cmd, "script") {
+                parse_request_script(script).map_err(|e| e.to_string())?
+            } else {
+                HttpRequestSpec::default()
+            };
+
+            if let Some(m) = opt_flag(cmd, "method") {
+                spec.method = HttpMethod::parse(m)
+                    .ok_or_else(|| format!("Unsupported HTTP method `{m}`"))?;
+            }
+            if let Some(url) = opt_flag(cmd, "url") {
+                spec.url = validate_request_url(url)?;
+            }
+
+            if upsert {
+                let target_ref = custom_id.unwrap_or(&name);
+                if let Ok(req) = find_request_mut_in_project(proj, target_ref) {
+                    req.doc.name = name;
+                    req.doc.request = spec;
+                    if let Some(desc) = opt_flag(cmd, "description") {
+                        req.doc.description = desc.to_string();
+                    }
+                    if let Some(order_str) = opt_flag(cmd, "order") {
+                        req.doc.order = order_str
+                            .parse::<i32>()
+                            .map_err(|e| format!("Invalid `--order`: {e}"))?;
+                    }
+                    req.doc.validate().map_err(|e| e.to_string())?;
+                    save_request(req).map_err(|e| e.to_string())?;
+                    validate_yaml_file(&req.file_path).map_err(|e| e.to_string())?;
+                    return serde_json::to_value(&req.doc).map_err(|e| e.to_string());
+                }
+            }
+
+            if let Some(cid) = custom_id
+                && proj.find_request(cid).is_some()
+            {
+                return Err(format!("Request with id `{cid}` already exists in project `{}`", proj.doc.name));
+            }
+
             let parent_dir = match opt_flag(cmd, "folder") {
                 Some(f) => find_folder_in_project(proj, f)?.dir_path.clone(),
                 None => proj.root_dir.clone(),
             };
 
-            let spec = if let Some(spec_json) = opt_flag(cmd, "spec-json") {
-                serde_json::from_str::<HttpRequestSpec>(spec_json)
-                    .map_err(|e| format!("Invalid `--spec-json`: {e}"))?
-            } else if let Some(script) = opt_flag(cmd, "script") {
-                parse_request_script(script).map_err(|e| e.to_string())?
-            } else {
-                let method = match opt_flag(cmd, "method") {
-                    Some(m) => HttpMethod::parse(m)
-                        .ok_or_else(|| format!("Unsupported HTTP method `{m}`"))?,
-                    None => HttpMethod::Get,
-                };
-                let url = validate_request_url(opt_flag(cmd, "url").unwrap_or(""))?;
-                let mut spec = HttpRequestSpec::default();
-                spec.method = method;
-                spec.url = url;
-                spec
-            };
-
             let mut req = create_request(&parent_dir, &name, spec.method, &spec.url)
                 .map_err(|e| e.to_string())?;
+            if let Some(cid) = custom_id {
+                req.doc.id = cid.to_string();
+            }
             req.doc.request = spec;
             if let Some(desc) = opt_flag(cmd, "description") {
                 req.doc.description = desc.to_string();
+            }
+            if let Some(order_str) = opt_flag(cmd, "order") {
+                req.doc.order = order_str
+                    .parse::<i32>()
+                    .map_err(|e| format!("Invalid `--order`: {e}"))?;
             }
             req.doc.validate().map_err(|e| e.to_string())?;
             save_request(&req).map_err(|e| e.to_string())?;
@@ -631,9 +905,8 @@ fn handle_item(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String
             let item_ref = req_flag(cmd, "item")?;
             let req = find_request_mut_in_project(proj, item_ref)?;
 
-            if let Some(spec_json) = opt_flag(cmd, "spec-json") {
-                req.doc.request = serde_json::from_str::<HttpRequestSpec>(spec_json)
-                    .map_err(|e| format!("Invalid `--spec-json`: {e}"))?;
+            if let Some(spec) = load_spec_from_cmd(cmd)? {
+                req.doc.request = spec;
             } else if let Some(script) = opt_flag(cmd, "script") {
                 req.doc.request = parse_request_script(script).map_err(|e| e.to_string())?;
             }
@@ -642,6 +915,11 @@ fn handle_item(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String
             }
             if let Some(desc) = opt_flag(cmd, "description") {
                 req.doc.description = desc.to_string();
+            }
+            if let Some(order_str) = opt_flag(cmd, "order") {
+                req.doc.order = order_str
+                    .parse::<i32>()
+                    .map_err(|e| format!("Invalid `--order`: {e}"))?;
             }
             if let Some(m) = opt_flag(cmd, "method") {
                 req.doc.request.method = HttpMethod::parse(m)
@@ -655,6 +933,123 @@ fn handle_item(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String
             save_request(req).map_err(|e| e.to_string())?;
             validate_yaml_file(&req.file_path).map_err(|e| e.to_string())?;
             serde_json::to_value(&req.doc).map_err(|e| e.to_string())
+        }
+        "run" => {
+            let item_ref = req_flag(cmd, "item")?;
+            let req_id = find_request_in_project(proj, item_ref)?.doc.id.clone();
+            let env_ref = opt_flag(cmd, "env").or_else(|| opt_flag(cmd, "profile"));
+            let mut active_env = match env_ref {
+                Some(eref) => Some(find_env(&tree.environments, eref)?.clone()),
+                None => tree
+                    .active_environment_id
+                    .as_ref()
+                    .and_then(|id| tree.environments.iter().find(|e| &e.doc.id == id))
+                    .cloned(),
+            };
+            let active_env_fallback = if active_env.is_none() {
+                tree.effective_environment()
+            } else {
+                None
+            };
+            let mut global_env = tree.global_environment.clone();
+            let extra_vars = parse_var_overrides(cmd)?;
+
+            let proj = find_project(&tree.projects, project_ref)?;
+            let Some((ancestors, req_node)) = proj.find_request(&req_id) else {
+                return Err(format!("Request `{req_id}` not found"));
+            };
+            let runner = HttpRunner::new().map_err(|e| e.to_string())?;
+            let prepared = materialize_request_doc_with_extra_vars(
+                proj,
+                &ancestors,
+                &req_node.doc,
+                active_env
+                    .as_ref()
+                    .map(|e| &e.doc)
+                    .or(active_env_fallback.as_ref()),
+                &extra_vars,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let req_method = prepared.method.as_str().to_string();
+            let req_url = prepared.url.clone();
+            let cancel = CancellationToken::new();
+            let res = match runner.execute_blocking(prepared, cancel) {
+                Ok(snapshot) => {
+                    let mut thread_vars = BTreeMap::new();
+                    for (k, v) in &extra_vars {
+                        let key = k.strip_prefix("thread.").unwrap_or(k);
+                        thread_vars.insert(key.to_string(), v.clone());
+                    }
+                    let mut changed_thread_keys = Vec::new();
+                    let mut changed_env_keys = Vec::new();
+                    let mut script_error: Option<String> = None;
+
+                    let script = req_node.doc.request.post_script.trim();
+                    if !script.is_empty() {
+                        match crate::post_script::run_post_script_with_thread(
+                            script,
+                            &req_node.doc.id,
+                            &req_node.doc.name,
+                            active_env
+                                .as_ref()
+                                .map(|e| &e.doc)
+                                .or(active_env_fallback.as_ref()),
+                            global_env.as_ref().map(|e| &e.doc),
+                            Some(&thread_vars),
+                            &snapshot,
+                        ) {
+                            Ok(ps) => {
+                                thread_vars = ps.next_thread_vars;
+                                changed_thread_keys = ps.changed_thread_keys;
+                                changed_env_keys = ps.changed_keys.clone();
+                                if !ps.changed_keys.is_empty()
+                                    && let Some(env) = active_env.as_mut()
+                                {
+                                    apply_vars_to_env_node(env, &ps.next_vars);
+                                    save_environment(env).map_err(|e| e.to_string())?;
+                                }
+                                if !ps.changed_global_keys.is_empty()
+                                    && let Some(genv) = global_env.as_mut()
+                                {
+                                    apply_vars_to_env_node(genv, &ps.next_global_vars);
+                                    save_environment(genv).map_err(|e| e.to_string())?;
+                                }
+                            }
+                            Err(err) => {
+                                script_error = Some(err.to_string());
+                            }
+                        }
+                    }
+
+                    let ok = snapshot.status_code < 400 && script_error.is_none();
+                    json!({
+                        "id": req_node.doc.id,
+                        "name": req_node.doc.name,
+                        "method": req_method,
+                        "url": req_url,
+                        "ok": ok,
+                        "statusCode": snapshot.status_code,
+                        "reason": snapshot.reason,
+                        "durationMs": snapshot.duration_ms,
+                        "sizeBytes": snapshot.size_bytes,
+                        "bodySummary": summarize_body(&snapshot),
+                        "threadVars": thread_vars,
+                        "changedThreadKeys": changed_thread_keys,
+                        "changedEnvKeys": changed_env_keys,
+                        "scriptError": script_error,
+                    })
+                }
+                Err(err) => json!({
+                    "id": req_node.doc.id,
+                    "name": req_node.doc.name,
+                    "method": req_method,
+                    "url": req_url,
+                    "ok": false,
+                    "error": err.to_string(),
+                }),
+            };
+            Ok(res)
         }
         "delete" => {
             let item_ref = req_flag(cmd, "item")?;
@@ -965,16 +1360,30 @@ fn count_set_requests(folders: &[RequestSetFolder], requests: &[RequestSetItem])
 fn find_set<'a>(sets: &'a [RequestSet], id_or_name: &str) -> Result<&'a RequestSet, String> {
     sets.iter()
         .find(|s| s.id == id_or_name || s.name == id_or_name)
-        .ok_or_else(|| format!("Package `{id_or_name}` not found"))
+        .ok_or_else(|| {
+            let cands = sets
+                .iter()
+                .map(|s| format!("{} ({})", s.id, s.name))
+                .collect();
+            format!("Package `{id_or_name}` not found.{}", format_candidates(cands))
+        })
 }
 
 fn find_set_mut<'a>(
     sets: &'a mut [RequestSet],
     id_or_name: &str,
 ) -> Result<&'a mut RequestSet, String> {
-    sets.iter_mut()
-        .find(|s| s.id == id_or_name || s.name == id_or_name)
-        .ok_or_else(|| format!("Package `{id_or_name}` not found"))
+    if let Some(ix) = sets
+        .iter()
+        .position(|s| s.id == id_or_name || s.name == id_or_name)
+    {
+        return Ok(&mut sets[ix]);
+    }
+    let cands = sets
+        .iter()
+        .map(|s| format!("{} ({})", s.id, s.name))
+        .collect();
+    Err(format!("Package `{id_or_name}` not found.{}", format_candidates(cands)))
 }
 
 fn find_set_folder_mut<'a>(
@@ -1153,8 +1562,408 @@ fn handle_package(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Str
             save_workspace_sets(workspace_dir, &sets).map_err(|e| e.to_string())?;
             Ok(json!({ "deleted": removed_id }))
         }
+        "dag" => handle_package_dag(workspace_dir, cmd, &mut sets),
+        "run" => handle_package_run(workspace_dir, cmd, &sets),
         other => Err(format!("Unknown package action `{other}`")),
     }
+}
+
+fn handle_package_dag(
+    workspace_dir: &Path,
+    cmd: &ParsedApiCmd,
+    sets: &mut [RequestSet],
+) -> Result<Value, String> {
+    let sub = cmd
+        .sub_action
+        .as_deref()
+        .ok_or_else(|| "Missing dag sub-action (`get | validate | set | add-node | add-edge | remove-node`)".to_string())?;
+    let pkg_ref = req_flag(cmd, "package")?;
+
+    match sub {
+        "get" => {
+            let pkg = find_set(sets, pkg_ref)?;
+            serde_json::to_value(&pkg.dag).map_err(|e| e.to_string())
+        }
+        "validate" => {
+            let pkg = find_set(sets, pkg_ref)?;
+            let tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
+            pkg.dag.validate().map_err(|e| e.to_string())?;
+            for node in &pkg.dag.nodes {
+                let found = if !node.project_id.is_empty() {
+                    tree.find_project(&node.project_id)
+                        .and_then(|p| p.find_request(&node.request_id))
+                        .is_some()
+                } else {
+                    tree.projects
+                        .iter()
+                        .any(|p| p.find_request(&node.request_id).is_some())
+                };
+                if !found {
+                    return Err(format!(
+                        "Package `{}` node `{}` references unknown requestId `{}`",
+                        pkg.name, node.id, node.request_id
+                    ));
+                }
+            }
+            let order = pkg.dag.topological_order().map_err(|e| e.to_string())?;
+            Ok(json!({
+                "valid": true,
+                "packageId": pkg.id,
+                "packageName": pkg.name,
+                "nodeCount": pkg.dag.nodes.len(),
+                "topologicalOrder": order,
+            }))
+        }
+        "set" => {
+            let raw = if let Some(file_path) = opt_flag(cmd, "file") {
+                read_text_or_stdin(file_path, "--file")?
+            } else if let Some(dag_json) = opt_flag(cmd, "dag-json") {
+                if dag_json == "-" {
+                    read_text_or_stdin("-", "--dag-json")?
+                } else {
+                    dag_json.to_string()
+                }
+            } else {
+                return Err("Missing `--file <path|->` or `--dag-json <json|->`".to_string());
+            };
+            let dag: PackageDag = if raw.trim_start().starts_with('{') {
+                serde_json::from_str(&raw).map_err(|e| format!("Invalid DAG JSON: {e}"))?
+            } else {
+                yaml_serde::from_str(&raw).map_err(|e| format!("Invalid DAG YAML: {e}"))?
+            };
+            dag.validate().map_err(|e| e.to_string())?;
+            let pkg = find_set_mut(sets, pkg_ref)?;
+            pkg.dag = dag.clone();
+            save_workspace_sets(workspace_dir, sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&dag).map_err(|e| e.to_string())
+        }
+        "add-node" => {
+            let project_ref = req_flag(cmd, "project")?;
+            let item_ref = req_flag(cmd, "item")?;
+            let tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
+            let proj = find_project(&tree.projects, project_ref)?;
+            let req = find_request_in_project(proj, item_ref)?;
+
+            let pkg = find_set_mut(sets, pkg_ref)?;
+            let node_id = opt_flag(cmd, "id")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let mut id = generate_id("node");
+                    while pkg.dag.nodes.iter().any(|n| n.id == id) {
+                        id = generate_id("node");
+                    }
+                    id
+                });
+            if pkg.dag.nodes.iter().any(|n| n.id == node_id) {
+                return Err(format!("DAG node `{node_id}` already exists in package `{}`", pkg.name));
+            }
+            let name = opt_flag(cmd, "name")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| req.doc.name.clone());
+            let x = opt_flag(cmd, "x")
+                .map(|v| v.parse::<f32>().map_err(|e| format!("Invalid `--x`: {e}")))
+                .transpose()?
+                .unwrap_or(0.0);
+            let y = opt_flag(cmd, "y")
+                .map(|v| v.parse::<f32>().map_err(|e| format!("Invalid `--y`: {e}")))
+                .transpose()?
+                .unwrap_or(0.0);
+            let needs: Vec<String> = opt_flag(cmd, "needs")
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let node = DagNode {
+                id: node_id,
+                project_id: proj.doc.id.clone(),
+                request_id: req.doc.id.clone(),
+                name,
+                needs,
+                overrides: DagNodeOverrides::default(),
+                x,
+                y,
+            };
+            let mut next_dag = pkg.dag.clone();
+            next_dag.nodes.push(node.clone());
+            next_dag.validate().map_err(|e| e.to_string())?;
+            pkg.dag = next_dag;
+            save_workspace_sets(workspace_dir, sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&node).map_err(|e| e.to_string())
+        }
+        "add-edge" => {
+            let from_id = req_flag(cmd, "from")?;
+            let to_id = req_flag(cmd, "to")?;
+            let pkg = find_set_mut(sets, pkg_ref)?;
+            if !pkg.dag.nodes.iter().any(|n| n.id == from_id) {
+                return Err(format!("Source DAG node `{from_id}` not found"));
+            }
+            if !pkg.dag.nodes.iter().any(|n| n.id == to_id) {
+                return Err(format!("Target DAG node `{to_id}` not found"));
+            }
+            if pkg.dag.would_create_cycle(from_id, to_id) {
+                return Err(format!("Edge `{from_id}` -> `{to_id}` would create a cycle"));
+            }
+            if let Some(target) = pkg.dag.nodes.iter_mut().find(|n| n.id == to_id)
+                && !target.needs.iter().any(|d| d == from_id)
+            {
+                target.needs.push(from_id.to_string());
+            }
+            pkg.dag.validate().map_err(|e| e.to_string())?;
+            let updated = pkg.dag.clone();
+            save_workspace_sets(workspace_dir, sets).map_err(|e| e.to_string())?;
+            serde_json::to_value(&updated).map_err(|e| e.to_string())
+        }
+        "remove-node" => {
+            let node_id = req_flag(cmd, "node")?;
+            let pkg = find_set_mut(sets, pkg_ref)?;
+            let before = pkg.dag.nodes.len();
+            pkg.dag.nodes.retain(|n| n.id != node_id);
+            if pkg.dag.nodes.len() == before {
+                return Err(format!("DAG node `{node_id}` not found"));
+            }
+            for n in &mut pkg.dag.nodes {
+                n.needs.retain(|d| d != node_id);
+            }
+            save_workspace_sets(workspace_dir, sets).map_err(|e| e.to_string())?;
+            Ok(json!({ "deleted": node_id }))
+        }
+        other => Err(format!("Unknown `package dag` sub-action `{other}`")),
+    }
+}
+
+fn handle_package_run(
+    workspace_dir: &Path,
+    cmd: &ParsedApiCmd,
+    sets: &[RequestSet],
+) -> Result<Value, String> {
+    let pkg_ref = req_flag(cmd, "package")?;
+    let pkg = find_set(sets, pkg_ref)?;
+    let order = pkg.dag.topological_order().map_err(|e| e.to_string())?;
+    let tree = load_workspace(workspace_dir).map_err(|e| e.to_string())?;
+
+    let env_ref = opt_flag(cmd, "env").or_else(|| opt_flag(cmd, "profile"));
+    let mut active_env = match env_ref {
+        Some(eref) => Some(find_env(&tree.environments, eref)?.clone()),
+        None => tree
+            .active_environment_id
+            .as_ref()
+            .and_then(|id| tree.environments.iter().find(|e| &e.doc.id == id))
+            .cloned(),
+    };
+    let active_env_fallback = if active_env.is_none() {
+        tree.effective_environment()
+    } else {
+        None
+    };
+    let mut global_env = tree.global_environment.clone();
+    let seed_vars = parse_var_overrides(cmd)?;
+    let fail_fast = cmd.bool_flags.contains("fail-fast");
+
+    let mut thread_vars: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in &seed_vars {
+        let key = k.strip_prefix("thread.").unwrap_or(k);
+        thread_vars.insert(key.to_string(), v.clone());
+    }
+
+    let nodes_by_id: HashMap<&str, &DagNode> =
+        pkg.dag.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let runner = HttpRunner::new().map_err(|e| e.to_string())?;
+    let run_started = Instant::now();
+
+    let mut node_reports: Vec<Value> = Vec::with_capacity(order.len());
+    let mut failed_or_skipped: HashSet<String> = HashSet::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut aborted = false;
+
+    for node_id in &order {
+        let Some(&node) = nodes_by_id.get(node_id.as_str()) else {
+            continue;
+        };
+        if aborted || node.needs.iter().any(|dep| failed_or_skipped.contains(dep)) {
+            skipped += 1;
+            failed_or_skipped.insert(node.id.clone());
+            node_reports.push(json!({
+                "nodeId": node.id,
+                "nodeName": node.name,
+                "requestId": node.request_id,
+                "status": "skipped",
+                "reason": if aborted { "fail-fast triggered by earlier failure" } else { "upstream dependency failed or skipped" },
+            }));
+            continue;
+        }
+
+        let resolved = if !node.project_id.is_empty() {
+            tree.find_project(&node.project_id)
+                .and_then(|p| p.find_request(&node.request_id).map(|(anc, r)| (p, anc, r)))
+        } else {
+            tree.projects
+                .iter()
+                .find_map(|p| p.find_request(&node.request_id).map(|(anc, r)| (p, anc, r)))
+        };
+
+        let Some((proj, ancestors, req_node)) = resolved else {
+            failed += 1;
+            failed_or_skipped.insert(node.id.clone());
+            node_reports.push(json!({
+                "nodeId": node.id,
+                "nodeName": node.name,
+                "requestId": node.request_id,
+                "status": "failed",
+                "error": format!("Request `{}` not found", node.request_id),
+            }));
+            if fail_fast {
+                aborted = true;
+            }
+            continue;
+        };
+
+        let mut effective_doc = req_node.doc.clone();
+        node.overrides.apply_to(&mut effective_doc);
+
+        let mut extra_vars = seed_vars.clone();
+        for (k, v) in &thread_vars {
+            extra_vars.insert(format!("thread.{k}"), v.clone());
+        }
+
+        let prepared = match materialize_request_doc_with_extra_vars(
+            proj,
+            &ancestors,
+            &effective_doc,
+            active_env
+                .as_ref()
+                .map(|e| &e.doc)
+                .or(active_env_fallback.as_ref()),
+            &extra_vars,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                failed += 1;
+                failed_or_skipped.insert(node.id.clone());
+                node_reports.push(json!({
+                    "nodeId": node.id,
+                    "nodeName": node.name,
+                    "requestId": node.request_id,
+                    "status": "failed",
+                    "error": err.to_string(),
+                }));
+                if fail_fast {
+                    aborted = true;
+                }
+                continue;
+            }
+        };
+
+        let req_method = prepared.method.as_str().to_string();
+        let req_url = prepared.url.clone();
+        match runner.execute_blocking(prepared, CancellationToken::new()) {
+            Ok(snapshot) => {
+                let mut changed_thread_keys = Vec::new();
+                let mut script_error: Option<String> = None;
+                let script = effective_doc.request.post_script.trim();
+                if !script.is_empty() {
+                    match crate::post_script::run_post_script_with_thread(
+                        script,
+                        &effective_doc.id,
+                        &effective_doc.name,
+                        active_env
+                            .as_ref()
+                            .map(|e| &e.doc)
+                            .or(active_env_fallback.as_ref()),
+                        global_env.as_ref().map(|e| &e.doc),
+                        Some(&thread_vars),
+                        &snapshot,
+                    ) {
+                        Ok(ps) => {
+                            thread_vars = ps.next_thread_vars;
+                            changed_thread_keys = ps.changed_thread_keys;
+                            if !ps.changed_keys.is_empty()
+                                && let Some(env) = active_env.as_mut()
+                            {
+                                apply_vars_to_env_node(env, &ps.next_vars);
+                                save_environment(env).map_err(|e| e.to_string())?;
+                            }
+                            if !ps.changed_global_keys.is_empty()
+                                && let Some(genv) = global_env.as_mut()
+                            {
+                                apply_vars_to_env_node(genv, &ps.next_global_vars);
+                                save_environment(genv).map_err(|e| e.to_string())?;
+                            }
+                        }
+                        Err(err) => {
+                            script_error = Some(err.to_string());
+                        }
+                    }
+                }
+
+                let is_ok = snapshot.status_code < 400 && script_error.is_none();
+                if is_ok {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                    failed_or_skipped.insert(node.id.clone());
+                    if fail_fast {
+                        aborted = true;
+                    }
+                }
+
+                node_reports.push(json!({
+                    "nodeId": node.id,
+                    "nodeName": node.name,
+                    "requestId": node.request_id,
+                    "method": req_method,
+                    "url": req_url,
+                    "status": if is_ok { "success" } else { "failed" },
+                    "statusCode": snapshot.status_code,
+                    "reason": snapshot.reason,
+                    "durationMs": snapshot.duration_ms,
+                    "sizeBytes": snapshot.size_bytes,
+                    "changedThreadKeys": changed_thread_keys,
+                    "bodySummary": summarize_body(&snapshot),
+                    "error": script_error,
+                }));
+            }
+            Err(err) => {
+                failed += 1;
+                failed_or_skipped.insert(node.id.clone());
+                node_reports.push(json!({
+                    "nodeId": node.id,
+                    "nodeName": node.name,
+                    "requestId": node.request_id,
+                    "method": req_method,
+                    "url": req_url,
+                    "status": "failed",
+                    "error": err.to_string(),
+                }));
+                if fail_fast {
+                    aborted = true;
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": failed == 0,
+        "packageId": pkg.id,
+        "packageName": pkg.name,
+        "total": order.len(),
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped,
+        "durationMs": run_started.elapsed().as_millis() as u64,
+        "threadVars": thread_vars,
+        "nodes": node_reports,
+    }))
 }
 
 fn handle_share(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, String> {
@@ -1437,6 +2246,227 @@ fn handle_share(workspace_dir: &Path, cmd: &ParsedApiCmd) -> Result<Value, Strin
         other => Err(format!(
             "Unknown share action `{other}` (expected list | status | config-set | login | publish | revoke)"
         )),
+    }
+}
+
+fn read_text_or_stdin(source: &str, flag_name: &str) -> Result<String, String> {
+    if source == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("Failed reading stdin for `{flag_name}`: {e}"))?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(source)
+            .map_err(|e| format!("Failed reading file `{source}` for `{flag_name}`: {e}"))
+    }
+}
+
+fn load_spec_from_cmd(cmd: &ParsedApiCmd) -> Result<Option<HttpRequestSpec>, String> {
+    let has_json = opt_flag(cmd, "spec-json");
+    let has_file = opt_flag(cmd, "spec-file");
+    if has_json.is_some() && has_file.is_some() {
+        return Err("Cannot specify both `--spec-json` and `--spec-file`".to_string());
+    }
+    if let Some(raw_or_stdin) = has_json {
+        let raw = if raw_or_stdin == "-" {
+            read_text_or_stdin("-", "--spec-json")?
+        } else {
+            raw_or_stdin.to_string()
+        };
+        let spec = serde_json::from_str::<HttpRequestSpec>(&raw)
+            .map_err(|e| format!("Invalid `--spec-json`: {e}"))?;
+        return Ok(Some(spec));
+    }
+    if let Some(path) = has_file {
+        let raw = read_text_or_stdin(path, "--spec-file")?;
+        let spec = serde_json::from_str::<HttpRequestSpec>(&raw)
+            .map_err(|e| format!("Invalid JSON in `--spec-file`: {e}"))?;
+        return Ok(Some(spec));
+    }
+    Ok(None)
+}
+
+fn parse_var_overrides(cmd: &ParsedApiCmd) -> Result<BTreeMap<String, String>, String> {
+    let mut vars = BTreeMap::new();
+    for raw in multi_flag(cmd, "var") {
+        let Some((k, v)) = raw.split_once('=') else {
+            return Err(format!("Invalid `--var` `{raw}` (expected `key=value`)"));
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            return Err("`--var` key must not be empty".to_string());
+        }
+        vars.insert(key.to_string(), v.to_string());
+    }
+    Ok(vars)
+}
+
+fn summarize_body(snapshot: &HttpResponseSnapshot) -> String {
+    let text = if snapshot.pretty_body.trim().is_empty() {
+        snapshot.body_text.trim()
+    } else {
+        snapshot.pretty_body.trim()
+    };
+    const MAX_CHARS: usize = 500;
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}… (truncated, {} bytes total)", snapshot.size_bytes)
+    } else {
+        head
+    }
+}
+
+fn apply_vars_to_env_node(env: &mut EnvironmentNode, next_vars: &BTreeMap<String, String>) {
+    for (k, v) in next_vars {
+        if let Some(row) = env.doc.variables.iter_mut().find(|r| r.key == *k) {
+            row.value = v.clone();
+            row.enabled = true;
+        } else {
+            env.doc.variables.push(EnvVariable::new(k, v));
+        }
+    }
+}
+
+fn render_resource_help(resource: &str, action: &str) -> String {
+    match resource {
+        "project" | "projects" => "\
+testrix project <ACTION> [FLAGS]
+
+Actions:
+  list                                 List all projects in workspace
+  get     --project <ref>              Get project details
+  create  --name <name> [options]      Create a new project
+          [--base-url <url>] [--description <desc>] [--auth-json <json>]
+  update  --project <ref> [options]    Update project settings
+          [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
+  delete  --project <ref>              Delete a project
+
+Common flags: --workspace <dir>, --out <file>, --quiet (-q)
+Note: <ref> accepts project id, display name, or directory slug."
+            .to_string(),
+        "folder" | "folders" => "\
+testrix folder <ACTION> [FLAGS]
+
+Actions:
+  list    --project <ref>              List folders in a project
+  create  --project <ref> --name <n>   Create a folder [--parent <ref>] [--order <n>]
+  update  --project <ref> --folder <ref> [--name <n>] [--order <n>] [--auth-json <json>]
+  delete  --project <ref> --folder <ref>
+
+Note: <ref> accepts id, display name, folder slug, or relative path."
+            .to_string(),
+        "item" | "items" | "request" | "requests" => match action {
+            "create" | "update" => "\
+testrix item <create|update> --project <ref> [FLAGS]
+
+Required:
+  --project <ref>                      Project id, name, or slug
+  --name <name>                        (create) Request display name
+  --item <ref>                         (update) Request id, name, slug, or relative path
+
+Optional:
+  --folder <ref>                       Target folder (create)
+  --id <id>                            Custom request id (create)
+  --upsert                             Update existing item if id/name matches (create)
+  --method <GET|POST|PUT|DELETE|...>   Overrides method in --spec-json/--spec-file
+  --url <url>                          Overrides url in --spec-json/--spec-file
+  --description <text>                 Request description
+  --order <i32>                        Sort order in Explorer
+  --script <curl|wget|ps>              Import from cURL / wget / PowerShell command
+  --spec-json <json|->                 Full HttpRequestSpec JSON (use `-` for stdin)
+  --spec-file <path>                   Read HttpRequestSpec JSON from file
+  --out <file>                         Write JSON output to file (UTF-8)
+  --quiet (-q)                         Print only the item id
+
+HttpRequestSpec JSON schema:
+  { \"method\": \"POST\", \"url\": \"{{baseUrl}}/path\", \"params\": [{\"key\":\"a\",\"value\":\"1\",\"enabled\":true}],
+    \"headers\": [...], \"body\": {\"mode\":\"json\",\"content\":\"{\\\"k\\\":1}\"}, \"postScript\": \"...\" }"
+                .to_string(),
+            "run" => "\
+testrix item run --project <ref> --item <ref> [FLAGS]
+
+Optional:
+  --env <ref> / --profile <ref>        Environment profile id, name, or slug
+  --var <k=v>                          Template/thread variable override (repeatable)
+  --out <file>                         Write JSON result to file"
+                .to_string(),
+            _ => "\
+testrix item <ACTION> [FLAGS]
+
+Actions:
+  list    --project <ref> [--folder <ref>]
+  get     --project <ref> --item <ref>
+  create  --project <ref> --name <name> [--method M] [--url U] [--spec-json J | --spec-file P] [--id ID] [--upsert] [--order N] [--description D]
+  update  --project <ref> --item <ref> [--name N] [--method M] [--url U] [--spec-json J | --spec-file P] [--order N] [--description D]
+  delete  --project <ref> --item <ref>
+  run     --project <ref> --item <ref> [--env <ref>] [--var k=v ...]
+
+Run `testrix item create --help` or `testrix item run --help` for detailed flags and schema."
+                .to_string(),
+        },
+        "profile" | "profiles" | "env" | "environment" | "environments" => "\
+testrix profile <ACTION> [FLAGS]
+
+Actions:
+  list    [--project <ref>]
+  get     --profile <ref> [--project <ref>]
+  create  --name <name> [--project <ref>]
+  update  --profile <ref> [--name <name>] [--project <ref>]
+  delete  --profile <ref> [--project <ref>]
+  merge   --profile <target> --from <source> [--overwrite]"
+            .to_string(),
+        "var" | "vars" | "variable" | "variables" => "\
+testrix var <ACTION> --profile <ref> [FLAGS]
+
+Actions:
+  list    --profile <ref> [--project <ref>]
+  get     --profile <ref> --key <key>
+  create  --profile <ref> --key <key> --value <val> [--secret true|false] [--enabled true|false]
+  update  --profile <ref> --key <key> [--new-key <key>] [--value <val>] [--secret true|false] [--enabled true|false]
+  set     --profile <ref> --key <key> --value <val> [--secret true|false] [--enabled true|false]
+  delete  --profile <ref> --key <key>"
+            .to_string(),
+        "package" | "packages" | "set" | "sets" => "\
+testrix package <ACTION> [FLAGS]
+
+Actions:
+  list
+  get           --package <ref>
+  create        --name <name>
+  update        --package <ref> --name <name>
+  delete        --package <ref>
+  add-folder    --package <ref> --name <name> [--parent <ref>]
+  update-folder --package <ref> --folder <ref> --name <name>
+  delete-folder --package <ref> --folder <ref>
+  add-item      --package <ref> --project <ref> --item <ref> [--folder <ref>]
+  remove-item   --package <ref> --item <ref> [--folder <ref>]
+  run           --package <ref> [--env <ref>] [--var k=v ...] [--fail-fast]
+  dag get       --package <ref>
+  dag validate  --package <ref>
+  dag set       --package <ref> (--file <path|-> | --dag-json <json|->)
+  dag add-node  --package <ref> --project <ref> --item <ref> [--id <id>] [--name <n>] [--x N] [--y N] [--needs a,b]
+  dag add-edge  --package <ref> --from <nodeId> --to <nodeId>
+  dag remove-node --package <ref> --node <nodeId>"
+            .to_string(),
+        "share" | "shares" => "\
+testrix share <list|status|config-set|login|publish|revoke> [FLAGS]
+
+Actions:
+  status
+  list       [--project <ref>] [--channel server|r2]
+  config-set [--server-url <url>] [--access-token <tok>] [--r2-account <id>] [--r2-bucket <b>] [--r2-access-key <k>] [--r2-secret-key <s>] [--r2-pages-url <url>]
+  login      --email <email> --password <password>
+  publish    --project <ref> [--channel server|r2]
+  revoke     [--share <id>] [--project <ref>] [--channel server|r2]"
+            .to_string(),
+        "notify" | "reload" => "\
+testrix notify reload
+
+Notifies any running Testrix GUI instance to reload the workspace from disk."
+            .to_string(),
+        _ => format!("No help available for `{resource}`. Run `testrix --help`."),
     }
 }
 
@@ -1729,5 +2759,192 @@ mod tests {
 
         let empty_list = execute_cli_api(ws, &s(&["package", "list"])).unwrap();
         assert!(empty_list.contains("[]"));
+    }
+
+    #[test]
+    fn item_spec_merge_upsert_order_slug_help_and_dag_cli() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path();
+
+        execute_cli_api(ws, &s(&["project", "create", "--name", "Shop API"])).unwrap();
+        execute_cli_api(
+            ws,
+            &s(&["folder", "create", "--project", "Shop API", "--name", "Auth Flow"]),
+        )
+        .unwrap();
+
+        // --spec-json merged with --method / --url + --id + --order + --description
+        let created = execute_cli_api_detailed(
+            ws,
+            &s(&[
+                "item",
+                "create",
+                "--project",
+                "Shop API",
+                "--folder",
+                "Auth Flow",
+                "--id",
+                "req-login",
+                "--name",
+                "Login",
+                "--description",
+                "User login",
+                "--order",
+                "5",
+                "--method",
+                "POST",
+                "--url",
+                "https://example.com/login",
+                "--spec-json",
+                r#"{"headers":[{"name":"X-Test","value":"1","enabled":true}]}"#,
+                "--quiet",
+            ]),
+        )
+        .unwrap();
+        assert!(created.quiet);
+        assert_eq!(created.quiet_text.as_deref(), Some("req-login"));
+        assert!(created.text.contains(r#""method": "POST""#));
+        assert!(created.text.contains(r#""url": "https://example.com/login""#));
+        assert!(created.text.contains(r#""order": 5"#));
+        assert!(created.text.contains(r#""description": "User login""#));
+        assert!(created.text.contains("X-Test"));
+
+        // --upsert updates existing item by id
+        let upserted = execute_cli_api(
+            ws,
+            &s(&[
+                "item",
+                "create",
+                "--project",
+                "Shop API",
+                "--id",
+                "req-login",
+                "--name",
+                "Login v2",
+                "--method",
+                "PUT",
+                "--url",
+                "https://example.com/v2/login",
+                "--upsert",
+            ]),
+        )
+        .unwrap();
+        assert!(upserted.contains("Login v2"));
+        assert!(upserted.contains(r#""method": "PUT""#));
+
+        // --spec-file
+        let spec_path = dir.path().join("spec.json");
+        std::fs::write(
+            &spec_path,
+            r#"{"method":"GET","url":"https://example.com/me"}"#,
+        )
+        .unwrap();
+        execute_cli_api(
+            ws,
+            &s(&[
+                "item",
+                "create",
+                "--project",
+                "Shop API",
+                "--id",
+                "req-me",
+                "--name",
+                "Get Me",
+                "--spec-file",
+                spec_path.to_str().unwrap(),
+            ]),
+        )
+        .unwrap();
+
+        // Not found includes candidates
+        let err = execute_cli_api(
+            ws,
+            &s(&["item", "get", "--project", "Shop API", "--item", "missing"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("Available:"));
+        assert!(err.contains("req-login"));
+
+        // Subcommand --help
+        let help = execute_cli_api_detailed(ws, &s(&["item", "create", "--help"])).unwrap();
+        assert!(help.is_help);
+        assert!(help.text.contains("--spec-json"));
+
+        // package dag CLI
+        execute_cli_api(ws, &s(&["package", "create", "--name", "Smoke"])).unwrap();
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "dag",
+                "add-node",
+                "--package",
+                "Smoke",
+                "--id",
+                "n1",
+                "--project",
+                "Shop API",
+                "--item",
+                "req-login",
+            ]),
+        )
+        .unwrap();
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "dag",
+                "add-node",
+                "--package",
+                "Smoke",
+                "--id",
+                "n2",
+                "--project",
+                "Shop API",
+                "--item",
+                "req-me",
+            ]),
+        )
+        .unwrap();
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "dag",
+                "add-edge",
+                "--package",
+                "Smoke",
+                "--from",
+                "n1",
+                "--to",
+                "n2",
+            ]),
+        )
+        .unwrap();
+        let val = execute_cli_api(
+            ws,
+            &s(&["package", "dag", "validate", "--package", "Smoke"]),
+        )
+        .unwrap();
+        assert!(val.contains(r#""valid": true"#));
+        assert!(val.contains("n1"));
+        assert!(val.contains("n2"));
+
+        execute_cli_api(
+            ws,
+            &s(&[
+                "package",
+                "dag",
+                "remove-node",
+                "--package",
+                "Smoke",
+                "--node",
+                "n1",
+            ]),
+        )
+        .unwrap();
+        let dag_after =
+            execute_cli_api(ws, &s(&["package", "dag", "get", "--package", "Smoke"])).unwrap();
+        assert!(!dag_after.contains(r#""n1""#));
     }
 }

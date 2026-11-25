@@ -25,43 +25,72 @@ Testrix stores projects, folders, HTTP requests, and environments as `testrix.io
    testrix item get --project <project-id-or-name> --item <item-id-or-name>
    ```
 
-## 2. CLI CRUD Reference (Preferred)
+## 2. CLI CRUD, Execution & Help Reference (Preferred)
 
 Every CLI command performs schema & legal checks and returns structured JSON (`{ "ok": true, "data": ... }` or `{ "ok": false, "error": ... }`):
 
 ```bash
-testrix project  <list|get|create|update|delete> [--project <id-or-name>] [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
-testrix folder   <list|create|update|delete>     --project <id-or-name> [--folder <id-or-name>] [--parent <id-or-name>] [--name <name>] [--order <n>]
-testrix item     <list|get|create|update|delete> --project <id-or-name> [--item <id-or-name>] [--folder <id-or-name>] [--name <name>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json>]
-testrix profile  <list|get|create|update|delete|merge> --project <id-or-name> [--profile <id-or-name>] [--from <source>] [--overwrite]
-testrix var      <list|get|create|update|set|delete>  --project <id-or-name> --profile <id-or-name> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
-testrix package  <list|get|create|update|delete|add-folder|update-folder|delete-folder|add-item|remove-item> [--package <id-or-name>] [--name <name>] [--folder <id-or-name>] [--parent <id-or-name>] [--project <id-or-name>] [--item <id-or-name>]
-testrix share    <list|status|config-set|login|publish|revoke> [--project <id-or-name>] [--channel <server|r2>] [--share <id>] [--access-token <token>]
+testrix project  <list|get|create|update|delete> [--project <ref>] [--name <name>] [--base-url <url>] [--description <desc>] [--auth-json <json>]
+testrix folder   <list|create|update|delete>     --project <ref> [--folder <ref>] [--parent <ref>] [--name <name>] [--order <n>]
+testrix item     <list|get|create|update|delete|run> --project <ref> [--item <ref>] [--folder <ref>] [--id <id>] [--upsert] [--name <name>] [--description <desc>] [--order <n>] [--method <METHOD>] [--url <url>] [--script <curl|wget|ps>] [--spec-json <json|->] [--spec-file <path>] [--env <ref>] [--var <k=v>]
+testrix profile  <list|get|create|update|delete|merge> [--project <ref>] [--profile <ref>] [--from <source>] [--overwrite]
+testrix var      <list|get|create|update|set|delete>  [--project <ref>] --profile <ref> --key <key> [--new-key <key>] [--value <val>] [--secret <true|false>] [--enabled <true|false>]
+testrix package  <list|get|create|update|delete|add-folder|update-folder|delete-folder|add-item|remove-item|run|dag> [--package <ref>] [--name <name>] [--folder <ref>] [--parent <ref>] [--project <ref>] [--item <ref>] [--env <ref>] [--var <k=v>] [--fail-fast]
+testrix package  dag <get|validate|set|add-node|add-edge|remove-node> --package <ref> [...]
+testrix share    <list|status|config-set|login|publish|revoke> [--project <ref>] [--channel <server|r2>] [--share <id>] [--access-token <token>]
 testrix notify   reload
 ```
 
-- Run `testrix <resource> --help` (or `testrix --help`) to see all supported resources and actions.
-- Mutating CLI CRUD commands (`create`, `update`, `delete`, `set`, `merge`, `add-folder`, `update-folder`, `delete-folder`, `add-item`, `remove-item`) automatically notify any running Testrix GUI instance via IPC (Unix Domain Socket on macOS/Linux, Named Pipe on Windows) to reload the workspace.
-- Package examples:
+### Key CLI Rules & Pitfalls
+
+| Topic | Behavior & Best Practice |
+|---|---|
+| **Running alongside GUI** | CLI CRUD and `run` commands work while the Testrix GUI is running; mutating commands automatically notify the GUI via IPC (`UDS` / `Named Pipe`) to reload. |
+| **Subcommand `--help`** | Run `testrix <resource> --help` or `testrix <resource> <action> --help` (e.g. `testrix item create --help`) for exact flags, required fields, and `--spec-json` schema. |
+| **Identifier resolution (`<ref>`)** | `--project`, `--folder`, `--item`, `--profile`, and `--package` accept **id**, **exact display name**, **directory/file slug** (e.g. `auth-flow`, `create-user`), or **relative path** (for folders/items). Not-found errors list available candidates. |
+| **`--spec-json` / `--spec-file` merge** | `--spec-json <json\|->` (use `-` for stdin) and `--spec-file <path>` supply a full `HttpRequestSpec` object. If `--method` or `--url` is also passed, those flags **override** the spec's `method`/`url`. |
+| **Stable output & Windows UTF-8** | Testrix switches the Windows console to UTF-8 (`CP_UTF8`). For scripts, pass `--out <file>` to write UTF-8 JSON directly to disk, or `--quiet` (`-q`) to print only the created/updated/deleted `id`. |
+| **Manual YAML fallback** | All core fields (`--description`, `--order`, `--id`, `--upsert`, `package dag`) are supported in the CLI; only edit YAML directly for advanced fields (e.g. custom `DagNode.overrides`), then run `testrix --check`. |
+
+- **`--spec-json` / `--spec-file` example**:
+  ```bash
+  testrix item create --project shop-api --id req-create-order --name "Create Order" --order 2 \
+    --method POST --url "{{baseUrl}}/orders" \
+    --spec-json '{"headers":[{"name":"Content-Type","value":"application/json","enabled":true}],"body":{"type":"raw","language":"json","content":"{\"sku\":\"A1\"}"}}'
+  ```
+- **End-to-end Package & DAG recipe**:
+  ```bash
+  testrix folder create --project shop-api --name "Checkout"
+  testrix item create --project shop-api --folder Checkout --id req-login --name "Login" --method POST --url "{{baseUrl}}/login"
+  testrix item create --project shop-api --folder Checkout --id req-order --name "Order" --method POST --url "{{baseUrl}}/orders"
+  testrix package create --name "Checkout Flow"
+  testrix package add-item --package "Checkout Flow" --project shop-api --item req-login
+  testrix package dag add-node --package "Checkout Flow" --id n1 --project shop-api --item req-login
+  testrix package dag add-node --package "Checkout Flow" --id n2 --project shop-api --item req-order --needs n1
+  testrix --check
+  testrix package run --package "Checkout Flow" --fail-fast
+  ```
+- **Package examples**:
   ```bash
   testrix package list
   testrix package create --name "Smoke Suite"
   testrix package add-folder --package "Smoke Suite" --name "Auth"
-  testrix package add-item --package "Smoke Suite" --folder "Auth" --project <project-id-or-name> --item <item-id-or-name>
-  testrix package remove-item --package "Smoke Suite" --folder "Auth" --item <item-id-or-name>
+  testrix package add-item --package "Smoke Suite" --project <project-ref> --item <item-ref> [--folder "Auth"]
+  testrix package remove-item --package "Smoke Suite" --item <item-ref> [--folder "Auth"]
+  testrix package run --package "Smoke Suite" [--env dev] [--var token=abc] [--fail-fast]
   testrix package delete --package "Smoke Suite"
   ```
-- Sharing examples:
+- **Sharing examples**:
   ```bash
   testrix share status
   testrix share list
-  testrix share publish --project <project-id-or-name> [--channel server|r2]
-  testrix share revoke --project <project-id-or-name> [--channel server|r2]
+  testrix share publish --project <project-ref> [--channel server|r2]
+  testrix share revoke --project <project-ref> [--channel server|r2]
   ```
 
 ## 3. Fallback: Manual YAML Editing & `--check`
 
-Only edit YAML files directly if a specific operation is not covered by the CLI CRUD commands above. If you must edit YAML manually:
+Only edit YAML files directly if a specific operation is not covered by the CLI CRUD commands above (for example, authoring `DagNode.overrides` in `.testrix-sets.yaml`). If you must edit YAML manually:
 
 1. **Locate the workspace** by reading `~/.testrix/config.yaml` (`workspaceDir`) or inspecting `testrix project list` output — never scan the disk.
 2. **Read the target file** (and nearby `testrix.project.yaml`, `_folder.yaml`, or `environments/*.env.yaml` if inheritance or variables matter).
@@ -69,20 +98,20 @@ Only edit YAML files directly if a specific operation is not covered by the CLI 
 4. **Validate with `testrix --check` and notify the running GUI to reload** before finishing:
 
 ```bash
-# Check the configured workspace
+# Check the entire workspace (projects, folders, requests, environments, .testrix-sets.yaml, and DAGs)
 testrix --check
 
-# Notify the running Testrix GUI app to reload YAML changes immediately (via UDS on Unix / Named Pipe on Windows)
+# Notify the running Testrix GUI app to reload YAML changes immediately (returns guiRunning: true/false)
 testrix notify reload
-```
 
 # Check one or more specific YAML files or a project directory
 testrix --check path/to/file.request.yaml path/to/dev.env.yaml
 testrix --check path/to/project-dir
 ```
 
-- Exit code `0` (`OK ...` on stdout) means all checked YAML files parsed and passed schema validation.
-- Non-zero exit code (`ERR ...` on stderr) means one or more files failed; fix every reported error and re-run `testrix --check`.
+- `testrix --check` on a workspace validates every YAML document **plus** `.testrix-sets.yaml` packages and DAG integrity (cycles, missing `needs`, unknown `requestId`), and prints counts (`projects`, `requests`, `environments`, `packages`, `dag nodes`).
+- Exit code `0` (`OK ...` on stdout) means all checked files and DAGs passed validation.
+- Non-zero exit code (`ERR ...` on stderr) means one or more checks failed; fix every reported error and re-run `testrix --check`.
 
 ---
 
@@ -341,16 +370,24 @@ sets:
 2. **No loops allowed**:
    - Every `dep` in `node.needs` must reference an existing `DagNode.id` in the same `dag.nodes`.
    - Self-loops (`node.id` in `node.needs`), duplicate entries in `needs`, and cycles of any length are invalid.
-3. **Coordinates (`x`, `y`)**: optional (`0` by default); if all nodes are `(0, 0)`, Testrix auto-lays out the DAG left-to-right by topological layer.
-4. **Float-layer `overrides`** (optional on `DagNode`):
+3. **`requests` list vs `dag.nodes`**: `dag.nodes` only needs `projectId` + `requestId` to execute; the package `requests` list is for the sidebar tree display and is optional for DAG execution (`package add-item` populates it for GUI visibility).
+4. **Coordinates (`x`, `y`)**: optional (`0` by default); if all nodes are `(0, 0)`, Testrix auto-lays out the DAG left-to-right by topological layer.
+5. **Float-layer `overrides`** (optional on `DagNode`):
    - Supported fields: `params`, `pathParams`, `headers`, `body`, `auth`, `postScript`.
+   - **`overrides` does NOT support `url`**: to pass dynamic upstream values like `{{thread.id}}` in a URL per node, design the base request with query `params` (e.g. `/detail?id={{thread.id}}`) or `pathParams` (e.g. `/detail/{{id}}`), and override `params` or `pathParams` on the node.
    - Applied **only** during DAG execution without modifying the base `*.request.yaml` file.
-5. **DAG-scoped `thread` variables**:
+6. **DAG-scoped `thread` variables & unset placeholders**:
    - Upstream `postScript` (base or `overrides.postScript`) can write `thread.<key> = value`.
    - Downstream nodes can reference `{{thread.<key>}}` in URLs, `params`, `pathParams`, `headers`, `body`, or `auth`, and read `thread.<key>` in downstream `postScript`.
-   - `thread` is ephemeral and only exists for the duration of a single DAG run.
-6. **Reload GUI after editing `.testrix-sets.yaml`**:
+   - If `{{thread.<key>}}` is **unset**, Testrix leaves the literal `{{thread.<key>}}` placeholder intact (it does **not** replace it with an empty string and does not fail template rendering).
+   - `thread` is ephemeral and only exists for the duration of a single DAG run (and can be seeded via `--var key=value` in `testrix package run`).
+7. **Failure & downstream blocking**:
+   - Any node preparation error, HTTP transport error, HTTP status `>= 400`, or `postScript` exception marks that node as **failed**.
+   - In the GUI and in `testrix package run --fail-fast`, the run stops immediately on the first failure (blocking all remaining nodes). Without `--fail-fast` in CLI, dependent downstream nodes are marked `skipped` while independent branches continue.
+8. **Validate & run**:
    ```bash
+   testrix package dag validate --package "Checkout Flow"
+   testrix package run --package "Checkout Flow" --fail-fast
    testrix notify reload
    ```
 

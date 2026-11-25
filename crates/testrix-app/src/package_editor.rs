@@ -2449,7 +2449,8 @@ fn extract_thread_keys_from_script(script: &str, out: &mut BTreeSet<String>) {
     let bytes = script.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if script[i..].starts_with("thread.") {
+        let tail = &script[i..];
+        if tail.starts_with("thread.") {
             let start = i + "thread.".len();
             let mut end = start;
             while end < bytes.len()
@@ -2463,8 +2464,8 @@ fn extract_thread_keys_from_script(script: &str, out: &mut BTreeSet<String>) {
             i = end;
             continue;
         }
-        if script[i..].starts_with("thread[") {
-            let rest = &script[i + "thread[".len()..];
+        if tail.starts_with("thread[") {
+            let rest = &tail["thread[".len()..];
             if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
                 let after_q = &rest[1..];
                 if let Some(close) = after_q.find(quote) {
@@ -2477,7 +2478,8 @@ fn extract_thread_keys_from_script(script: &str, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        i += 1;
+        let ch = tail.chars().next().expect("non-empty tail");
+        i += ch.len_utf8();
     }
 }
 
@@ -2632,5 +2634,122 @@ impl Render for PackageTabView {
                     }),
             )
             .child(self.render_console_panel(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{
+        Bounds, Point, TestAppContext, WindowBounds, WindowOptions, size,
+        test::TestWindowExt as _,
+    };
+    use tempfile::TempDir;
+    use testrix_core::PackageDag;
+    use testrix_storage::ensure_seeded_workspace;
+
+    #[gpui_kit::test]
+    fn double_clicking_dag_node_opens_drawer_without_crash(cx: &mut TestAppContext) {
+        let dir = TempDir::new().unwrap();
+        let workspace = ensure_seeded_workspace(dir.path()).unwrap();
+        let proj = &workspace.projects[0];
+        let req = &proj.requests[0];
+        let mut set = RequestSet {
+            id: "set-test".to_string(),
+            name: "Test Set".to_string(),
+            folders: Vec::new(),
+            requests: Vec::new(),
+            dag: PackageDag::default(),
+        };
+        set.dag.nodes.push(DagNode {
+            id: "n1".to_string(),
+            project_id: proj.doc.id.clone(),
+            request_id: req.doc.id.clone(),
+            name: req.doc.name.clone(),
+            needs: Vec::new(),
+            overrides: DagNodeOverrides {
+                post_script: Some(
+                    "// 提取普通会诊ID\nthread.consultationId = \"123\";\nthread[\"中文键\"] = \"ok\";"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            x: 60.0,
+            y: 60.0,
+        });
+        set.dag.nodes.push(DagNode {
+            id: "n2".to_string(),
+            project_id: proj.doc.id.clone(),
+            request_id: req.doc.id.clone(),
+            name: "Downstream".to_string(),
+            needs: vec!["n1".to_string()],
+            overrides: DagNodeOverrides::default(),
+            x: 340.0,
+            y: 60.0,
+        });
+
+        cx.update(crate::init_app);
+        let runner = HttpRunner::new().unwrap();
+        let active_env = workspace.effective_environment();
+        let global_env = workspace.global_environment.as_ref().map(|e| e.doc.clone());
+
+        let (window, pkg_view) = cx.update(|cx| {
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(px(1200.), px(800.)),
+            };
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        PackageTabView::new(
+                            set,
+                            workspace,
+                            active_env,
+                            global_env,
+                            runner,
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .unwrap()
+        });
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            pkg_view.update(cx, |this, cx| {
+                this.open_node_drawer("n2", window, cx);
+            });
+            window.render_frame(cx);
+            for tab in [
+                OverrideSection::Path,
+                OverrideSection::Headers,
+                OverrideSection::Body,
+                OverrideSection::Auth,
+                OverrideSection::PostScript,
+                OverrideSection::Params,
+            ] {
+                pkg_view.update(cx, |this, cx| {
+                    if let Some(d) = &mut this.node_drawer {
+                        d.active_tab = tab;
+                    }
+                    cx.notify();
+                });
+                window.render_frame(cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pkg_view.read(cx).node_drawer.is_some());
+        })
+        .unwrap();
     }
 }
