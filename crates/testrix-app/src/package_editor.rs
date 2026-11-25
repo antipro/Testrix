@@ -1527,9 +1527,6 @@ impl PackageTabView {
 
     fn collect_upstream_thread_keys(&self, node_id: &str) -> Vec<String> {
         let mut keys = BTreeSet::new();
-        for k in self.last_thread_vars.keys() {
-            keys.insert(k.clone());
-        }
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
         if let Some(start) = self.set.dag.nodes.iter().find(|n| n.id == node_id) {
@@ -2724,6 +2721,12 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
             pkg_view.update(cx, |this, cx| {
+                this.last_thread_vars
+                    .insert("downstreamOnlyVar".to_string(), "999".to_string());
+                assert!(this.collect_upstream_thread_keys("n1").is_empty());
+                let n2_keys = this.collect_upstream_thread_keys("n2");
+                assert!(n2_keys.contains(&"consultationId".to_string()));
+                assert!(!n2_keys.contains(&"downstreamOnlyVar".to_string()));
                 this.open_node_drawer("n2", window, cx);
             });
             window.render_frame(cx);
