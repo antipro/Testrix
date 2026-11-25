@@ -4,6 +4,24 @@ All notable changes to Testrix are documented in this file.
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-11-25
+
+### Added
+- Add a Package Properties tab with an interactive DAG draw pane, YAML spec editor, `needs`-based execution ordering, drag-and-drop from Explorer/History, left-mouse canvas panning, and a starter demo package.
+- Add a slide-over Float Layer drawer on DAG node double-click for per-node overrides (`Params`, `Path`, `Headers`, `Body`, `Auth`, `Post-Script`) and upstream `thread.*` variable chips.
+- Add a collapsible DAG execution console using read-only `EditorState` with Find support, detailed HTTP/thread logs, and automatic failure on HTTP 4xx/5xx responses.
+- Add right-side Properties icon buttons and `Properties` context menu entries for Projects and Folders in the Explorer.
+- Add `testrix item run`, `testrix package run`, and `testrix package dag <get|validate|set|add-node|add-edge|remove-node>` CLI commands.
+- Add `--spec-file`, `--spec-json -` (stdin) with `--method`/`--url` override merging, `--id`, `--upsert`, `--order`, `--description`, `--out`, `--quiet`, subcommand `--help`, slug/relative-path identifier resolution with candidate suggestions, and DAG validation in `testrix --check`.
+- Persist sidebar split state across sessions and enable UTF-8 console output on Windows.
+
+### Fixed
+- Allow CLI API commands to execute while the Testrix GUI is running and notify the GUI to reload via IPC.
+- Restore single-click fold/unfold in Explorer Project and Folder rows.
+- Fix panic when double-clicking a DAG node whose upstream `postScript` contains non-ASCII UTF-8 characters.
+- Scope node drawer `thread` variable chips and validation to upstream ancestor nodes only.
+- Sync `PackageTabView` workspace state when requests are saved, occlude the console Find bar cleanly, and prevent Close Behavior combobox clipping in Preferences.
+
 ## [v1.0.0] - 2026-11-24
 
 ### Added
