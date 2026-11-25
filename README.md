@@ -25,6 +25,9 @@ A native desktop API client and YAML-backed request workbench built with **Rust*
    - **Float-Layer Node Overrides**: Double-click any DAG node to open a slide-over drawer for per-node overrides (`Params`, `Path`, `Headers`, `Body`, `Auth`, `Post-Script`) without modifying the underlying `*.request.yaml` file.
    - **DAG-Scoped `thread` Variables**: Write `thread.<key> = value` in an upstream node's Post-Script and reference `{{thread.<key>}}` in downstream nodes (with clickable upstream `thread.*` chips in the node drawer).
    - **Live Execution Console & CLI Runner**: Run the DAG in topological order from the GUI (with a collapsible read-only console, Find bar, and automatic failure on HTTP 4xx/5xx or script errors) or via `testrix package run --package <ref> [--fail-fast]`.
+
+   ![Testrix DAG Example](docs/Screenshot-DAG.png)
+
 12. **CLI CRUD & Execution API for AI Agents**: Run `testrix [--workspace <DIR>] <project|folder|item|profile|var|package|share|notify> <action> ...` to perform validated JSON CRUD, run single items (`item run`) or package DAGs (`package run`, `package dag ...`), and automatically notify a running GUI instance to reload via IPC.
 13. **Preferences & 13-Language UI (i18n)**: Configure workspace directory (`~/.testrix/config.yaml`), session persistence, sharing credentials/access tokens, theme, and UI language (`English`, `Français`, `Deutsch`, `Español`, `Italiano`, `Português`, `Русский`, `العربية`, `Türkçe`, `日本語`, `한국어`, `简体中文`, `繁體中文`).
 14. **YAML-First Storage (`testrix.io/v1`)**: Every HTTP request is stored on disk as `*.request.yaml` alongside `testrix.project.yaml`, `_folder.yaml`, `environments/*.env.yaml`, and `.testrix-sets.yaml`. See [docs/yaml-spec.md](docs/yaml-spec.md).
