@@ -548,7 +548,7 @@ fn render_tree_row(
             (
                 SharedString::from(name),
                 row.into_any_element(),
-                Some((tree_id, ExplorerNode::Project { project_id }, true)),
+                None,
             )
         }
         Some(NodeMeta::Folder {
@@ -640,14 +640,7 @@ fn render_tree_row(
             (
                 SharedString::from(name),
                 row.into_any_element(),
-                Some((
-                    tree_id,
-                    ExplorerNode::Folder {
-                        project_id,
-                        folder_id,
-                    },
-                    true,
-                )),
+                None,
             )
         }
         Some(NodeMeta::Request {
@@ -683,14 +676,10 @@ fn render_tree_row(
             (
                 SharedString::from(format!("{} {}", method.as_str(), name)),
                 row.into_any_element(),
-                Some((
-                    tree_id,
-                    ExplorerNode::Request {
-                        project_id,
-                        request_id,
-                    },
-                    false,
-                )),
+                Some(ExplorerNode::Request {
+                    project_id,
+                    request_id,
+                }),
             )
         }
         None => (
@@ -711,17 +700,11 @@ fn render_tree_row(
         .accessibility_label(a11y_label)
         .selected(selected)
         .child(content)
-        .when_some(click_action, |item, (tid, node, expand_on_click)| {
+        .when_some(click_action, |item, node| {
             item.on_click(move |_, _, cx| {
-                if expand_on_click {
-                    view_click.update(cx, |panel, cx| {
-                        panel.toggle_expand(&tid, cx);
-                    });
-                } else {
-                    view_click.update(cx, |_, cx| {
-                        cx.emit(ExplorerEvent::OpenNode(node.clone()));
-                    });
-                }
+                view_click.update(cx, |_, cx| {
+                    cx.emit(ExplorerEvent::OpenNode(node.clone()));
+                });
             })
         });
 
@@ -846,6 +829,18 @@ fn build_context_menu(
             let p_exp = project_id.clone();
             let p4 = project_id;
             menu.item(
+                PopupMenuItem::new("Properties")
+                    .icon(LucideIcon::SlidersHorizontal)
+                    .on_click(move |_, _, cx| {
+                        v3.update(cx, |_, cx| {
+                            cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Project {
+                                project_id: p3.clone(),
+                            }));
+                        });
+                    }),
+            )
+            .separator()
+            .item(
                 PopupMenuItem::new(crate::i18n::t("new_request"))
                     .icon(LucideIcon::FilePlus)
                     .on_click(move |_, _, cx| {
@@ -870,17 +865,6 @@ fn build_context_menu(
                     }),
             )
             .separator()
-            .item(
-                PopupMenuItem::new(crate::i18n::t("project_settings_menu"))
-                    .icon(LucideIcon::ShieldCheck)
-                    .on_click(move |_, _, cx| {
-                        v3.update(cx, |_, cx| {
-                            cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Project {
-                                project_id: p3.clone(),
-                            }));
-                        });
-                    }),
-            )
             .item(
                 PopupMenuItem::new("Reload from Disk")
                     .icon(IconName::RefreshCw)
@@ -930,6 +914,19 @@ fn build_context_menu(
             let p3 = project_id.clone();
             let f3 = folder_id.clone();
             menu.item(
+                PopupMenuItem::new("Properties")
+                    .icon(LucideIcon::SlidersHorizontal)
+                    .on_click(move |_, _, cx| {
+                        v3.update(cx, |_, cx| {
+                            cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Folder {
+                                project_id: p3.clone(),
+                                folder_id: f3.clone(),
+                            }));
+                        });
+                    }),
+            )
+            .separator()
+            .item(
                 PopupMenuItem::new(crate::i18n::t("new_request"))
                     .icon(LucideIcon::FilePlus)
                     .on_click(move |_, _, cx| {
@@ -950,19 +947,6 @@ fn build_context_menu(
                                 project_id: p2.clone(),
                                 parent_folder_id: Some(f2.clone()),
                             });
-                        });
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new(crate::i18n::t("folder_settings_menu"))
-                    .icon(LucideIcon::FolderKey)
-                    .on_click(move |_, _, cx| {
-                        v3.update(cx, |_, cx| {
-                            cx.emit(ExplorerEvent::OpenNode(ExplorerNode::Folder {
-                                project_id: p3.clone(),
-                                folder_id: f3.clone(),
-                            }));
                         });
                     }),
             )
